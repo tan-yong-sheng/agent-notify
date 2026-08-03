@@ -128,17 +128,24 @@ So you can keep shared defaults in `.env` and override per platform with env var
 1. Open Orca.
 2. Go to **Settings → Plugins**.
 3. Click **Install plugin**.
-4. Choose the **Local folder** tab.
-5. Select the `agent-notify` repo folder (the one containing `orca-plugin.json`).
-6. Review the permissions and enable the plugin.
+4. Input the GitHub URL: `https://github.com/tan-yong-sheng/agent-notify`.
+5. Review the permissions and enable the plugin.
 
 The plugin subscribes to `agent.status.changed` events for all agents.
 
-To update after changing the plugin, remove it in Settings → Plugins and reinstall from the same folder.
+To update after changing the plugin, remove it in Settings → Plugins and reinstall from the same URL.
 
 ### 3. Install for Herdr
 
-1. Link the plugin:
+#### From GitHub
+
+```bash
+herdr plugin install tan-yong-sheng/agent-notify
+```
+
+#### Local development
+
+1. Link the local plugin folder:
 
 ```bash
 herdr plugin link /path/to/agent-notify

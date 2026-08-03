@@ -67,14 +67,22 @@ See `README.md` and `docs/ntfy-setup.md` for detailed ntfy backend setup instruc
 
 ### 2. Install for Orca
 
-1. Push this repo to GitHub.
-2. In Orca, go to Settings → Plugins → + Install plugin.
-3. Enter the GitHub URL.
+1. In Orca, go to **Settings → Plugins**.
+2. Click **Install plugin**.
+3. Input the GitHub URL: `https://github.com/tan-yong-sheng/agent-notify`.
 4. Enable the plugin in the plugin list.
 
 ### 3. Install for Herdr
 
-Link the plugin and copy the config to Herdr's managed config directory:
+#### From GitHub
+
+```bash
+herdr plugin install tan-yong-sheng/agent-notify
+CONFIG_DIR="$(herdr plugin config-dir agent-notify)"
+cp .env "$CONFIG_DIR/.env"
+```
+
+#### Local development
 
 ```bash
 herdr plugin link /path/to/agent-notify
