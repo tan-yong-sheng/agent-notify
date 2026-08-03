@@ -17,6 +17,12 @@ function parseBool(value) {
   return value === 'true' || value === '1' || value === true
 }
 
+function parsePriority(value, defaultValue) {
+  const num = Number(value)
+  if (Number.isFinite(num) && num >= 1 && num <= 5) return num
+  return defaultValue
+}
+
 export function loadNtfyConfig(configDir) {
   const envFromConfigDir = loadEnvFromDir(configDir)
 
@@ -30,5 +36,13 @@ export function loadNtfyConfig(configDir) {
     NTFY_URL: resolveConfigValue(envFromConfigDir, 'NTFY_URL', 'http://localhost:10081'),
     NTFY_TOPIC: resolveConfigValue(envFromConfigDir, 'NTFY_TOPIC', 'agent-alerts'),
     NTFY_API_KEY: resolveConfigValue(envFromConfigDir, 'NTFY_API_KEY', ''),
+    NTFY_PRIORITY_DONE: parsePriority(
+      resolveConfigValue(envFromConfigDir, 'NTFY_PRIORITY_DONE', '4'),
+      4
+    ),
+    NTFY_PRIORITY_BLOCKED: parsePriority(
+      resolveConfigValue(envFromConfigDir, 'NTFY_PRIORITY_BLOCKED', '5'),
+      5
+    ),
   }
 }

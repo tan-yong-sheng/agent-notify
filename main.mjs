@@ -36,17 +36,14 @@ function isNotifyState(state) {
   return state === 'done' || state === 'blocked'
 }
 
-const NTFY_PRIORITY_DONE = 'default'
-const NTFY_PRIORITY_BLOCKED = 'high'
-
 function notifyTitle(state) {
   if (state === 'blocked') return 'Agent needs action'
   return 'Agent settled'
 }
 
-function notifyPriority(state) {
-  if (state === 'blocked') return NTFY_PRIORITY_BLOCKED
-  return NTFY_PRIORITY_DONE
+function notifyPriority(state, config) {
+  if (state === 'blocked') return config.NTFY_PRIORITY_BLOCKED
+  return config.NTFY_PRIORITY_DONE
 }
 
 function readAgent(payload) {
@@ -70,7 +67,7 @@ async function handleStatusChanged(payload, config, orca) {
       title: notifyTitle(state),
       body,
       tags: buildTags(state, agent, body),
-      priority: notifyPriority(state),
+      priority: notifyPriority(state, config),
       config,
     },
     config,

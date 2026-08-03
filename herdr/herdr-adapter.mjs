@@ -21,8 +21,6 @@ import { resolveWorkspaceFromSnapshot } from './snapshot.mjs'
 import { readState, writeState, shouldNotify, updateState } from './state.mjs'
 
 const NOTIFY_STATES = ['done', 'blocked']
-const NTFY_PRIORITY_DONE = 'default'
-const NTFY_PRIORITY_BLOCKED = 'high'
 
 function translateStatus(status) {
   if (status === 'idle') return 'done'
@@ -71,9 +69,9 @@ function notifyTitle(status) {
   return 'Agent settled'
 }
 
-function notifyPriority(status) {
-  if (status === 'blocked') return NTFY_PRIORITY_BLOCKED
-  return NTFY_PRIORITY_DONE
+function notifyPriority(status, config) {
+  if (status === 'blocked') return config.NTFY_PRIORITY_BLOCKED
+  return config.NTFY_PRIORITY_DONE
 }
 
 function resolveLocation(workspace, tab) {
@@ -100,7 +98,7 @@ function composeNotification(status, agent, event, context, config) {
     title: notifyTitle(status),
     body,
     tags: buildTags(status, agent, body),
-    priority: notifyPriority(status),
+    priority: notifyPriority(status, config),
     config,
     workspace,
     paneId,
@@ -120,7 +118,7 @@ async function runTestNotification(config) {
       title,
       body,
       tags: buildTags('done', 'Agent', body),
-      priority: NTFY_PRIORITY_DONE,
+      priority: config.NTFY_PRIORITY_DONE,
       config,
     },
     config,
