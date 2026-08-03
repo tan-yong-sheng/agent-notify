@@ -2,3 +2,8 @@
 .env.local
 node_modules/
 .DS_Store
+.fallow/
+.pi/
+coverage/
+coverage-v8/
+.nyc_output/

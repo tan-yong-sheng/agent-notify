@@ -1,15 +1,15 @@
-id = "zom-2018.herdr-ntfy-notify"
-name = "Herdr ntfy Notification Plugin"
-version = "0.1.0"
+id = "agent-notify"
+name = "Agent Notify"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
-description = "Send ntfy pushes when Herdr agents finish or need action."
+description = "Send notifications when agents reach done or blocked."
 platforms = ["linux", "macos", "windows"]
 
 [[actions]]
 id = "test"
-title = "Send test ntfy notification"
-command = ["node", "notify.mjs", "--test"]
+title = "Send test notification"
+command = ["node", "herdr/herdr-adapter.mjs", "--test"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["node", "notify.mjs"]
+command = ["node", "herdr/herdr-adapter.mjs"]

@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 1,
+  "id": "agent-notify",
+  "publisher": "agent-notify",
+  "name": "Agent Notify",
+  "version": "1.1.0",
+  "description": "Send notifications when agents reach done or blocked status",
+  "engines": { "orca": ">=1.4.0" },
+  "pluginApi": 1,
+  "main": "main.mjs",
+  "contributes": {
+    "events": [
+      { "on": "agent.status.changed" }
+    ]
+  },
+  "capabilities": [
+    { "kind": "events:subscribe" },
+    { "kind": "notifications:show" }
+  ]
+}
