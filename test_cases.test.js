@@ -6,8 +6,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
-import { loadEnv, loadNtfyConfig, buildTags, isEnabled, buildAuthHeaders, isDesktopMode, isNtfyMode } from './shared/ntfy.mjs'
+import http from 'node:http'
+import { loadEnv, loadNtfyConfig, resolveConfigDir, buildTags, isEnabled, buildAuthHeaders, isDesktopMode, isNtfyMode } from './shared/ntfy.mjs'
 import { dispatchNotification } from './shared/notify.mjs'
+import { publishToNtfy } from './shared/publish.mjs'
 import { buildSimpleBody } from './shared/format.mjs'
 import { detectGitBranch } from './shared/git.mjs'
 import {
@@ -234,6 +236,24 @@ async function runUnitTests() {
   fs.unlinkSync(tmpConfigEnv)
   fs.rmdirSync(tmpConfigDir)
 
+  // Orca layout: hashed package root first, durable dev/.env second
+  const orcaHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orca-plugin-home-'))
+  const hashedRoot = path.join(orcaHome, 'contenthash')
+  const durableDev = path.join(orcaHome, 'dev')
+  fs.mkdirSync(hashedRoot)
+  fs.mkdirSync(durableDev)
+  fs.writeFileSync(path.join(durableDev, '.env'), 'PLATFORM_NTFY=true\nNTFY_TOPIC=orca-dev\n')
+  const resolvedDev = resolveConfigDir([hashedRoot, durableDev, orcaHome], durableDev)
+  assert(resolvedDev === durableDev, 'resolveConfigDir prefers durable dev/.env')
+  const orcaConfig = loadNtfyConfig(resolvedDev)
+  assert(orcaConfig.PLATFORM_NTFY === true, 'orca durable .env enables ntfy')
+  assert(orcaConfig.NTFY_TOPIC === 'orca-dev', 'orca durable .env topic')
+  // package-local .env wins when present
+  fs.writeFileSync(path.join(hashedRoot, '.env'), 'PLATFORM_NTFY=false\nNTFY_TOPIC=package-local\n')
+  const resolvedPackage = resolveConfigDir([hashedRoot, durableDev, orcaHome], durableDev)
+  assert(resolvedPackage === hashedRoot, 'resolveConfigDir prefers package-local .env')
+  fs.rmSync(orcaHome, { recursive: true, force: true })
+
   Object.assign(process.env, savedEnv)
 
   // ── buildAuthHeaders ──
@@ -303,14 +323,55 @@ async function runUnitTests() {
   )
   assert(ntfyDesktopCalled === false, 'dispatchNotification ntfy skips desktop')
 
-  // both platform calls desktop and attempts ntfy
+  // both platforms: desktop still fires even when ntfy is unreachable
   let bothDesktopCalled = false
-  await dispatchNotification(
+  const bothResults = await dispatchNotification(
     { title: 'Test', body: 'Body' },
-    { PLATFORM_DESKTOP: true, PLATFORM_NTFY: true, NTFY_URL: 'http://localhost:10081' },
+    { PLATFORM_DESKTOP: true, PLATFORM_NTFY: true, NTFY_URL: 'http://127.0.0.1:1', NTFY_TOPIC: 'agent-alerts' },
     () => { bothDesktopCalled = true }
   )
   assert(bothDesktopCalled === true, 'dispatchNotification both calls desktop')
+  assert(bothResults.desktop?.ok === true, 'dispatchNotification desktop result ok')
+  assert(bothResults.ntfy?.ok === false, 'dispatchNotification ntfy result fails independently')
+
+  // ── publishToNtfy via local HTTP server (node:http path) ──
+  const missing = await publishToNtfy({ title: 'x', body: 'y', config: {} })
+  assert(missing.ok === false, 'publishToNtfy missing NTFY_URL fails')
+
+  let received = null
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      received = {
+        method: req.method,
+        url: req.url,
+        title: req.headers.title,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain' })
+      res.end('ok')
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  const published = await publishToNtfy({
+    title: 'Smoke',
+    body: 'hello-ntfy',
+    tags: 'test_tube',
+    priority: '4',
+    config: {
+      NTFY_URL: `http://127.0.0.1:${port}`,
+      NTFY_TOPIC: 'agent-alerts',
+      NTFY_API_KEY: '',
+    },
+  })
+  server.close()
+  assert(published.ok === true, 'publishToNtfy local server succeeds')
+  assert(received?.method === 'POST', 'publishToNtfy posts')
+  assert(received?.url === '/agent-alerts', 'publishToNtfy uses topic path')
+  assert(received?.title === 'Smoke', 'publishToNtfy sends title header')
+  assert(received?.body === 'hello-ntfy', 'publishToNtfy sends body')
 
   // ── detectGitBranch ──
   const tmpGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-git-'))

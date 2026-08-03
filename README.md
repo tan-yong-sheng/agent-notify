@@ -91,11 +91,13 @@ See [docs/ntfy-setup.md](docs/ntfy-setup.md) for a complete guide to ntfy.sh and
 
 **Orca**
 
-After installing the plugin, copy `.env.example` into the plugin install directory next to `main.mjs`.
-On most systems that is:
+After installing the plugin, put `.env` in Orca's durable plugin config directory (`dev/`).
+Do not put it only next to the hashed package copy of `main.mjs` - that directory is replaced on every install/update.
+On most systems:
 
 ```bash
 CONFIG_DIR="$HOME/.config/orca/plugins/agent-notify.agent-notify/dev"
+mkdir -p "$CONFIG_DIR"
 cp .env.example "$CONFIG_DIR/.env"
 ```
 
@@ -116,7 +118,7 @@ Config is read from (highest priority first):
 
 1. Actual environment variables
 2. Platform-specific `.env`:
-   - Orca: the plugin install directory next to `main.mjs`
+   - Orca: first existing file among package root, `../dev/.env`, then plugin home
    - Herdr: `HERDR_PLUGIN_CONFIG_DIR/.env`
 3. Built-in defaults
 

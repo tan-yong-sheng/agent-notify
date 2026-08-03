@@ -4,5 +4,15 @@
     "main.mjs",
     "herdr/herdr-adapter.mjs",
     "test_cases.test.js"
-  ]
+  ],
+  "health": {
+    "thresholdOverrides": [
+      {
+        "files": ["test_cases.test.js"],
+        "maxUnitSize": 250,
+        "maxCrap": 80,
+        "reason": "Integration harness is intentionally linear and long"
+      }
+    ]
+  }
 }

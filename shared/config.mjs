@@ -2,6 +2,7 @@
 // Exposed env vars: PLATFORM_DESKTOP, PLATFORM_NTFY, NTFY_URL, NTFY_TOPIC,
 // NTFY_API_KEY. Everything else uses internal defaults.
 
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { loadEnv } from './env.mjs'
 
@@ -11,6 +12,18 @@ function resolveConfigValue(envFromConfigDir, envKey, defaultValue) {
 
 function loadEnvFromDir(configDir) {
   return configDir ? loadEnv(path.join(configDir, '.env')) : {}
+}
+
+function hasEnvFile(dir) {
+  return Boolean(dir) && existsSync(path.join(dir, '.env'))
+}
+
+// Pick the first candidate directory that already has a .env file.
+// Falls back to fallbackDir (or the first candidate) when none exist yet.
+export function resolveConfigDir(candidates = [], fallbackDir = null) {
+  const hit = candidates.find(hasEnvFile)
+  if (hit) return hit
+  return fallbackDir || candidates.find(Boolean) || null
 }
 
 function parseBool(value) {

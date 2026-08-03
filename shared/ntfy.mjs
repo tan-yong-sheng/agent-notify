@@ -2,7 +2,7 @@
 // Adapters may import from this file or from the narrower modules below.
 
 export { loadEnv } from './env.mjs'
-export { loadNtfyConfig } from './config.mjs'
+export { loadNtfyConfig, resolveConfigDir } from './config.mjs'
 export { buildAuthHeaders } from './auth.mjs'
 export { buildTags } from './tags.mjs'
 export { isEnabled } from './publish.mjs'
