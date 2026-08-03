@@ -118,8 +118,7 @@ Config is read from (highest priority first):
 2. Platform-specific `.env`:
    - Orca: the plugin install directory next to `main.mjs`
    - Herdr: `HERDR_PLUGIN_CONFIG_DIR/.env`
-3. Legacy fallback: `/opt/herdr-ntfy-notify/.env`
-4. Built-in defaults
+3. Built-in defaults
 
 So you can keep shared defaults in `.env` and override per platform with env vars.
 
@@ -128,7 +127,7 @@ So you can keep shared defaults in `.env` and override per platform with env var
 1. Open Orca.
 2. Go to **Settings → Plugins**.
 3. Click **Install plugin**.
-4. Input the GitHub URL: `https://github.com/tan-yong-sheng/agent-notify`.
+4. Input the GitHub URL: `https://github.com/tan-yong-sheng/agent-notify#main`.
 5. Review the permissions and enable the plugin.
 
 The plugin subscribes to `agent.status.changed` events for all agents.

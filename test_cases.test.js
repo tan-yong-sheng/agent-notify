@@ -222,15 +222,15 @@ async function runUnitTests() {
   assert(overridden.NTFY_TOPIC === 'custom-topic', 'loadNtfyConfig env topic override')
   assert(overridden.NTFY_API_KEY === 'tok', 'loadNtfyConfig env api key override')
 
-  // configDir .env overrides fallback defaults but not env vars
+  // configDir .env overrides defaults but not env vars
   delete process.env.NTFY_TOPIC
   delete process.env.NTFY_URL
   const tmpConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ntfy-config-'))
   const tmpConfigEnv = path.join(tmpConfigDir, '.env')
   fs.writeFileSync(tmpConfigEnv, 'NTFY_TOPIC=from-config-dir\n')
-  const fromDir = loadNtfyConfig(tmpConfigDir, '/nonexistent-fallback')
+  const fromDir = loadNtfyConfig(tmpConfigDir)
   assert(fromDir.NTFY_TOPIC === 'from-config-dir', 'loadNtfyConfig configDir .env')
-  assert(fromDir.NTFY_URL === 'http://localhost:10081', 'loadNtfyConfig configDir fallback default')
+  assert(fromDir.NTFY_URL === 'http://localhost:10081', 'loadNtfyConfig configDir default')
   fs.unlinkSync(tmpConfigEnv)
   fs.rmdirSync(tmpConfigDir)
 

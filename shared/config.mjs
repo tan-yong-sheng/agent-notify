@@ -5,8 +5,8 @@
 import path from 'node:path'
 import { loadEnv } from './env.mjs'
 
-function resolveConfigValue(envFromConfigDir, envFromFallback, envKey, defaultValue) {
-  return process.env[envKey] || envFromConfigDir[envKey] || envFromFallback[envKey] || defaultValue
+function resolveConfigValue(envFromConfigDir, envKey, defaultValue) {
+  return process.env[envKey] || envFromConfigDir[envKey] || defaultValue
 }
 
 function loadEnvFromDir(configDir) {
@@ -17,19 +17,18 @@ function parseBool(value) {
   return value === 'true' || value === '1' || value === true
 }
 
-export function loadNtfyConfig(configDir, fallbackPath = '/opt/herdr-ntfy-notify/.env') {
+export function loadNtfyConfig(configDir) {
   const envFromConfigDir = loadEnvFromDir(configDir)
-  const envFromFallback = fallbackPath ? loadEnv(fallbackPath) : {}
 
   return {
     PLATFORM_DESKTOP: parseBool(
-      resolveConfigValue(envFromConfigDir, envFromFallback, 'PLATFORM_DESKTOP', 'true')
+      resolveConfigValue(envFromConfigDir, 'PLATFORM_DESKTOP', 'true')
     ),
     PLATFORM_NTFY: parseBool(
-      resolveConfigValue(envFromConfigDir, envFromFallback, 'PLATFORM_NTFY', 'false')
+      resolveConfigValue(envFromConfigDir, 'PLATFORM_NTFY', 'false')
     ),
-    NTFY_URL: resolveConfigValue(envFromConfigDir, envFromFallback, 'NTFY_URL', 'http://localhost:10081'),
-    NTFY_TOPIC: resolveConfigValue(envFromConfigDir, envFromFallback, 'NTFY_TOPIC', 'agent-alerts'),
-    NTFY_API_KEY: resolveConfigValue(envFromConfigDir, envFromFallback, 'NTFY_API_KEY', ''),
+    NTFY_URL: resolveConfigValue(envFromConfigDir, 'NTFY_URL', 'http://localhost:10081'),
+    NTFY_TOPIC: resolveConfigValue(envFromConfigDir, 'NTFY_TOPIC', 'agent-alerts'),
+    NTFY_API_KEY: resolveConfigValue(envFromConfigDir, 'NTFY_API_KEY', ''),
   }
 }
