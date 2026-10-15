@@ -93,6 +93,7 @@ See [docs/ntfy-setup.md](docs/ntfy-setup.md) for a complete guide to ntfy.sh and
 
 After installing the plugin, put `.env` in Orca's durable plugin config directory (`dev/`).
 Do not put it only next to the hashed package copy of `main.mjs` - that directory is replaced on every install/update.
+If a reinstall leaves `dev/.env` empty, re-copy your config there.
 On most systems:
 
 ```bash
@@ -173,7 +174,15 @@ node test_cases.test.js
 
 ## How It Works
 
-Orca reports `done`, `blocked`, `working`, and `waiting`. The Orca plugin fires only on `done` and `blocked`.
+Orca reports `done`, `blocked`, `working`, and `waiting`. The Orca plugin
+notifies on the **main agent's own state** (`mainAgent` in the event payload,
+falling back to the combined `state` when the host omits it) - never on a
+headless subagent process (`claude -p`, `pi -p`, `codex exec`, ...) on its
+own: subagent activity is folded into the pane's combined status and a
+per-pane settle de-dupe prevents a subagent finishing from re-announcing an
+already-notified main-agent settle. So you get one notification when the main
+agent settles (`done`) or needs input (`blocked`), regardless of subagents
+still running underneath.
 
 The Herdr adapter translates platform-specific statuses into a common vocabulary. Herdr's Pi integration emits `idle` when the agent settles; the adapter maps that to `done` before deciding whether to notify. So both platforms notify on completion (`done`/`idle`) and when input is needed (`blocked`).
 

@@ -22,6 +22,12 @@ import {
 } from './herdr/utils.mjs'
 import { findPaneCwd } from './herdr/snapshot.mjs'
 import { shouldNotify, updateState } from './herdr/state.mjs'
+import {
+  resolveNotifyState,
+  forgetPane,
+  isSettleAlreadyNotified,
+  markPaneNotified,
+} from './main.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
 
@@ -460,6 +466,40 @@ async function runHerdrUnitTests() {
   assert(us.p1 === 'working', 'updateState ignores waiting')
 }
 
+function runOrcaMainUnitTests() {
+  console.log('\nRunning main.mjs (Orca plugin) unit tests...\n')
+
+  // Gate on the main agent's own state; subagent processes never drive a
+  // notification on their own.
+  assert(
+    resolveNotifyState({ state: 'working', mainAgent: { state: 'done', stateStartedAt: 1 } }) === 'done',
+    'resolveNotifyState prefers mainAgent state over combined'
+  )
+  assert(
+    resolveNotifyState({ state: 'done' }) === 'done',
+    'resolveNotifyState falls back to combined state without mainAgent'
+  )
+  assert(
+    resolveNotifyState({ state: 'DONE', mainAgent: { state: 'Blocked', stateStartedAt: 1 } }) === 'blocked',
+    'states are lowercased before comparison'
+  )
+  assert(
+    resolveNotifyState({}) === '',
+    'empty payload resolves to empty (not a notify state)'
+  )
+
+  // Per-pane settle de-dupe: a subagent finishing re-emits the row while the
+  // main agent already settled; that must not re-notify.
+  const pane = 'tab:leaf'
+  assert(isSettleAlreadyNotified(pane, 'done') === false, 'fresh pane is not de-duped')
+  markPaneNotified(pane, 'done')
+  assert(isSettleAlreadyNotified(pane, 'done') === true, 'same settle state de-duped')
+  assert(isSettleAlreadyNotified(pane, 'blocked') === false, 'different state is not de-duped')
+  assert(isSettleAlreadyNotified('', 'done') === false, 'empty paneKey never de-dupes')
+  forgetPane(pane)
+  assert(isSettleAlreadyNotified(pane, 'done') === false, 'forgotten pane notifies again')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,6 +508,7 @@ async function main() {
   runIntegrationTests()
   await runUnitTests()
   await runHerdrUnitTests()
+  runOrcaMainUnitTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {

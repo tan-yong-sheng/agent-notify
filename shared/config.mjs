@@ -1,6 +1,7 @@
 // ─── Notification configuration loading (env vars + .env fallbacks) ──────────
 // Exposed env vars: PLATFORM_DESKTOP, PLATFORM_NTFY, NTFY_URL, NTFY_TOPIC,
-// NTFY_API_KEY. Everything else uses internal defaults.
+// NTFY_API_KEY, NTFY_PRIORITY_DONE, NTFY_PRIORITY_BLOCKED.
+// Everything else uses internal defaults.
 
 import { existsSync } from 'node:fs'
 import path from 'node:path'

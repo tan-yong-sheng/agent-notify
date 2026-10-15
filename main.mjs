@@ -33,8 +33,21 @@ function readState(payload) {
   return payload.state?.toLowerCase() || ''
 }
 
+function readMainAgentState(payload) {
+  return payload.mainAgent?.state?.toLowerCase() || ''
+}
+
 function isNotifyState(state) {
   return state === 'done' || state === 'blocked'
+}
+
+// Gate on the main agent's own state so subagent processes (claude -p, pi -p,
+// codex exec, ...) never drive a notification on their own. When the host
+// does not carry a mainAgent fact, fall back to the combined state - that is
+// the best available main-agent signal.
+export function resolveNotifyState(payload) {
+  const mainState = readMainAgentState(payload)
+  return mainState || readState(payload)
 }
 
 function notifyTitle(state) {
@@ -45,10 +58,6 @@ function notifyTitle(state) {
 function notifyPriority(state, config) {
   if (state === 'blocked') return config.NTFY_PRIORITY_BLOCKED
   return config.NTFY_PRIORITY_DONE
-}
-
-function readAgent(payload) {
-  return payload.agentType || 'Agent'
 }
 
 function readWorktreeId(payload) {
@@ -76,24 +85,52 @@ function logOrca(orca, message) {
   console.error(message)
 }
 
-async function handleStatusChanged(payload, config, orca) {
-  const state = readState(payload)
-  if (!isNotifyState(state)) return
+// Orca re-emits the row when the combined state changes, so a main agent that
+// already settled is re-announced when a subagent process finishes. Notify
+// each pane at most once per settle cycle (reset by any non-notify fact).
+const lastSettledByPane = new Map()
 
-  const agent = readAgent(payload)
+export function forgetPane(paneKey) {
+  lastSettledByPane.delete(paneKey)
+}
+
+export function isSettleAlreadyNotified(paneKey, state) {
+  if (!paneKey) return false
+  if (lastSettledByPane.size >= 512) lastSettledByPane.clear()
+  return lastSettledByPane.get(paneKey) === state
+}
+
+export function markPaneNotified(paneKey, state) {
+  if (paneKey) lastSettledByPane.set(paneKey, state)
+}
+
+async function handleStatusChanged(payload, config, orca) {
+  const state = resolveNotifyState(payload)
+  const paneKey = payload.paneKey || ''
+
+  if (!isNotifyState(state)) {
+    // New main-agent activity starts a fresh settle cycle.
+    forgetPane(paneKey)
+    return
+  }
+  if (isSettleAlreadyNotified(paneKey, state)) return
+  markPaneNotified(paneKey, state)
+
   const worktreeId = readWorktreeId(payload)
   const body = buildOrcaBody(state, worktreeId)
 
   logOrca(
     orca,
-    `[agent-notify] dispatch state=${state} agent=${agent} config=${JSON.stringify(summarizeConfig(config))}`
+    `[agent-notify] dispatch state=${state} config=${JSON.stringify(summarizeConfig(config))}`
   )
 
   const results = await dispatchNotification(
     {
       title: notifyTitle(state),
       body,
-      tags: buildTags(state, agent, body),
+      // Orca's v0 projection carries no agent-type field, so agent-specific
+      // emoji tags are out of scope here.
+      tags: buildTags(state, '', body),
       priority: notifyPriority(state, config),
       config,
     },

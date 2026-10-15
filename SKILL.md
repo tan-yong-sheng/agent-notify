@@ -71,6 +71,17 @@ See `README.md` and `docs/ntfy-setup.md` for detailed ntfy backend setup instruc
 2. Click **Install plugin**.
 3. Input the GitHub URL: `https://github.com/tan-yong-sheng/agent-notify`.
 4. Enable the plugin in the plugin list.
+5. Put the config in Orca's durable plugin config dir so it survives
+   reinstalls (the hashed package copy is replaced on every install/update):
+
+```bash
+CONFIG_DIR="$HOME/.config/orca/plugins/agent-notify.agent-notify/dev"
+mkdir -p "$CONFIG_DIR"
+cp .env "$CONFIG_DIR/.env"
+```
+
+If an install wipes or empties `dev/.env`, re-copy it from the template or
+from the Herdr config dir (`herdr plugin config-dir agent-notify`).
 
 ### 3. Install for Herdr
 
@@ -99,7 +110,11 @@ and `blocked` - not on `working` or `waiting`.
   → calls `herdr/herdr-adapter.mjs`. Herdr's `idle` status is mapped to `done`.
 - **Orca**: `orca-plugin.json` declares `events: [{ "on":
   "agent.status.changed" }]` → `main.mjs` subscribes via
-  `orca.events.on(...)` → dispatches notifications.
+  `orca.events.on(...)` → dispatches notifications. The trigger is the
+  main agent's own state (`payload.mainAgent`, falling back to the combined
+  `state` when the host omits it), never a headless subagent process on its
+  own - a per-pane settle de-dupe stops a subagent finishing from
+  re-announcing an already-notified main-agent settle.
 
 The shared core is the only code that knows how to talk to ntfy or the desktop.
 Both adapters (`herdr/herdr-adapter.mjs` and `main.mjs`) just read their event
