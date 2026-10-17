@@ -166,6 +166,62 @@ cp /path/to/agent-notify/.env "$CONFIG_DIR/.env"
 herdr plugin action invoke test --plugin agent-notify
 ```
 
+## Agent Monitor Dashboard
+
+A lightweight, zero-dependency local web dashboard to monitor which coding agents (Pi, Claude, Codex, etc.) are currently running, waiting for input, or finished across both **Orca** worktrees and **Herdr** sessions in one place.
+
+### Launch the Dashboard
+
+```bash
+node dashboard.mjs
+# Or specify a custom port:
+node dashboard.mjs --port 8080
+```
+
+Then visit [http://localhost:3333](http://localhost:3333).
+
+- **Real-time status**: Polls live agent state across Orca and Herdr every 3 seconds without UI flicker.
+- **Compact dense table**: Clean layout showing status badges (🟢 Working, 🟡 Needs Action, ⚪ Done / Idle), host environment (`Orca` / `Herdr`), agent type (`pi`), workspace directory, git branch, and active tool / prompt.
+- **Search & Filter**: Real-time filter box and quick tabs (`All`, `Working`, `Needs Action`, `Settled`).
+- **Click-to-copy & Inspect**: Click any directory path to copy it to your clipboard, or click a prompt to expand its full text.
+- **Configurable**: Set `DASHBOARD_PORT=3333` in `.env` or pass `--port <number>`.
+
+### Background Service Management
+
+You can install the dashboard as a persistent background daemon that starts on login:
+- **Linux**: Managed via `systemd --user` (`~/.config/systemd/user/agent-monitor.service`)
+- **macOS**: Managed via `launchd` (`~/Library/LaunchAgents/dev.agent-notify.dashboard.plist`)
+- **Windows**: Managed via user Startup folder shortcut
+
+```bash
+# Install and start service on login
+node dashboard.mjs --service install
+
+# Check service status
+node dashboard.mjs --service status
+
+# Restart service
+node dashboard.mjs --service restart
+
+# View logs (Linux journalctl or macOS stdout log)
+node dashboard.mjs --service logs
+
+# Stop and uninstall service
+node dashboard.mjs --service uninstall
+```
+
+### Updates
+
+The dashboard automatically checks for updates against GitHub and displays a banner when a newer commit is available. You can also check and update from the terminal:
+
+```bash
+# Check if updates are available
+node dashboard.mjs --check-update
+
+# Fast-forward pull latest changes and restart service
+node dashboard.mjs --update
+```
+
 ## Test
 
 ```bash

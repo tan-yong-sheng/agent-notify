@@ -10,6 +10,11 @@ id = "test"
 title = "Send test notification"
 command = ["node", "herdr/herdr-adapter.mjs", "--test"]
 
+[[actions]]
+id = "dashboard"
+title = "Launch Agent Monitor Dashboard"
+command = ["node", "dashboard.mjs"]
+
 [[events]]
 on = "pane.agent_status_changed"
 command = ["node", "herdr/herdr-adapter.mjs"]

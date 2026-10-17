@@ -28,6 +28,20 @@ import {
   isSettleAlreadyNotified,
   markPaneNotified,
 } from './main.mjs'
+import { getExtendedPathEnv } from './shared/env.mjs'
+import {
+  resolveConfig as resolveDashboardConfig,
+  normalizeAgentStatus,
+  parseHerdrAgent,
+  parseOrcaAgent,
+} from './dashboard.mjs'
+import {
+  buildSystemdUnit,
+  buildLaunchdPlist,
+  buildWindowsVbs,
+  getServicePlatform,
+  checkUpdateStatus,
+} from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
 
@@ -544,6 +558,73 @@ function runOrcaMainUnitTests() {
   assert(isSettleAlreadyNotified(pane, 'done') === false, 'forgotten pane notifies again')
 }
 
+function runDashboardUnitTests() {
+  console.log('\nRunning dashboard.mjs unit tests...\n')
+
+  const env = getExtendedPathEnv(['/nonexistent/test/path'])
+  assert(typeof env.PATH === 'string', 'getExtendedPathEnv returns PATH')
+
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '4567'], {}).port === 4567,
+    'resolveDashboardConfig --port <n>'
+  )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port=7890'], {}).port === 7890,
+    'resolveDashboardConfig --port=<n>'
+  )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '5555' }).port === 5555,
+    'resolveDashboardConfig DASHBOARD_PORT env'
+  )
+
+  assert(normalizeAgentStatus('WORKING') === 'working', 'normalizeAgentStatus working')
+  assert(normalizeAgentStatus('blocked') === 'blocked', 'normalizeAgentStatus blocked')
+  assert(normalizeAgentStatus('Done') === 'done', 'normalizeAgentStatus done')
+  assert(normalizeAgentStatus('idle') === 'idle', 'normalizeAgentStatus idle')
+  assert(normalizeAgentStatus('unknown') === 'idle', 'normalizeAgentStatus fallback')
+
+  const herdrAgent = parseHerdrAgent({
+    pane_id: 'p1',
+    agent: 'pi',
+    agent_status: 'working',
+    cwd: '/path/to/herdr',
+    terminal_title: 'Title',
+    focused: true,
+  })
+  assert(herdrAgent.source === 'herdr', 'parseHerdrAgent source')
+  assert(herdrAgent.status === 'working', 'parseHerdrAgent status')
+  assert(herdrAgent.cwd === '/path/to/herdr', 'parseHerdrAgent cwd')
+  assert(herdrAgent.displayName === 'Title', 'parseHerdrAgent displayName')
+
+  const orcaAgent = parseOrcaAgent(
+    { path: '/path/to/orca', displayName: 'Orca Repo', branch: 'refs/heads/feature' },
+    { paneKey: 'k1', agentType: 'claude', state: 'done', prompt: 'hi' }
+  )
+  assert(orcaAgent.source === 'orca', 'parseOrcaAgent source')
+  assert(orcaAgent.status === 'done', 'parseOrcaAgent status')
+  assert(orcaAgent.cwd === '/path/to/orca', 'parseOrcaAgent cwd')
+  assert(orcaAgent.branch === 'feature', 'parseOrcaAgent branch stripped')
+  assert(orcaAgent.prompt === 'hi', 'parseOrcaAgent prompt')
+
+  // Service & Update tests
+  assert(getServicePlatform() === process.platform, 'getServicePlatform matches process.platform')
+
+  const systemd = buildSystemdUnit('/usr/bin/node', '/path/dashboard.mjs', '/path')
+  assert(systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs'), 'buildSystemdUnit ExecStart')
+  assert(systemd.includes('WorkingDirectory=/path'), 'buildSystemdUnit WorkingDirectory')
+
+  const plist = buildLaunchdPlist('/usr/bin/node', '/path/dashboard.mjs', '/path')
+  assert(plist.includes('<string>dev.agent-notify.dashboard</string>'), 'buildLaunchdPlist label')
+  assert(plist.includes('<string>/usr/bin/node</string>'), 'buildLaunchdPlist node')
+
+  const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs')
+  assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')
+
+  const updateStatus = checkUpdateStatus(process.cwd())
+  assert(typeof updateStatus === 'object', 'checkUpdateStatus returns object')
+  assert(updateStatus.isGit === true, 'checkUpdateStatus isGit')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,6 +634,7 @@ async function main() {
   await runUnitTests()
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
+  runDashboardUnitTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {
