@@ -420,6 +420,20 @@ async function runHerdrUnitTests() {
   assert(ws.tab === 'editor', 'extractWorkspaceContext tab')
   assert(ws.paneId === 'p1', 'extractWorkspaceContext paneId')
 
+  const wsHerdrCwd = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { workspace_cwd: '/home/user/project', tab_label: 'terminal 1' }
+  )
+  assert(wsHerdrCwd.workspace === '/home/user/project', 'extractWorkspaceContext Herdr workspace_cwd')
+  assert(wsHerdrCwd.tab === 'terminal 1', 'extractWorkspaceContext Herdr tab_label')
+  assert(wsHerdrCwd.paneId === 'wG5:p3', 'extractWorkspaceContext Herdr pane_id')
+
+  const wsFocusedCwd = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { focused_pane_cwd: '/home/user/focused-project' }
+  )
+  assert(wsFocusedCwd.workspace === '/home/user/focused-project', 'extractWorkspaceContext Herdr focused_pane_cwd')
+
   const sup = extractSupplementaryStatus({ data: { custom_status: 'cs', title: 't', state_labels: { error: 'e' } } }, {})
   assert(sup.customStatus === 'cs', 'extractSupplementaryStatus custom_status')
   assert(sup.error === 'e', 'extractSupplementaryStatus error')

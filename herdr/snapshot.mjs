@@ -2,6 +2,7 @@
 // Falls back to `herdr api snapshot` when the plugin event provides no path.
 
 import { execSync } from 'node:child_process'
+import { getExtendedPathEnv } from '../shared/env.mjs'
 
 function safeJsonParse(value) {
   try {
@@ -33,6 +34,7 @@ export function resolveWorkspaceFromSnapshot(paneId) {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['pipe', 'pipe', 'ignore'],
+      env: getExtendedPathEnv(),
     })
     const response = safeJsonParse(stdout)
     return findPaneCwd(response?.result?.snapshot, paneId)

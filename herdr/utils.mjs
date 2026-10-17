@@ -26,11 +26,24 @@ function contextAgent(context) {
 }
 
 function contextWorkspace(context) {
-  return context.focused_pane_workspace || context.workspace
+  const candidates = [
+    context.workspace_cwd,
+    context.focused_pane_cwd,
+    context.cwd,
+    context.focused_pane_workspace,
+    context.workspace,
+    context.workspace_label,
+  ]
+  return candidates.find(Boolean) || ''
 }
 
 function contextTab(context) {
-  return context.focused_pane_tab || context.tab
+  return (
+    context.tab_label ||
+    context.focused_pane_tab ||
+    context.tab ||
+    ''
+  )
 }
 
 // Parse environment-set JSON event and context.
@@ -62,12 +75,12 @@ function extractAgentFromData(data, context) {
 
 function extractWorkspaceFromData(data, context) {
   const candidates = [
+    data.workspace_cwd,
+    data.cwd,
     data.workspace,
     contextWorkspace(context),
     data.agent_session_path,
     context.agent_session_path,
-    data.cwd,
-    context.cwd,
   ]
   for (const value of candidates) {
     if (value) return value
