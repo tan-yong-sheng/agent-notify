@@ -31,6 +31,39 @@ function parseBool(value) {
   return value === 'true' || value === '1' || value === true
 }
 
+// ─── Dashboard port ─────────────────────────────────────────────────────────
+// Shared by the dashboard server and the service installer, so an install
+// message reports the port the installed service will actually bind.
+
+const DEFAULT_DASHBOARD_PORT = 3333
+
+function portValueFrom(argv, index) {
+  const arg = argv[index]
+  return arg.startsWith('--port=') ? arg.slice('--port='.length) : argv[index + 1]
+}
+
+function parseCliPort(argv = []) {
+  for (let i = 2; i < argv.length; i++) {
+    if (argv[i] === '--port' || argv[i].startsWith('--port=')) {
+      return parseInt(portValueFrom(argv, i), 10)
+    }
+  }
+  return null
+}
+
+function resolvePort(value) {
+  const parsed = parseInt(value, 10)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null
+}
+
+export function resolveDashboardPort(argv = process.argv, env = process.env, fileEnv = {}) {
+  return (
+    resolvePort(parseCliPort(argv)) ||
+    resolvePort(env.DASHBOARD_PORT || fileEnv.DASHBOARD_PORT) ||
+    DEFAULT_DASHBOARD_PORT
+  )
+}
+
 function parsePriority(value, defaultValue) {
   const num = Number(value)
   if (Number.isFinite(num) && num >= 1 && num <= 5) return num

@@ -2,6 +2,7 @@
 // Runs the Herdr adapter in integration mode and unit-tests shared/ntfy.mjs.
 
 import { execSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -32,7 +33,10 @@ import { getExtendedPathEnv } from './shared/env.mjs'
 import {
   resolveConfig as resolveDashboardConfig,
   isAllowedHost,
+  isDirectInvocation,
+  formatListenError,
 } from './dashboard.mjs'
+import { resolveDashboardPort } from './shared/config.mjs'
 import {
   normalizeAgentStatus,
   parseHerdrAgent,
@@ -48,10 +52,12 @@ import {
   resolveServiceRuntime,
   buildVersionLabel,
   fetchUpdateStatus,
+  checkUpdateStatusAsync,
   nonInteractiveGitEnv,
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
+const dashboardPath = fileURLToPath(new URL('./dashboard.mjs', import.meta.url))
 
 function assert(condition, label) {
   results.total++
@@ -588,6 +594,43 @@ async function runDashboardUnitTests() {
     resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '99999'], {}, {}).port === 3333,
     'resolveDashboardConfig rejects out-of-range port'
   )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '4002' }, { DASHBOARD_PORT: '4001' }) === 4002,
+    'resolveDashboardPort prefers the environment to the file'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], {}, { DASHBOARD_PORT: '4001' }) === 4001,
+    'resolveDashboardPort reads the .env fallback'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port', '4003'], {}, {}) === 4003,
+    'resolveDashboardPort prefers the flag'
+  )
+
+  // A launch through a symlink (or an npm/npx shim) must still start the server
+  // instead of resolving argv[1] to the link and exiting 0 without a word.
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-link-'))
+  const linkPath = path.join(linkDir, 'dashboard-link.mjs')
+  fs.symlinkSync(dashboardPath, linkPath)
+  assert(isDirectInvocation(['node', linkPath]), 'isDirectInvocation follows a symlinked entry point')
+  assert(isDirectInvocation(['node', dashboardPath]), 'isDirectInvocation accepts the real path')
+  assert(
+    !isDirectInvocation(['node', path.join(linkDir, 'other.mjs')]),
+    'isDirectInvocation rejects another file'
+  )
+  assert(!isDirectInvocation(['node']), 'isDirectInvocation rejects a missing argv[1]')
+  assert(
+    !isDirectInvocation(['node', path.join(linkDir, 'gone.mjs')]),
+    'isDirectInvocation rejects an unresolvable path'
+  )
+
+  assert(formatListenError({ code: 'EADDRINUSE' }, 3333).includes('3333'), 'formatListenError names the busy port')
+  assert(/already in use/.test(formatListenError({ code: 'EADDRINUSE' }, 3333)), 'formatListenError explains a busy port')
+  assert(/Not allowed/.test(formatListenError({ code: 'EACCES' }, 80)), 'formatListenError explains a privileged port')
+  assert(
+    formatListenError(new Error('boom'), 3333).includes('boom'),
+    'formatListenError falls back to the error message'
+  )
 
   assert(isAllowedHost('localhost:3333'), 'isAllowedHost accepts localhost with port')
   assert(isAllowedHost('127.0.0.1:3333'), 'isAllowedHost accepts loopback ip')
@@ -695,6 +738,78 @@ async function runDashboardUnitTests() {
   assert(updateStatus.hasUpdate === false, 'fetchUpdateStatus reports no update without a target')
   assert(Boolean(updateStatus.unavailable), 'fetchUpdateStatus explains the missing target')
   assert(fetchUpdateStatus('/nonexistent').isGit === false, 'fetchUpdateStatus non-git directory')
+
+  // The dashboard route must not run the probe on its event loop. A 0ms timer
+  // proves the loop kept running while the probe was in flight: with a
+  // synchronous probe the timer is cancelled before it can fire, because the
+  // awaiting continuation is a microtask that runs first. The probe entry is the
+  // real dashboard script, but the target is a non-git temp directory, so the
+  // child re-enters the script and the check stays offline.
+  let loopRanWhileProbing = false
+  const probeTimer = setTimeout(() => {
+    loopRanWhileProbing = true
+  }, 0)
+  const firstStatus = await checkUpdateStatusAsync(linkDir, [dashboardPath])
+  clearTimeout(probeTimer)
+  assert(firstStatus.isGit === false, 'checkUpdateStatusAsync reports a non-git directory')
+  assert(typeof firstStatus.checkedAt === 'number', 'checkUpdateStatusAsync returns a status with checkedAt')
+  assert(loopRanWhileProbing, 'checkUpdateStatusAsync does not block the event loop')
+  assert(
+    (await checkUpdateStatusAsync(linkDir, [dashboardPath])) === firstStatus,
+    'checkUpdateStatusAsync serves a repeat call from cache'
+  )
+
+  // Installing must restart an already-running unit: `enable --now` leaves a
+  // running unit on its previous definition, so reinstalling after an edit would
+  // keep serving the old ExecStart. A fake systemctl on PATH records the calls it
+  // receives, so the real install path runs without touching the user's units.
+  if (getServicePlatform() === 'linux') {
+    const runInstall = (isActive) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-home-'))
+      const binDir = path.join(home, 'bin')
+      fs.mkdirSync(binDir, { recursive: true })
+      const callsLog = path.join(home, 'calls.log')
+      fs.writeFileSync(
+        path.join(binDir, 'systemctl'),
+        [
+          '#!/bin/sh',
+          `echo "$@" >> "${callsLog}"`,
+          '[ "$2" = "is-active" ] && exit "${FAKE_IS_ACTIVE:-0}"',
+          'exit 0',
+          '',
+        ].join('\n'),
+        { mode: 0o755 }
+      )
+      const stdout = execSync(`"${process.execPath}" "${dashboardPath}" --service install`, {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+          DASHBOARD_PORT: '4321',
+          FAKE_IS_ACTIVE: isActive ? '0' : '3',
+        },
+      })
+      return { calls: fs.readFileSync(callsLog, 'utf8'), stdout, home }
+    }
+
+    const freshInstall = runInstall(false)
+    assert(freshInstall.calls.includes('--user daemon-reload'), 'service install reloads systemd units')
+    assert(freshInstall.calls.includes('--user enable agent-monitor.service'), 'service install enables the unit')
+    assert(freshInstall.calls.includes('--user start agent-monitor.service'), 'service install starts a stopped unit')
+    assert(freshInstall.stdout.includes('http://localhost:4321'), 'service install reports the resolved port')
+    assert(
+      fs.existsSync(path.join(freshInstall.home, '.config', 'systemd', 'user', 'agent-monitor.service')),
+      'service install writes the unit file'
+    )
+
+    const reinstall = runInstall(true)
+    assert(reinstall.calls.includes('--user restart agent-monitor.service'), 'service install restarts an active unit')
+    assert(
+      !reinstall.calls.includes('--user start agent-monitor.service'),
+      'service install does not start an already active unit'
+    )
+  }
   fs.rmSync(tmpRepoDir, { recursive: true, force: true })
 
   // This check runs inside the HTTP server: git must never sit on a credential

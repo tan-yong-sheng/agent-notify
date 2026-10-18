@@ -6,11 +6,12 @@
 //
 // Also provides git-based update checks and one-command upgrades.
 
-import { execSync, execFileSync, spawn } from 'node:child_process'
+import { execSync, execFileSync, execFile, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { getExtendedPathEnv } from './env.mjs'
+import { resolveDashboardPort } from './config.mjs'
 
 const SERVICE_NAME = 'agent-monitor'
 const MACOS_LABEL = 'dev.agent-notify.dashboard'
@@ -128,16 +129,27 @@ WantedBy=default.target
 `
 }
 
-function installLinuxService({ nodeBin, scriptPath, repoDir }) {
+// `systemctl --user is-active` exits 0 only for an active unit, and reports the
+// state even when the unit file is missing.
+function isSystemdServiceActive() {
+  return runQuiet(`systemctl --user is-active ${SERVICE_NAME}.service`).ok
+}
+
+function installLinuxService({ nodeBin, scriptPath, repoDir, port }) {
   const dir = getSystemdDir()
   fs.mkdirSync(dir, { recursive: true })
   const serviceFile = getSystemdServicePath()
   fs.writeFileSync(serviceFile, buildSystemdUnit(nodeBin, scriptPath, repoDir), 'utf8')
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' })
-  execSync(`systemctl --user enable --now ${SERVICE_NAME}.service`, { stdio: 'inherit' })
+  // `enable --now` leaves a unit that is already running on its previous
+  // definition, so reinstalling after an edit would keep serving the old
+  // ExecStart until a manual restart. Restart when it is already up.
+  const wasActive = isSystemdServiceActive()
+  execSync(`systemctl --user enable ${SERVICE_NAME}.service`, { stdio: 'inherit' })
+  execSync(`systemctl --user ${wasActive ? 'restart' : 'start'} ${SERVICE_NAME}.service`, { stdio: 'inherit' })
   console.log(`\n✅ Successfully installed and started ${SERVICE_NAME} via systemd --user!`)
-  console.log(`   Status: http://localhost:3333`)
+  console.log(`   Status: http://localhost:${port}`)
   console.log(`   Manage with: node dashboard.mjs --service [status|restart|uninstall|logs]\n`)
 }
 
@@ -196,6 +208,16 @@ function getLaunchdPlistPath() {
   return path.join(getLaunchdDir(), `${MACOS_LABEL}.plist`)
 }
 
+// launchd opens these itself, so they live outside a world-readable /tmp: the
+// dashboard log carries worktree paths and agent prompts.
+function getLaunchdLogDir() {
+  return path.join(os.homedir(), 'Library', 'Logs', SERVICE_NAME)
+}
+
+function getLaunchdLogPath(stream) {
+  return path.join(getLaunchdLogDir(), `${stream}.log`)
+}
+
 export function buildLaunchdPlist(nodeBin, scriptPath, repoDir) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -215,24 +237,27 @@ export function buildLaunchdPlist(nodeBin, scriptPath, repoDir) {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/${SERVICE_NAME}.stdout.log</string>
+    <string>${xmlEscape(getLaunchdLogPath('stdout'))}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/${SERVICE_NAME}.stderr.log</string>
+    <string>${xmlEscape(getLaunchdLogPath('stderr'))}</string>
 </dict>
 </plist>
 `
 }
 
-function installDarwinService({ nodeBin, scriptPath, repoDir }) {
+function installDarwinService({ nodeBin, scriptPath, repoDir, port }) {
   const dir = getLaunchdDir()
   fs.mkdirSync(dir, { recursive: true })
+  // launchd opens the log files before the job starts, so the directory has to
+  // exist first or the job fails to load.
+  fs.mkdirSync(getLaunchdLogDir(), { recursive: true })
   const plistPath = getLaunchdPlistPath()
   fs.writeFileSync(plistPath, buildLaunchdPlist(nodeBin, scriptPath, repoDir), 'utf8')
 
   execFileSync('launchctl', ['load', '-w', plistPath], { stdio: 'inherit' })
   console.log(`\n✅ Successfully installed and started ${MACOS_LABEL} via launchd!`)
-  console.log(`   Status: http://localhost:3333`)
-  console.log(`   Logs: /tmp/${SERVICE_NAME}.stdout.log\n`)
+  console.log(`   Status: http://localhost:${port}`)
+  console.log(`   Logs: ${getLaunchdLogPath('stdout')}\n`)
 }
 
 function statusDarwinService() {
@@ -262,7 +287,7 @@ function restartDarwinService(context) {
 }
 
 function logsDarwinService() {
-  const logFile = `/tmp/${SERVICE_NAME}.stdout.log`
+  const logFile = getLaunchdLogPath('stdout')
   console.log(`Tailing ${logFile}:`)
   spawn('tail', ['-f', logFile], { stdio: 'inherit' })
 }
@@ -325,7 +350,7 @@ const PLATFORM_SERVICES = {
   },
 }
 
-export function handleServiceCommand(argv) {
+export function handleServiceCommand(argv, { port } = {}) {
   const serviceIndex = argv.indexOf('--service')
   if (serviceIndex === -1) return false
 
@@ -334,6 +359,9 @@ export function handleServiceCommand(argv) {
   const repoDir = path.dirname(scriptPath)
   const nodeBin = resolveServiceRuntime()
   const platform = getServicePlatform()
+  // The dashboard passes the port it resolved (which includes .env); the fallback
+  // keeps a bare --service call usable on its own.
+  const dashboardPort = port ?? resolveDashboardPort(argv, process.env, {})
 
   const platformOps = PLATFORM_SERVICES[platform]
   if (!platformOps) {
@@ -349,7 +377,7 @@ export function handleServiceCommand(argv) {
   }
 
   try {
-    handler({ nodeBin, scriptPath, repoDir })
+    handler({ nodeBin, scriptPath, repoDir, port: dashboardPort })
   } catch (err) {
     // A path that cannot be represented in a unit file is refused rather than
     // written, and supervisor failures (no systemd --user, unwritable directory)
@@ -440,10 +468,10 @@ export function buildVersionLabel(localVersions, remoteVersions) {
 
 // Uncached probe. Does a `git fetch` of the update target, so it mutates the
 // repo's remote-tracking refs and needs network access; callers that render the
-// UI should go through checkUpdateStatus instead.
-// The update check runs inside the dashboard's HTTP server, where a git
-// credential prompt would block the event loop until the timeout expires and
-// stall every other request. This env makes git fail fast instead of asking.
+// UI should go through checkUpdateStatusAsync instead.
+// The update check is reachable from the dashboard's HTTP server, where a git
+// credential prompt would hang until the timeout expires and stall the request.
+// This env makes git fail fast instead of asking.
 // GIT_ASKPASS is cleared too: git consults an askpass program even when
 // GIT_TERMINAL_PROMPT=0, and getExtendedPathEnv() inherits it from the parent
 // environment, so a configured askpass would bypass the guard above.
@@ -495,7 +523,7 @@ export function fetchUpdateStatus(repoDir) {
   }
 }
 
-export function checkUpdateStatus(repoDir) {
+function checkUpdateStatus(repoDir) {
   const now = Date.now()
   if (cachedUpdateCheck && now - lastUpdateCheckTime < UPDATE_CHECK_INTERVAL_MS) {
     return cachedUpdateCheck
@@ -503,6 +531,71 @@ export function checkUpdateStatus(repoDir) {
   cachedUpdateCheck = fetchUpdateStatus(repoDir)
   lastUpdateCheckTime = now
   return cachedUpdateCheck
+}
+
+// The probe fetches from the remote, which takes seconds on a real network, and
+// every git call above is synchronous: run from the dashboard it freezes the
+// event loop for the duration (measured 4.5s cold, 3.8s of that the fetch) and
+// stalls agent polling. A child process keeps the blocking work off this loop;
+// the CLI keeps using the synchronous form above.
+const PROBE_TIMEOUT_MS = 30000
+let pendingUpdateCheck = null
+
+function probeUpdateStatusInChild(repoDir, probeArgv) {
+  if (!probeArgv?.length) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [...probeArgv, '--update-status-json', repoDir],
+      { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, env: nonInteractiveGitEnv() },
+      (err, stdout) => {
+        if (err) return resolve(null)
+        try {
+          const status = JSON.parse(stdout)
+          resolve(status && typeof status === 'object' ? status : null)
+        } catch {
+          resolve(null)
+        }
+      }
+    )
+  })
+}
+
+// Same 1h cache as the CLI form, but callers that arrive together share one
+// in-flight probe, and a probe that cannot run degrades to the last known
+// status instead of throwing into the request handler.
+// repoDir is the checkout to report on and probeArgv is the entry point to run
+// the probe as, e.g. the dashboard script: the child re-enters it with
+// --update-status-json and the repoDir, so the target never depends on how the
+// child runtime resolves its own entry path (Bun rewrites argv[1] to the
+// resolved realpath, Node keeps it).
+export async function checkUpdateStatusAsync(repoDir, probeArgv) {
+  const now = Date.now()
+  if (cachedUpdateCheck && now - lastUpdateCheckTime < UPDATE_CHECK_INTERVAL_MS) {
+    return cachedUpdateCheck
+  }
+  if (!pendingUpdateCheck) {
+    pendingUpdateCheck = probeUpdateStatusInChild(repoDir, probeArgv)
+      .then((status) => {
+        if (status) {
+          cachedUpdateCheck = status
+          lastUpdateCheckTime = Date.now()
+        }
+        return (
+          status ||
+          cachedUpdateCheck || {
+            isGit: false,
+            hasUpdate: false,
+            unavailable: 'the update check could not run',
+            checkedAt: Date.now(),
+          }
+        )
+      })
+      .finally(() => {
+        pendingUpdateCheck = null
+      })
+  }
+  return pendingUpdateCheck
 }
 
 function printCheckUpdateResult(status) {
@@ -532,16 +625,10 @@ function printCheckUpdateResult(status) {
 
 function restartServiceIfActive() {
   if (process.platform === 'linux') {
-    try {
-      const isActive = execSync(`systemctl --user is-active ${SERVICE_NAME}.service`, {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-      }).trim()
-      if (isActive === 'active') {
-        console.log(`Restarting ${SERVICE_NAME} systemd service...`)
-        execSync(`systemctl --user restart ${SERVICE_NAME}.service`, { stdio: 'inherit' })
-      }
-    } catch {}
+    if (isSystemdServiceActive()) {
+      console.log(`Restarting ${SERVICE_NAME} systemd service...`)
+      execSync(`systemctl --user restart ${SERVICE_NAME}.service`, { stdio: 'inherit' })
+    }
     return
   }
 
@@ -587,10 +674,21 @@ function executeGitUpdate(repoDir, env) {
 export function handleUpdateCommand(argv) {
   const wantsUpdate = argv.includes('--update')
   const wantsCheck = argv.includes('--check-update')
-  if (!wantsUpdate && !wantsCheck) return false
+  const wantsStatusJson = argv.includes('--update-status-json')
+  if (!wantsUpdate && !wantsCheck && !wantsStatusJson) return false
 
   const scriptPath = path.resolve(argv[1])
   const repoDir = path.dirname(scriptPath)
+
+  // Machine-readable form of --check-update. The dashboard runs this in a child
+  // process so its event loop is free while the git calls block. An explicit
+  // directory after the flag reports on that checkout instead of this script's.
+  if (wantsStatusJson) {
+    const explicitTarget = argv[argv.indexOf('--update-status-json') + 1]
+    const target = explicitTarget && !explicitTarget.startsWith('--') ? path.resolve(explicitTarget) : repoDir
+    console.log(JSON.stringify(fetchUpdateStatus(target)))
+    return true
+  }
 
   if (wantsCheck) {
     console.log(`Checking for updates...`)

@@ -13,8 +13,8 @@ import { URL, fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs'
 import { loadEnv } from './shared/env.mjs'
-import { resolveConfigDir } from './shared/config.mjs'
-import { handleServiceCommand, handleUpdateCommand, checkUpdateStatus } from './shared/service.mjs'
+import { resolveConfigDir, resolveDashboardPort } from './shared/config.mjs'
+import { handleServiceCommand, handleUpdateCommand, checkUpdateStatusAsync } from './shared/service.mjs'
 import {
   getLiveAgents,
   normalizeAgentStatus,
@@ -24,18 +24,6 @@ import {
 } from './shared/catalog.mjs'
 
 // ─── Configuration & Port Resolution ─────────────────────────────────────────
-
-function parseCliPort(argv) {
-  for (let i = 2; i < argv.length; i++) {
-    if (argv[i] === '--port' && argv[i + 1]) {
-      return parseInt(argv[i + 1], 10)
-    }
-    if (argv[i].startsWith('--port=')) {
-      return parseInt(argv[i].split('=')[1], 10)
-    }
-  }
-  return null
-}
 
 function loadDashboardEnv() {
   const pluginRoot = path.dirname(fileURLToPath(import.meta.url))
@@ -51,24 +39,18 @@ function loadDashboardEnv() {
   }
 }
 
-const DEFAULT_PORT = 3333
-
-function resolvePort(value) {
-  const parsed = parseInt(value, 10)
-  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null
-}
-
 export function resolveConfig(argv = process.argv, env = process.env, fileEnv = loadDashboardEnv()) {
-  const cliPort = parseCliPort(argv)
-  const port =
-    resolvePort(cliPort) ||
-    resolvePort(env.DASHBOARD_PORT || fileEnv.DASHBOARD_PORT) ||
-    DEFAULT_PORT
-  return { port }
+  return { port: resolveDashboardPort(argv, env, fileEnv) }
 }
 
 const config = resolveConfig()
 const PORT = config.port
+
+// The update probe re-enters this same script with --update-status-json, in its
+// own process, so its blocking git calls stay off this event loop.
+const SCRIPT_PATH = fileURLToPath(import.meta.url)
+const PROBE_ARGV = [SCRIPT_PATH]
+const REPO_DIR = path.dirname(SCRIPT_PATH)
 
 export { normalizeAgentStatus, parseHerdrAgent, parseOrcaAgent, collectLiveState }
 
@@ -677,8 +659,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (reqUrl.pathname === '/api/update') {
-    const repoDir = path.dirname(fileURLToPath(import.meta.url))
-    const updateInfo = checkUpdateStatus(repoDir)
+    const updateInfo = await checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV)
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-cache',
@@ -696,22 +677,54 @@ const server = http.createServer(async (req, res) => {
   res.end('Not Found')
 })
 
+// Server failures (a port already bound, a privileged port) arrive as an 'error'
+// event; without a handler they surface as an unhandled exception, so a second
+// dashboard on the same port would print a raw stack trace.
+export function formatListenError(err, port) {
+  if (err?.code === 'EADDRINUSE') {
+    return `Port ${port} is already in use - another dashboard is probably running.\n   Stop the other instance, or start this one elsewhere: node dashboard.mjs --port <number>`
+  }
+  if (err?.code === 'EACCES') {
+    return `Not allowed to bind port ${port}.\n   Pick a port above 1023: node dashboard.mjs --port <number>`
+  }
+  return `Could not start the dashboard on port ${port}: ${err?.message || err}`
+}
+
+server.on('error', (err) => {
+  console.error(`\n❌ ${formatListenError(err, PORT)}\n`)
+  process.exit(1)
+})
+
 export function handleCliCommands(argv = process.argv) {
-  if (handleServiceCommand(argv)) return true
+  if (handleServiceCommand(argv, { port: PORT })) return true
   if (handleUpdateCommand(argv)) return true
   return false
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// A symlinked (or npm/npx-shimmed) dashboard.mjs resolves argv[1] to the link,
+// not to the real file, so comparing raw strings would find no match and exit 0
+// without starting anything. Compare realpaths, and treat a path that cannot be
+// resolved as "not this file".
+export function isDirectInvocation(argv = process.argv, moduleUrl = import.meta.url) {
+  const invoked = argv[1]
+  if (!invoked) return false
+  try {
+    return fs.realpathSync(invoked) === fs.realpathSync(fileURLToPath(moduleUrl))
+  } catch {
+    return false
+  }
+}
+
+if (isDirectInvocation(process.argv)) {
   const handled = handleCliCommands(process.argv)
   if (!handled) {
     server.listen(PORT, '127.0.0.1', () => {
       console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
       console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
       console.log(`   Press Ctrl+C to stop.\n`)
-      // The remote-version query is synchronous, so warm the cache before any
-      // client polls: otherwise the first /api/update blocks agent polling.
-      setTimeout(() => checkUpdateStatus(path.dirname(fileURLToPath(import.meta.url))), 0)
+      // Warms the 1h cache off the request path; the probe runs in a child
+      // process, so the first /api/update does not block agent polling.
+      checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV).catch(() => {})
     })
   }
 }

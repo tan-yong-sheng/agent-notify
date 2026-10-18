@@ -193,7 +193,7 @@ Then visit [http://localhost:3333](http://localhost:3333).
 
 You can install the dashboard as a persistent background daemon that starts on login:
 - **Linux**: Managed via `systemd --user` (`~/.config/systemd/user/agent-monitor.service`)
-- **macOS**: Managed via `launchd` (`~/Library/LaunchAgents/dev.agent-notify.dashboard.plist`)
+- **macOS**: Managed via `launchd` (`~/Library/LaunchAgents/dev.agent-notify.dashboard.plist`), logging to `~/Library/Logs/agent-monitor`
 - **Windows**: Managed via user Startup folder shortcut
 - **Opportunistic Bun**: Automatically selects `bun` if installed on your system to minimize daemon background RAM usage (~35 MB), falling back to `node`.
 
@@ -221,6 +221,9 @@ The dashboard checks the branch your checkout actually tracks (falling back to `
 ```bash
 # Check if updates are available
 node dashboard.mjs --check-update
+
+# The same result as JSON, optionally for another checkout
+node dashboard.mjs --update-status-json [path]
 
 # Fast-forward the tracked upstream; restarts the service only if HEAD moved
 node dashboard.mjs --update
