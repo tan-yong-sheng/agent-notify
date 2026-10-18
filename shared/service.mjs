@@ -344,7 +344,15 @@ export function handleServiceCommand(argv) {
     return true
   }
 
-  handler({ nodeBin, scriptPath, repoDir })
+  try {
+    handler({ nodeBin, scriptPath, repoDir })
+  } catch (err) {
+    // A path that cannot be represented in a unit file is refused rather than
+    // written, and supervisor failures (no systemd --user, unwritable directory)
+    // should read as an error rather than a stack trace.
+    console.error(`\n❌ Service ${action} failed: ${err.message}\n`)
+    process.exitCode = 1
+  }
   return true
 }
 
