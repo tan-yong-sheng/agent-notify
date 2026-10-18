@@ -74,21 +74,23 @@ if (isDirty(REPO_ROOT, { trackedOnly: true })) {
   process.exit(2)
 }
 
-// A recycled pid would otherwise block every later run for good: on Linux the
-// recorded pid only counts as the holder when its command line is still this
-// driver.
+// A lock left by a dead run must not block every later run, and a recycled pid
+// must not be mistaken for the holder. Only a pid that is alive but provably
+// something else lets a new run take the lock over.
 function mutationDriverIsAlive(pid) {
   if (!pid) return false
   try {
     process.kill(pid, 0)
-  } catch {
-    return false
+  } catch (err) {
+    return err.code === 'EPERM' // alive, just not ours to signal; ESRCH means gone
   }
   try {
     return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('mutate.mjs')
-  } catch (err) {
-    // No /proc at all (macOS, Windows): a live pid is all the OS will tell us.
-    return err.code !== 'ENOENT'
+  } catch {
+    // Nothing to read: macOS and Windows have no /proc, and Linux may not let us
+    // look. A live pid is all the OS will tell us, and admitting a second driver
+    // is worse than refusing one, so refuse.
+    return true
   }
 }
 
