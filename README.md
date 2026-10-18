@@ -174,6 +174,8 @@ A lightweight, zero-dependency local web dashboard to monitor which coding agent
 
 ```bash
 node dashboard.mjs
+# Or start with bun for lower memory usage:
+bun dashboard.mjs
 # Or specify a custom port:
 node dashboard.mjs --port 8080
 ```
@@ -181,6 +183,7 @@ node dashboard.mjs --port 8080
 Then visit [http://localhost:3333](http://localhost:3333).
 
 - **Real-time status**: Polls live agent state across Orca and Herdr every 3 seconds without UI flicker.
+- **Low Memory / Multi-Runtime**: Runs on standard Node.js or opportunistically under Bun (~35 MB RSS vs ~57 MB RSS).
 - **Compact dense table**: Clean layout showing status badges (🟢 Working, 🟡 Needs Action, ⚪ Done / Idle), host environment (`Orca` / `Herdr`), agent type (`pi`), workspace directory, git branch, and active tool / prompt.
 - **Search & Filter**: Real-time filter box and quick tabs (`All`, `Working`, `Needs Action`, `Settled`).
 - **Click-to-copy & Inspect**: Click any directory path to copy it to your clipboard, or click a prompt to expand its full text.
@@ -192,6 +195,7 @@ You can install the dashboard as a persistent background daemon that starts on l
 - **Linux**: Managed via `systemd --user` (`~/.config/systemd/user/agent-monitor.service`)
 - **macOS**: Managed via `launchd` (`~/Library/LaunchAgents/dev.agent-notify.dashboard.plist`)
 - **Windows**: Managed via user Startup folder shortcut
+- **Opportunistic Bun**: Automatically selects `bun` if installed on your system to minimize daemon background RAM usage (~35 MB), falling back to `node`.
 
 ```bash
 # Install and start service on login

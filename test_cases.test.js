@@ -40,6 +40,7 @@ import {
   buildLaunchdPlist,
   buildWindowsVbs,
   getServicePlatform,
+  resolveServiceRuntime,
   checkUpdateStatus,
 } from './shared/service.mjs'
 
@@ -608,6 +609,8 @@ function runDashboardUnitTests() {
 
   // Service & Update tests
   assert(getServicePlatform() === process.platform, 'getServicePlatform matches process.platform')
+  assert(resolveServiceRuntime('/custom/bun').includes('bun'), 'resolveServiceRuntime detects bun')
+  assert(typeof resolveServiceRuntime() === 'string', 'resolveServiceRuntime returns string')
 
   const systemd = buildSystemdUnit('/usr/bin/node', '/path/dashboard.mjs', '/path')
   assert(systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs'), 'buildSystemdUnit ExecStart')

@@ -19,6 +19,24 @@ export function getServicePlatform() {
   return process.platform
 }
 
+export function resolveServiceRuntime(customExecPath) {
+  const currentExec = customExecPath || process.execPath
+  if (currentExec.includes('bun')) {
+    return currentExec
+  }
+
+  // Check if bun is installed and available in extended PATH
+  const env = getExtendedPathEnv()
+  try {
+    const bunPath = execSync('which bun', { env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim()
+    if (bunPath && fs.existsSync(bunPath)) {
+      return bunPath
+    }
+  } catch {}
+
+  return currentExec
+}
+
 // ─── Systemd (Linux) ─────────────────────────────────────────────────────────
 
 function getSystemdDir() {
@@ -233,7 +251,7 @@ export function handleServiceCommand(argv) {
   const action = argv[serviceIndex + 1] || 'status'
   const scriptPath = path.resolve(argv[1])
   const repoDir = path.dirname(scriptPath)
-  const nodeBin = process.execPath
+  const nodeBin = resolveServiceRuntime()
   const platform = getServicePlatform()
 
   const platformOps = PLATFORM_SERVICES[platform]
