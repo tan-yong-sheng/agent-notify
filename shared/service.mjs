@@ -103,8 +103,15 @@ export function resolveServiceRuntime(customExecPath) {
 
 // ─── Systemd (Linux) ─────────────────────────────────────────────────────────
 
+// An install belongs to the invoking user, so an explicit HOME wins: Node reads it
+// from os.homedir(), Bun resolves the passwd entry instead, and both runtimes must
+// place the service in the same directory.
+function getUserHome() {
+  return process.env.HOME || os.homedir()
+}
+
 function getSystemdDir() {
-  return path.join(os.homedir(), '.config', 'systemd', 'user')
+  return path.join(getUserHome(), '.config', 'systemd', 'user')
 }
 
 function getSystemdServicePath() {
@@ -212,7 +219,7 @@ function logsLinuxService() {
 // ─── Launchd (macOS) ─────────────────────────────────────────────────────────
 
 function getLaunchdDir() {
-  return path.join(os.homedir(), 'Library', 'LaunchAgents')
+  return path.join(getUserHome(), 'Library', 'LaunchAgents')
 }
 
 function getLaunchdPlistPath() {
@@ -222,7 +229,7 @@ function getLaunchdPlistPath() {
 // launchd opens these itself, so they live outside a world-readable /tmp: the
 // dashboard log carries worktree paths and agent prompts.
 function getLaunchdLogDir() {
-  return path.join(os.homedir(), 'Library', 'Logs', SERVICE_NAME)
+  return path.join(getUserHome(), 'Library', 'Logs', SERVICE_NAME)
 }
 
 function getLaunchdLogPath(stream) {
@@ -259,7 +266,9 @@ export function buildLaunchdPlist(nodeBin, scriptPath, repoDir, port) {
 `
 }
 
-function installDarwinService({ nodeBin, scriptPath, repoDir, port }) {
+// Exported for the installer test: the plist builder alone cannot show that a
+// reload replaces an already loaded job.
+export function installDarwinService({ nodeBin, scriptPath, repoDir, port }) {
   const dir = getLaunchdDir()
   fs.mkdirSync(dir, { recursive: true })
   // launchd opens the log files before the job starts, so the directory has to

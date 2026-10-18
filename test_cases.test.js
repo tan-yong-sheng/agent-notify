@@ -49,6 +49,7 @@ import {
   buildSystemdUnit,
   buildLaunchdPlist,
   buildWindowsVbs,
+  installDarwinService,
   getServicePlatform,
   resolveServiceRuntime,
   buildVersionLabel,
@@ -60,6 +61,23 @@ import {
 const results = { pass: 0, fail: 0, total: 0 }
 const dashboardPath = fileURLToPath(new URL('./dashboard.mjs', import.meta.url))
 const catalogPath = fileURLToPath(new URL('./shared/catalog.mjs', import.meta.url))
+
+// launchd installs run the real installer against a fake supervisor, so the
+// supervisor's chatter is swallowed instead of interleaving with the report.
+function captureConsole(fn) {
+  const lines = []
+  const realLog = console.log
+  const realError = console.error
+  console.log = (...parts) => lines.push(parts.join(' '))
+  console.error = (...parts) => lines.push(parts.join(' '))
+  try {
+    fn()
+  } finally {
+    console.log = realLog
+    console.error = realError
+  }
+  return lines
+}
 
 function assert(condition, label) {
   results.total++
@@ -781,6 +799,64 @@ async function runDashboardUnitTests() {
     vbsQuoteRejected = true
   }
   assert(vbsQuoteRejected, 'buildWindowsVbs refuses a quote that would break the launcher')
+
+  // The launchd installer has to replace a job that is already loaded: `load` on
+  // its own leaves the previous definition (and its old port) running. Exercised
+  // through the real installer with a fake `launchctl` on PATH and a throwaway
+  // HOME, so the plist lands somewhere harmless and no supervisor is touched.
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-launchd-'))
+  const binDir = path.join(fakeHome, 'bin')
+  const launchctlLog = path.join(fakeHome, 'launchctl.log')
+  const loadedMarker = path.join(fakeHome, 'loaded')
+  const launchedPlist = path.join(fakeHome, 'Library', 'LaunchAgents', 'dev.agent-notify.dashboard.plist')
+  fs.mkdirSync(binDir, { recursive: true })
+  const fakeLaunchctl = path.join(binDir, 'launchctl')
+  fs.writeFileSync(
+    fakeLaunchctl,
+    [
+      '#!/bin/sh',
+      // `list` is the probe for a loaded job, so only the mutating calls are logged.
+      `if [ "$1" != list ]; then printf '%s\\n' "$*" >> ${JSON.stringify(launchctlLog)}; fi`,
+      `if [ "$1" = list ] && [ -f ${JSON.stringify(loadedMarker)} ]; then printf '4242\\t0\\tdev.agent-notify.dashboard\\n'; fi`,
+      'exit 0',
+      '',
+    ].join('\n')
+  )
+  fs.chmodSync(fakeLaunchctl, 0o755)
+  const savedHome = process.env.HOME
+  const savedPath = process.env.PATH
+  process.env.HOME = fakeHome
+  process.env.PATH = `${binDir}:${savedPath}`
+  try {
+    const installContext = {
+      nodeBin: '/usr/bin/node',
+      scriptPath: path.join(fakeHome, 'dashboard.mjs'),
+      repoDir: fakeHome,
+      port: 4501,
+    }
+    captureConsole(() => installDarwinService(installContext))
+    assert(
+      fs.readFileSync(launchctlLog, 'utf8').trim() === `load -w ${launchedPlist}`,
+      'launchd install loads a job that was not running'
+    )
+    assert(
+      fs.readFileSync(launchedPlist, 'utf8').includes('<string>4501</string>'),
+      'launchd install writes the reported port into the plist'
+    )
+
+    fs.writeFileSync(launchctlLog, '')
+    fs.writeFileSync(loadedMarker, '1')
+    captureConsole(() => installDarwinService(installContext))
+    assert(
+      fs.readFileSync(launchctlLog, 'utf8').trim().split('\n').join(' | ') ===
+        `unload -w ${launchedPlist} | load -w ${launchedPlist}`,
+      'launchd reinstall unloads the running job before loading the rewritten plist'
+    )
+  } finally {
+    process.env.HOME = savedHome
+    process.env.PATH = savedPath
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
 
   // No remote configured, so this stays offline: it must report a git checkout
   // it cannot resolve, rather than reaching out to the network.
