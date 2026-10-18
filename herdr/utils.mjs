@@ -25,14 +25,19 @@ function contextAgent(context) {
   return context.focused_pane_agent || context.agent
 }
 
-function contextWorkspace(context) {
+function contextWorkspace(context, eventPaneId) {
+  // In a multi-pane workspace, the 'focused' pane may not be the event's pane.
+  // Only use focused_pane_cwd if it matches the event; otherwise defer to snapshot.
+  const focusedPaneId = context.focused_pane_id
+  const focusedMatchesEvent = focusedPaneId && String(focusedPaneId) === String(eventPaneId)
+
   const candidates = [
     context.workspace_cwd,
-    context.focused_pane_cwd,
+    focusedMatchesEvent ? context.focused_pane_cwd : null,
     context.cwd,
+    // workspace and workspace_label are labels, not paths; keep them as fallbacks only.
     context.focused_pane_workspace,
     context.workspace,
-    context.workspace_label,
   ]
   return candidates.find(Boolean) || ''
 }
@@ -74,11 +79,12 @@ function extractAgentFromData(data, context) {
 }
 
 function extractWorkspaceFromData(data, context) {
+  const paneId = extractPaneIdFromData(data, context)
   const candidates = [
     data.workspace_cwd,
     data.cwd,
     data.workspace,
-    contextWorkspace(context),
+    contextWorkspace(context, paneId),
     data.agent_session_path,
     context.agent_session_path,
   ]

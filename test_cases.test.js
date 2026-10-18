@@ -430,9 +430,16 @@ async function runHerdrUnitTests() {
 
   const wsFocusedCwd = extractWorkspaceContext(
     { data: { pane_id: 'wG5:p3' } },
-    { focused_pane_cwd: '/home/user/focused-project' }
+    { focused_pane_id: 'wG5:p3', focused_pane_cwd: '/home/user/focused-project' }
   )
-  assert(wsFocusedCwd.workspace === '/home/user/focused-project', 'extractWorkspaceContext Herdr focused_pane_cwd')
+  assert(wsFocusedCwd.workspace === '/home/user/focused-project', 'extractWorkspaceContext Herdr focused_pane_cwd when pane matches')
+
+  // When focused_pane_id does NOT match the event pane, focused_pane_cwd must be ignored.
+  const wsMismatchedPane = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { focused_pane_id: 'wG5:other', focused_pane_cwd: '/home/user/other-project' }
+  )
+  assert(wsMismatchedPane.workspace === '', 'extractWorkspaceContext ignores focused_pane_cwd when pane ID mismatches')
 
   const sup = extractSupplementaryStatus({ data: { custom_status: 'cs', title: 't', state_labels: { error: 'e' } } }, {})
   assert(sup.customStatus === 'cs', 'extractSupplementaryStatus custom_status')
