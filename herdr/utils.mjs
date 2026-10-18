@@ -25,9 +25,14 @@ function contextAgent(context) {
   return context.focused_pane_agent || context.agent
 }
 
+// Herdr's plugin context separates paths from labels: workspace_cwd and
+// focused_pane_cwd are paths, workspace_label and tab_label are display labels.
+// Only paths may become a workspace, because the adapter resolves that value as
+// a directory (and runs git in it), and because any non-empty result suppresses
+// the pane-accurate snapshot fallback.
 function contextWorkspace(context, eventPaneId) {
   // In a multi-pane workspace, the 'focused' pane may not be the event's pane.
-  // Only use focused_pane_cwd if it matches the event; otherwise defer to snapshot.
+  // Only use focused_pane_cwd if the event itself proves the match.
   const focusedPaneId = context.focused_pane_id
   const focusedMatchesEvent = focusedPaneId && String(focusedPaneId) === String(eventPaneId)
 
@@ -35,9 +40,6 @@ function contextWorkspace(context, eventPaneId) {
     context.workspace_cwd,
     focusedMatchesEvent ? context.focused_pane_cwd : null,
     context.cwd,
-    // workspace and workspace_label are labels, not paths; keep them as fallbacks only.
-    context.focused_pane_workspace,
-    context.workspace,
   ]
   return candidates.find(Boolean) || ''
 }
@@ -79,12 +81,16 @@ function extractAgentFromData(data, context) {
 }
 
 function extractWorkspaceFromData(data, context) {
-  const paneId = extractPaneIdFromData(data, context)
+  // The match must use the event's own pane id: extractPaneIdFromData() falls
+  // back to context.focused_pane_id, which would compare the focused pane with
+  // itself and accept focused_pane_cwd with no evidence that it is this event's
+  // pane. The fallback stays in place for the returned pane id, so the snapshot
+  // lookup still has a pane to resolve.
+  const eventPaneId = data.pane_id || ''
   const candidates = [
     data.workspace_cwd,
     data.cwd,
-    data.workspace,
-    contextWorkspace(context, paneId),
+    contextWorkspace(context, eventPaneId),
     data.agent_session_path,
     context.agent_session_path,
   ]
