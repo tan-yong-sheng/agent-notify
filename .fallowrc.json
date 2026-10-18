@@ -25,6 +25,12 @@
         "maxUnitSize": 250,
         "maxCrap": 150,
         "reason": "OS service management and update execution commands"
+      },
+      {
+        "files": ["shared/catalog.mjs"],
+        "maxUnitSize": 250,
+        "maxCrap": 200,
+        "reason": "Multi-runtime agent discovery and schema normalization"
       }
     ]
   }

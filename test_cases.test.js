@@ -31,10 +31,13 @@ import {
 import { getExtendedPathEnv } from './shared/env.mjs'
 import {
   resolveConfig as resolveDashboardConfig,
+} from './dashboard.mjs'
+import {
   normalizeAgentStatus,
   parseHerdrAgent,
   parseOrcaAgent,
-} from './dashboard.mjs'
+  getLiveAgents,
+} from './shared/catalog.mjs'
 import {
   buildSystemdUnit,
   buildLaunchdPlist,
@@ -559,7 +562,7 @@ function runOrcaMainUnitTests() {
   assert(isSettleAlreadyNotified(pane, 'done') === false, 'forgotten pane notifies again')
 }
 
-function runDashboardUnitTests() {
+async function runDashboardUnitTests() {
   console.log('\nRunning dashboard.mjs unit tests...\n')
 
   const env = getExtendedPathEnv(['/nonexistent/test/path'])
@@ -626,6 +629,11 @@ function runDashboardUnitTests() {
   const updateStatus = checkUpdateStatus(process.cwd())
   assert(typeof updateStatus === 'object', 'checkUpdateStatus returns object')
   assert(updateStatus.isGit === true, 'checkUpdateStatus isGit')
+
+  // Catalog tests
+  const liveState = await getLiveAgents()
+  assert(Array.isArray(liveState.agents), 'getLiveAgents returns agents array')
+  assert(typeof liveState.sources === 'object', 'getLiveAgents returns sources object')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,7 +645,7 @@ async function main() {
   await runUnitTests()
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
-  runDashboardUnitTests()
+  await runDashboardUnitTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {
