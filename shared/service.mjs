@@ -272,6 +272,14 @@ function installDarwinService({ nodeBin, scriptPath, repoDir, port }) {
   const plistPath = getLaunchdPlistPath()
   fs.writeFileSync(plistPath, buildLaunchdPlist(nodeBin, scriptPath, repoDir, port), 'utf8')
 
+  // `launchctl load` leaves an already loaded job running on its previous
+  // definition (and can fail with "already loaded"), so the job is unloaded first.
+  // The rewritten plist stays in place for the load below.
+  if (isLaunchdServiceLoaded()) {
+    const unload = runQuiet('launchctl', ['unload', '-w', plistPath])
+    if (!unload.ok) throw new Error(`could not unload the running job: ${unload.detail}`)
+  }
+
   execFileSync('launchctl', ['load', '-w', plistPath], { stdio: 'inherit' })
   console.log(`\n✅ Successfully installed and started ${MACOS_LABEL} via launchd!`)
   console.log(`   Status: http://localhost:${port}`)
@@ -282,12 +290,18 @@ function statusDarwinService() {
   execSync(`launchctl list | grep -F "${MACOS_LABEL}" || echo "${MACOS_LABEL} is not loaded."`, { stdio: 'inherit' })
 }
 
+// `launchctl list` reports loaded jobs; the plist on disk alone does not mean the
+// job is running.
+function isLaunchdServiceLoaded() {
+  return runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok
+}
+
 function stopDarwinService() {
   const plistPath = getLaunchdPlistPath()
   const failures = []
   let removed = false
 
-  if (runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok || fs.existsSync(plistPath)) {
+  if (isLaunchdServiceLoaded() || fs.existsSync(plistPath)) {
     const unload = runQuiet('launchctl', ['unload', '-w', plistPath])
     if (!unload.ok && !isUnitMissingError(unload)) failures.push(`unload: ${unload.detail}`)
     if (fs.existsSync(plistPath)) {
@@ -324,7 +338,17 @@ function getWindowsStartupDir() {
 
 export function buildWindowsVbs(nodeBin, scriptPath, port) {
   const dashboardPort = requireDashboardPort(port)
-  return `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${nodeBin}"" ""${scriptPath}"" --port ${dashboardPort}", 0, False\n`
+  return `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${vbsPathArgument(nodeBin)}"" ""${vbsPathArgument(scriptPath)}"" --port ${dashboardPort}", 0, False\n`
+}
+
+// The launcher wraps both paths in its own quotes, so a quote inside one would
+// end the literal and inject VBScript, and a newline would split the statement.
+// A Windows path cannot contain either, so refusing is safer than escaping.
+function vbsPathArgument(value) {
+  if (/["\r\n]/.test(value)) {
+    throw new Error(`refusing to build a Windows launcher for the path: ${value}`)
+  }
+  return value
 }
 
 function installWindowsService({ nodeBin, scriptPath, port }) {

@@ -1,7 +1,7 @@
 // ─── Integration + unit tests for agent-notify ───────────────────────────────
 // Runs the Herdr adapter in integration mode and unit-tests shared/ntfy.mjs.
 
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -43,6 +43,7 @@ import {
   parseOrcaAgent,
   getLiveAgents,
   resolveBranch,
+  mapWithConcurrency,
 } from './shared/catalog.mjs'
 import {
   buildSystemdUnit,
@@ -58,6 +59,7 @@ import {
 
 const results = { pass: 0, fail: 0, total: 0 }
 const dashboardPath = fileURLToPath(new URL('./dashboard.mjs', import.meta.url))
+const catalogPath = fileURLToPath(new URL('./shared/catalog.mjs', import.meta.url))
 
 function assert(condition, label) {
   results.total++
@@ -694,9 +696,17 @@ async function runDashboardUnitTests() {
   const malformedHerdr = parseHerdrAgent({ agent_status: { nope: true }, pane_id: 42, cwd: null, terminal_title: 7 })
   assert(malformedHerdr.id === 'herdr-42', 'parseHerdrAgent keeps a numeric pane id distinct')
   assert(malformedHerdr.status === 'idle' && malformedHerdr.cwd === '', 'parseHerdrAgent coerces bad status and cwd')
-  assert(parseHerdrAgent(null).id === 'herdr-pane', 'parseHerdrAgent survives a null element')
+  assert(parseHerdrAgent(null).id === 'herdr-pane-0', 'parseHerdrAgent survives a null element')
+  assert(
+    parseHerdrAgent({}, 1).id === 'herdr-pane-1',
+    'parseHerdrAgent keys a missing pane id by row position'
+  )
 
-  assert(parseOrcaAgent(null, null).id === 'orca-pane', 'parseOrcaAgent survives a null worktree and agent')
+  assert(parseOrcaAgent(null, null).id === 'orca-pane-0', 'parseOrcaAgent survives a null worktree and agent')
+  assert(
+    parseOrcaAgent({}, {}, 3).id === 'orca-pane-3',
+    'parseOrcaAgent keys a missing pane key by row position'
+  )
   assert(parseOrcaAgent({ branch: 42 }, {}).branch === '', 'parseOrcaAgent rejects a non-string branch')
   assert(parseOrcaAgent({}, { prompt: 99 }).prompt === null, 'parseOrcaAgent rejects a non-string prompt')
 
@@ -764,6 +774,13 @@ async function runDashboardUnitTests() {
   const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs', 4006)
   assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')
   assert(vbs.includes('--port 4006'), 'buildWindowsVbs passes the port the install reported')
+  let vbsQuoteRejected = false
+  try {
+    buildWindowsVbs('C:\\node.exe', 'C:\\quoted"script.mjs', 4006)
+  } catch {
+    vbsQuoteRejected = true
+  }
+  assert(vbsQuoteRejected, 'buildWindowsVbs refuses a quote that would break the launcher')
 
   // No remote configured, so this stays offline: it must report a git checkout
   // it cannot resolve, rather than reaching out to the network.
@@ -913,6 +930,27 @@ async function runDashboardUnitTests() {
   assert(buildVersionLabel({}, {}) === null, 'buildVersionLabel empty returns null')
 
   // Catalog tests
+  // The collection cache and its in-flight slot are process-wide, so the ordering
+  // this needs (a cold cache with a non-forced collection in flight) is set up in
+  // a child process instead of depending on what ran before it.
+  const coalesceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-coalesce-'))
+  const coalesceProbe = path.join(coalesceDir, 'probe.mjs')
+  fs.writeFileSync(
+    coalesceProbe,
+    `import { getLiveAgents } from ${JSON.stringify(catalogPath)}\n` +
+      `const nonForced = getLiveAgents()\n` +
+      `const forced = getLiveAgents({ forceFresh: true })\n` +
+      `const forcedAgain = getLiveAgents({ forceFresh: true })\n` +
+      `const [first, second, third] = await Promise.all([nonForced, forced, forcedAgain])\n` +
+      // An async function wraps its return value, so coalescing is observable in
+      // the resolved state objects, not in promise identity.
+      `console.log(JSON.stringify({ staleForced: second === first, forcedCoalesced: second === third }))\n`
+  )
+  const coalesced = JSON.parse(execFileSync(process.execPath, [coalesceProbe], { encoding: 'utf8' }))
+  assert(!coalesced.staleForced, 'getLiveAgents does not answer a forced request with an older collection')
+  assert(coalesced.forcedCoalesced, 'getLiveAgents coalesces concurrent forced collections')
+  fs.rmSync(coalesceDir, { recursive: true, force: true })
+
   const liveState = await getLiveAgents()
   assert(Array.isArray(liveState.agents), 'getLiveAgents returns agents array')
   assert(typeof liveState.sources === 'object', 'getLiveAgents returns sources object')
@@ -949,6 +987,55 @@ async function runDashboardUnitTests() {
   clearTimeout(branchTimer)
   assert(loopRanWhileResolving, 'resolveBranch does not block the event loop')
   fs.rmSync(branchLoopDir, { recursive: true, force: true })
+
+  // A snapshot can hold any number of rows, so the probes it triggers are capped.
+  // The peak is measured while ten items run through three slots.
+  let probesInFlight = 0
+  let peakProbes = 0
+  const visited = []
+  await mapWithConcurrency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3, async (n) => {
+    probesInFlight += 1
+    peakProbes = Math.max(peakProbes, probesInFlight)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    visited.push(n)
+    probesInFlight -= 1
+    return n * 2
+  })
+  assert(peakProbes <= 3, `mapWithConcurrency caps probes in flight (peak ${peakProbes})`)
+  assert(visited.length === 10, 'mapWithConcurrency visits every item')
+
+  // The runtimes are faked on PATH so discovery, id assignment, and branch
+  // filling are exercised end to end: execEnv keeps the inherited PATH, so a temp
+  // directory in front of it is found.
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-fake-bin-'))
+  const writeFakeRuntime = (name, payload) => {
+    const file = path.join(fakeBin, name)
+    fs.writeFileSync(file, `#!/bin/sh\necho '${payload}'\n`)
+    fs.chmodSync(file, 0o755)
+  }
+  writeFakeRuntime('herdr', '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"idle"}]}}')
+  writeFakeRuntime('orca', '{"result":{"worktrees":[{"path":"/tmp","agents":[{},{}]}]}}')
+  const stateProbe = path.join(fakeBin, 'probe.mjs')
+  fs.writeFileSync(
+    stateProbe,
+    `import { collectLiveState } from ${JSON.stringify(catalogPath)}\nconsole.log(JSON.stringify(await collectLiveState()))\n`
+  )
+  const probedState = JSON.parse(
+    execFileSync(process.execPath, [stateProbe], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH}` },
+    })
+  )
+  const idsFor = (source) =>
+    probedState.agents.filter((agent) => agent.source === source).map((agent) => agent.id)
+  assert(idsFor('herdr').length === 2, 'collectLiveState reads a runtime from the extended PATH')
+  assert(new Set(idsFor('herdr')).size === 2, 'collectLiveState keeps herdr ids unique without pane_id')
+  assert(new Set(idsFor('orca')).size === 2, 'collectLiveState keeps orca ids unique without paneKey')
+  assert(
+    probedState.agents.every((agent) => typeof agent.branch === 'string'),
+    'collectLiveState leaves a string branch on every record'
+  )
+  fs.rmSync(fakeBin, { recursive: true, force: true })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

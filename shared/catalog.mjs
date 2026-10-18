@@ -50,11 +50,14 @@ function asId(value, fallback) {
   return fallback
 }
 
-export function parseHerdrAgent(a = {}) {
+// `index` comes from the extractor and is only used when the runtime omits the
+// id: one shared fallback would key every such row alike, and the dashboard
+// resolves a row by id.
+export function parseHerdrAgent(a = {}, index = 0) {
   const record = a && typeof a === 'object' ? a : {}
   const rawStatus = asText(record.agent_status, 'idle').toLowerCase()
   return {
-    id: `herdr-${asId(record.pane_id, 'pane')}`,
+    id: `herdr-${asId(record.pane_id, `pane-${index}`)}`,
     source: 'herdr',
     agent: asText(record.agent) || 'pi',
     status: normalizeAgentStatus(rawStatus),
@@ -70,7 +73,7 @@ export function parseHerdrAgent(a = {}) {
   }
 }
 
-export function parseOrcaAgent(wt = {}, a = {}) {
+export function parseOrcaAgent(wt = {}, a = {}, index = 0) {
   const worktree = wt && typeof wt === 'object' ? wt : {}
   const agent = a && typeof a === 'object' ? a : {}
   const rawStatus = asText(agent.state, 'idle').toLowerCase()
@@ -78,7 +81,7 @@ export function parseOrcaAgent(wt = {}, a = {}) {
   const displayName = asText(worktree.displayName) || asText(worktree.repo) || 'Orca Worktree'
 
   return {
-    id: `orca-${asId(agent.paneKey, 'pane')}`,
+    id: `orca-${asId(agent.paneKey, `pane-${index}`)}`,
     source: 'orca',
     agent: asText(agent.agentType) || 'pi',
     status: normalizeAgentStatus(rawStatus),
@@ -96,7 +99,7 @@ export function parseOrcaAgent(wt = {}, a = {}) {
 
 function extractHerdrAgents(herdrRes) {
   if (!herdrRes.ok || !Array.isArray(herdrRes.data?.result?.agents)) return []
-  return herdrRes.data.result.agents.map(parseHerdrAgent)
+  return herdrRes.data.result.agents.map((agent, index) => parseHerdrAgent(agent, index))
 }
 
 // `herdr agent list` reports no branch field at all, so the branch is read from
@@ -140,6 +143,26 @@ export async function resolveBranch(cwd) {
   return probe
 }
 
+// The snapshot size is decided by the runtimes, so the probes it triggers are
+// capped: one git process per row at once could exhaust the process table.
+const BRANCH_PROBE_CONCURRENCY = 4
+
+// Runs `fn` over `items` with at most `limit` calls in flight, and returns the
+// results in the order of `items`. Exported for tests.
+export async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next
+      next += 1
+      results[index] = await fn(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
 function extractOrcaAgents(orcaRes) {
   if (!orcaRes.ok || !Array.isArray(orcaRes.data?.result?.worktrees)) return []
   const list = []
@@ -147,7 +170,7 @@ function extractOrcaAgents(orcaRes) {
     if (!wt || typeof wt !== 'object') continue
     if (Array.isArray(wt.agents)) {
       for (const a of wt.agents) {
-        list.push(parseOrcaAgent(wt, a))
+        list.push(parseOrcaAgent(wt, a, list.length))
       }
     }
   }
@@ -162,11 +185,14 @@ export async function collectLiveState() {
 
   const agents = [...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)]
   // Orca supplies the branch; fill it in from the directory for the runtimes that
-  // do not. Concurrent rows in one directory share a single probe.
-  await Promise.all(
-    agents.map(async (agent) => {
-      if (!agent.branch) agent.branch = await resolveBranch(agent.cwd)
-    })
+  // do not. Rows in one directory share a single probe, and the spawns are capped
+  // so a large snapshot cannot start one git per row at once.
+  await mapWithConcurrency(
+    agents.filter((agent) => !agent.branch),
+    BRANCH_PROBE_CONCURRENCY,
+    async (agent) => {
+      agent.branch = await resolveBranch(agent.cwd)
+    }
   )
 
   return {
@@ -184,6 +210,7 @@ export async function collectLiveState() {
 let cachedState = null
 let lastFetch = 0
 let inFlight = null
+let inFlightIsForced = false
 const CACHE_TTL_MS = 2000
 
 export async function getLiveAgents({ forceFresh = false } = {}) {
@@ -192,19 +219,32 @@ export async function getLiveAgents({ forceFresh = false } = {}) {
     return cachedState
   }
   // Requests that arrive before the cache is warm would otherwise each spawn the
-  // runtimes; share one collection instead.
-  if (inFlight) {
+  // runtimes; share one collection instead. A caller may share when any snapshot
+  // will do (it is not asking for freshness) or when the collection in flight was
+  // itself forced fresh now. A forced caller must not be answered with a
+  // collection that began before it asked.
+  if (inFlight && (inFlightIsForced || !forceFresh)) {
     return inFlight
   }
 
-  inFlight = collectLiveState()
+  let collection
+  collection = collectLiveState()
     .then((state) => {
-      cachedState = state
-      lastFetch = Date.now()
+      // Only the newest collection may fill the cache: an older one finishing
+      // late would otherwise overwrite the snapshot that replaced it.
+      if (inFlight === collection) {
+        cachedState = state
+        lastFetch = Date.now()
+      }
       return state
     })
     .finally(() => {
-      inFlight = null
+      if (inFlight === collection) {
+        inFlight = null
+        inFlightIsForced = false
+      }
     })
-  return inFlight
+  inFlight = collection
+  inFlightIsForced = forceFresh
+  return collection
 }
