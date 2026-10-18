@@ -19,7 +19,7 @@ When an agent settles or needs input, the plugin sends you a notification — a 
 - Run `herdr plugin action invoke test --plugin agent-notify`.
 - Configure the channels in `.env` (`PLATFORM_DESKTOP`, `PLATFORM_NTFY`, `NTFY_URL`, `NTFY_TOPIC`, `NTFY_API_KEY`).
 
-## Driving it with the verify drivers
+## Driving it with test_cases.test.js and the Herdr CLI
 
 Preconditions:
 

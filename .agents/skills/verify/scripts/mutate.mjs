@@ -74,6 +74,24 @@ if (isDirty(REPO_ROOT, { trackedOnly: true })) {
   process.exit(2)
 }
 
+// A recycled pid would otherwise block every later run for good: on Linux the
+// recorded pid only counts as the holder when its command line is still this
+// driver.
+function mutationDriverIsAlive(pid) {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+  } catch {
+    return false
+  }
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('mutate.mjs')
+  } catch (err) {
+    // No /proc at all (macOS, Windows): a live pid is all the OS will tell us.
+    return err.code !== 'ENOENT'
+  }
+}
+
 // This driver edits tracked files in place, so two runs in one checkout race:
 // each restores the other's mutation and the evidence file is written twice.
 const lockFile = path.join(ARTIFACTS, '.mutate.lock')
@@ -91,11 +109,7 @@ for (let attempt = 0; ; attempt++) {
     try {
       holder = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
     } catch {}
-    let alive = false
-    try {
-      if (holder?.pid) alive = process.kill(holder.pid, 0) || true
-    } catch {}
-    if (alive) {
+    if (mutationDriverIsAlive(holder?.pid)) {
       console.error(`refusing to run: another mutation driver (pid ${holder.pid}, started ${holder.at}) is working in this checkout`)
       process.exit(2)
     }

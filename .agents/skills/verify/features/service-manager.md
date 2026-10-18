@@ -21,7 +21,7 @@ The dashboard can install itself as a background service that starts on login, s
 - Run `node dashboard.mjs --service logs`.
 - Run `node dashboard.mjs --service uninstall`.
 
-## Driving it with the verify drivers
+## Driving it with the dashboard CLI
 
 Preconditions:
 

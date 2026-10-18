@@ -18,7 +18,7 @@ The adapters turn what each host actually reports into the one list the dashboar
 - Read the source health line at the top of the page when a host is unavailable.
 - Receive a notification whose body names the workspace and branch.
 
-## Driving it with the verify drivers
+## Driving it with test_cases.test.js and browser.mjs
 
 Preconditions:
 

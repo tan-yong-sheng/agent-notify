@@ -12,7 +12,7 @@ Two user-facing surfaces live in this repo:
 
 This skill drives the dashboard end to end and covers the plugins where the host accepts them. The feature map in `features/` is the maintained list; read `features/README.md` before driving, then use the matching feature file as the recipe.
 
-Every command in this skill is run from the repo root. The skill itself lives in `.agents/skills/verify/` rather than the `.claude/skills/` a generated skill usually targets: `.claude/` is gitignored in this repo (`.gitignore:7`), so a skill committed there would need `git add -f` and would be invisible to everyone else. Pi discovers `.agents/skills/` from the working directory up to the repo root (see `docs/skills.md` in the Pi install). Claude Code does **not** load a `/verify` from `.agents/`; do not move the directory back.
+Every command in this skill is run from the repo root. The skill itself lives in `.agents/skills/verify/` rather than the `.claude/skills/` a generated skill usually targets: `.claude/` is gitignored in this repo (`.gitignore:7`), so a skill committed there would need `git add -f` and would be invisible to everyone else. Pi discovers `.agents/skills/` from the working directory up to the repo root (see `docs/skills.md` in the Pi install), so this is the skill's committed home; do not move the directory back under `.claude/`.
 
 ## Launch
 
@@ -32,7 +32,7 @@ curl -fsS "http://127.0.0.1:$PORT/api/agents" | head -c 200
 
 A usable instance returns `{"agents":[...],"sources":{...}}` with HTTP 200. Startup prints the URL it bound: `⚡ Agent Monitor Dashboard running at: http://localhost:<port>` (the port is inside the URL, not on a line of its own).
 
-Both runtimes are supported: `node dashboard.mjs` and `bun dashboard.mjs`. Run the suite and at least one driver under each when a change touches shared code.
+Both runtimes are supported: `node dashboard.mjs` and `bun dashboard.mjs`. Run the suite and at least one driver under each when a change touches shared code. The drivers run under whichever runtime you invoke them with; `scripts/mutate.mjs` also takes `--runtime node|bun` and defaults to `node`.
 
 Teardown: kill the PID this run started, `kill <pid>`. The drivers do this themselves.
 
@@ -57,7 +57,7 @@ node .agents/skills/verify/scripts/mutate.mjs        # prove the suite still bit
 node .agents/skills/verify/scripts/mutate.mjs --only unit-port-dropped --runtime bun
 ```
 
-`mutate.mjs` refuses to run on a worktree with uncommitted tracked changes, because it edits the tracked files it reverts. Commit first, or run it in a copy. It also refuses while another mutation driver is working in the same checkout (a lock file next to the artifacts): two runs would restore each other's mutation and overwrite the same evidence. It restores every file it touched on `SIGINT`/`SIGTERM`/`SIGHUP` and on exit; a `kill -9` is the one case it cannot cover, which is why a dirty tree is refused. A replacement that kills the suite before its summary is reported as an **abort inside the mutated file**, never as "caught by <test>": the trace goes to `artifacts/mutations/<id>.log`, and every fix that has such an entry also has a variant whose named test fails, so no fix rests on an abort alone.
+`mutate.mjs` refuses to run on a worktree with uncommitted tracked changes, because it edits the tracked files it reverts. Commit first, or run it in a copy. It also refuses while another mutation driver is working in the same checkout (a lock file next to the artifacts): two runs would restore each other's mutation and overwrite the same evidence. A lock left by a dead run is taken over — the recorded pid must exist and, on Linux, still be a `mutate.mjs` process. It restores every file it touched on `SIGINT`/`SIGTERM`/`SIGHUP` and on exit; a `kill -9` is the one case it cannot cover, which is why a dirty tree is refused. A replacement that kills the suite before its summary is reported as an **abort inside the mutated file**, never as "caught by <test>": the trace goes to `artifacts/mutations/<id>.log`, and every fix that has such an entry also has a variant whose named test fails, so no fix rests on an abort alone.
 
 `drive-ui.mjs` serves the **real page** (`renderDashboardHtml()` from `dashboard.mjs`) from `scripts/serve-stub.mjs` with deterministic fixtures instead of live Orca/Herdr probes, so the table's contents are fixed and a failure is a UI failure. The stub exposes `/control/fixture?name=mixed|swapped|empty` and `/control/polls`; `/api/update` returns a deliberately stale status.
 

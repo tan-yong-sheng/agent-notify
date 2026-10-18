@@ -21,7 +21,7 @@ The dashboard table shows every coding agent running under Orca and Herdr in one
 - Choose one of the `All`, `Working`, `Blocked`, `Settled` tabs.
 - Click a row's activity cell to inspect the full prompt.
 
-## Driving it with the verify drivers
+## Driving it with drive-ui.mjs and browser.mjs
 
 Preconditions:
 
@@ -53,7 +53,7 @@ node .agents/skills/verify/scripts/browser.mjs close && kill <stub pid>
 
 - The status badges are uppercased by the stylesheet, so `innerText` returns `WORKING` and `BLOCKED`, not `Working` and `Blocked`. The host tags stay as authored (`Orca`, `Herdr`). Assert the rendered case.
 - A green `drive-ui.mjs` run proves the page and its rendering, not the live probe path: the stub replaces the Orca and Herdr probes. The probes are covered by `drive-api.mjs`, which starts the real `dashboard.mjs`.
-- Row order follows the order the payload arrives in, so rows move when the upstream order changes. `drive-ui.mjs` reports this as a failing check on purpose; it is a known defect, not a harness bug. Do not silence it.
+- Row order follows the order the payload arrives in, so rows move when the upstream order changes. `drive-ui.mjs` reports this as a failing check on purpose; it is a known defect, not a harness bug. Do not silence it — that check is the acceptance test for the fix and goes green only when rows keep their position across a payload reorder.
 - The page polls every 3 s. Wait for the expected state instead of sleeping a fixed time, and treat a row you read mid-poll as possibly stale.
 - Clicking a workspace path copies it to the clipboard and shows a toast. This run does not assert clipboard contents.
 - The detail panel and the search box keep state across polls. Reset the query or filter between journeys.

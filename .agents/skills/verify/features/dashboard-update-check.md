@@ -20,7 +20,7 @@ The dashboard tells you when your checkout is behind the branch it tracks: a ban
 - Run `node dashboard.mjs --update`.
 - `GET /api/update` on the running dashboard.
 
-## Driving it with the verify drivers
+## Driving it with browser.mjs and the dashboard CLI
 
 Preconditions:
 
@@ -39,7 +39,7 @@ node .agents/skills/verify/scripts/browser.mjs open http://127.0.0.1:4742/
 - **Read the structured form.** Run `node dashboard.mjs --update-status-json`. It prints one JSON object with `isGit`, `hasUpdate`, `localSha`, `remoteSha`, `behind`, `ahead`, `upstream`, `tracks`, `fetchFailed`, `versionLabel`, `checkedAt`, and exits `0`. `"fetchFailed":false` distinguishes "checked and current" from "could not check".
 - **Report on another checkout.** Run `node dashboard.mjs --update-status-json /path/to/other/checkout`. The JSON describes that directory instead of the script's own.
 - **The endpoint agrees.** Run `curl -fsS "http://127.0.0.1:$PORT/api/update"`. It returns an object with a boolean `hasUpdate`.
-- **Refuse a detached HEAD.** In a throwaway clone, detach and ask for an update. Run `git clone -q <repo> /tmp/upd-probe && git -C /tmp/upd-probe checkout -q --detach && node /tmp/upd-probe/dashboard.mjs --update`. It prints `❌ Update failed: the current checkout is not on a branch that tracks origin/main.` and a hint to switch to a tracking branch. `git -C /tmp/upd-probe rev-parse HEAD` is unchanged and `git status --porcelain` is empty — nothing was pulled.
+- **Refuse a detached HEAD.** In a throwaway clone, detach and ask for an update. Run `git clone -q "$PWD" /tmp/upd-probe` (remove a leftover `/tmp/upd-probe` first) `&& git -C /tmp/upd-probe checkout -q --detach && node /tmp/upd-probe/dashboard.mjs --update`. It prints `❌ Update failed: the current checkout is not on a branch that tracks origin/main.` and a hint to switch to a tracking branch. `git -C /tmp/upd-probe rev-parse HEAD` is unchanged and `git status --porcelain` is empty — nothing was pulled.
 - **Proof.** Capture the banner state. Run `node .agents/skills/verify/scripts/browser.mjs aria --path .agents/skills/verify/artifacts/ui/update.aria.txt` and `.../browser.mjs screenshot --path .agents/skills/verify/artifacts/ui/update.png`. The artifacts show the banner text and the table behind it.
 
 ## Gotchas
