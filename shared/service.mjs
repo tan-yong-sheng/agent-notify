@@ -444,8 +444,11 @@ export function buildVersionLabel(localVersions, remoteVersions) {
 // The update check runs inside the dashboard's HTTP server, where a git
 // credential prompt would block the event loop until the timeout expires and
 // stall every other request. This env makes git fail fast instead of asking.
+// GIT_ASKPASS is cleared too: git consults an askpass program even when
+// GIT_TERMINAL_PROMPT=0, and getExtendedPathEnv() inherits it from the parent
+// environment, so a configured askpass would bypass the guard above.
 export function nonInteractiveGitEnv() {
-  return { ...getExtendedPathEnv(), GIT_TERMINAL_PROMPT: '0' }
+  return { ...getExtendedPathEnv(), GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '' }
 }
 
 export function fetchUpdateStatus(repoDir) {

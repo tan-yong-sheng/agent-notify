@@ -718,9 +718,27 @@ async function runDashboardUnitTests() {
     'nonInteractiveGitEnv disables terminal prompts'
   )
   assert(
+    nonInteractiveGitEnv().GIT_ASKPASS === '',
+    'nonInteractiveGitEnv clears GIT_ASKPASS'
+  )
+  assert(
     /terminal prompts disabled/.test(promptProbe(nonInteractiveGitEnv())),
     'git refuses to prompt for credentials with nonInteractiveGitEnv'
   )
+  // getExtendedPathEnv() spreads process.env, so an askpass program set by the
+  // caller would survive unless the guard overwrites it. /bin/echo satisfies
+  // the fill when consulted, which makes a bypass observable instead of silent.
+  const inheritedAskpass = process.env.GIT_ASKPASS
+  process.env.GIT_ASKPASS = '/bin/echo'
+  try {
+    assert(
+      /terminal prompts disabled/.test(promptProbe(nonInteractiveGitEnv())),
+      'nonInteractiveGitEnv overrides an inherited GIT_ASKPASS'
+    )
+  } finally {
+    if (inheritedAskpass === undefined) delete process.env.GIT_ASKPASS
+    else process.env.GIT_ASKPASS = inheritedAskpass
+  }
 
   assert(
     buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.4.0' }) ===
