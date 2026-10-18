@@ -1,7 +1,8 @@
 // ─── Integration + unit tests for agent-notify ───────────────────────────────
 // Runs the Herdr adapter in integration mode and unit-tests shared/ntfy.mjs.
 
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -28,8 +29,79 @@ import {
   isSettleAlreadyNotified,
   markPaneNotified,
 } from './main.mjs'
+import { getExtendedPathEnv } from './shared/env.mjs'
+import {
+  resolveConfig as resolveDashboardConfig,
+  isAllowedHost,
+  isDirectInvocation,
+  formatListenError,
+  renderDashboardHtml,
+  updateBannerLabel,
+} from './dashboard.mjs'
+import { resolveDashboardPort } from './shared/config.mjs'
+import {
+  normalizeAgentStatus,
+  parseHerdrAgent,
+  parseOrcaAgent,
+  getLiveAgents,
+  resolveBranch,
+  mapWithConcurrency,
+} from './shared/catalog.mjs'
+import {
+  buildSystemdUnit,
+  buildLaunchdPlist,
+  buildWindowsVbs,
+  installDarwinService,
+  writeUpdateCheckCache,
+  getServicePlatform,
+  resolveServiceRuntime,
+  buildVersionLabel,
+  fetchUpdateStatus,
+  checkUpdateStatusAsync,
+  nonInteractiveGitEnv,
+} from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
+const dashboardPath = fileURLToPath(new URL('./dashboard.mjs', import.meta.url))
+const catalogPath = fileURLToPath(new URL('./shared/catalog.mjs', import.meta.url))
+
+// launchd installs run the real installer against a fake supervisor, so the
+// supervisor's chatter is swallowed instead of interleaving with the report.
+function captureConsole(fn) {
+  const lines = []
+  const realLog = console.log
+  const realError = console.error
+  console.log = (...parts) => lines.push(parts.join(' '))
+  console.error = (...parts) => lines.push(parts.join(' '))
+  try {
+    fn()
+  } finally {
+    console.log = realLog
+    console.error = realError
+  }
+  return lines
+}
+
+// Function.prototype.toString() is re-serialized by some runtimes (Bun emits its
+// own formatting, semicolons included), so the function embedded in the page is
+// sliced by matching braces instead of by a regex over its source.
+function sliceEmbeddedFunction(source, prelude) {
+  const start = source.indexOf(prelude)
+  if (start === -1) return null
+  const from = start + prelude.length
+  let depth = 0
+  let seenBrace = false
+  for (let i = from; i < source.length; i++) {
+    if (source[i] === '{') {
+      depth++
+      seenBrace = true
+    } else if (source[i] === '}') {
+      depth--
+      if (seenBrace && depth === 0) return source.slice(from, i + 1)
+    }
+  }
+  return null
+}
 
 function assert(condition, label) {
   results.total++
@@ -544,6 +616,652 @@ function runOrcaMainUnitTests() {
   assert(isSettleAlreadyNotified(pane, 'done') === false, 'forgotten pane notifies again')
 }
 
+// The update check's failure paths and the banner they feed. Kept out of the
+// dashboard assertions above: the branching here is what makes a failed check
+// readable, and it reads better as its own case.
+async function assertUpdateFailureAndBanner() {
+
+  // runtime with no process.execPath is the real case), so this promise rejects
+  // rather than resolving null. /api/update awaits it with no catch, so a
+  // rejection here would surface as a failed request instead of a status.
+  const spawnFailDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nospawn-'))
+  const realExecPath = process.execPath
+  let spawnFailStatus = null
+  let spawnFailRejected = null
+  try {
+    process.execPath = ''
+    spawnFailStatus = await checkUpdateStatusAsync(spawnFailDir, [dashboardPath]).catch((err) => {
+      spawnFailRejected = err
+      return null
+    })
+  } finally {
+    process.execPath = realExecPath
+  }
+  assert(spawnFailRejected === null, 'a probe that cannot spawn does not reject the update check')
+  assert(
+    spawnFailStatus?.unavailable === 'the update check could not run',
+    'a probe that cannot spawn reports that the check could not run'
+  )
+  fs.rmSync(spawnFailDir, { recursive: true, force: true })
+
+  // A stale status is one the dashboard could not refresh, so the banner has to
+  // say that instead of looking like a check that just succeeded. The page embeds
+  // the same function the tests call, so the two cannot drift apart.
+  const dashboardHtml = renderDashboardHtml()
+  assert(
+    updateBannerLabel({ versionLabel: 'v1 → v2', stale: true }).endsWith('(last known, the update check could not run)'),
+    'updateBannerLabel marks a stale status as last known'
+  )
+  assert(
+    updateBannerLabel({ localSha: 'aaaaaaa', remoteSha: 'bbbbbbb' }) === 'aaaaaaa → bbbbbbb',
+    'updateBannerLabel renders the revision pair'
+  )
+  assert(
+    dashboardHtml.includes('.innerText = updateBannerLabel('),
+    'the dashboard labels the update banner through it'
+  )
+  const embeddedLabel = sliceEmbeddedFunction(dashboardHtml, 'const updateBannerLabel = ')
+  assert(embeddedLabel !== null, 'the dashboard embeds the update banner label')
+  const pageLabel = new Function(`return ${embeddedLabel}`)()
+  const staleCase = { localSha: 'aaaaaaa', remoteSha: 'bbbbbbb', stale: true }
+  assert(
+    pageLabel(staleCase) === updateBannerLabel(staleCase),
+    'the embedded update banner label matches the tested one for a stale status'
+  )
+  const freshCase = { localSha: 'aaaaaaa', remoteSha: 'bbbbbbb' }
+  assert(
+    pageLabel(freshCase) === updateBannerLabel(freshCase),
+    'the embedded update banner label matches the tested one for a fresh status'
+  )
+}
+
+async function runDashboardUnitTests() {
+  console.log('\nRunning dashboard.mjs unit tests...\n')
+
+  const env = getExtendedPathEnv(['/nonexistent/test/path'])
+  assert(typeof env.PATH === 'string', 'getExtendedPathEnv returns PATH')
+
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '4567'], {}).port === 4567,
+    'resolveDashboardConfig --port <n>'
+  )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port=7890'], {}).port === 7890,
+    'resolveDashboardConfig --port=<n>'
+  )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '5555' }).port === 5555,
+    'resolveDashboardConfig DASHBOARD_PORT env'
+  )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '99999'], {}, {}).port === 3333,
+    'resolveDashboardConfig rejects out-of-range port'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '4002' }, { DASHBOARD_PORT: '4001' }) === 4002,
+    'resolveDashboardPort prefers the environment to the file'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], {}, { DASHBOARD_PORT: '4001' }) === 4001,
+    'resolveDashboardPort reads the .env fallback'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port', '4003'], {}, {}) === 4003,
+    'resolveDashboardPort prefers the flag'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port=4003'], {}, {}) === 4003,
+    'resolveDashboardPort accepts the flag=value form'
+  )
+  // parseInt reads a numeric prefix, so a malformed value must fall through to
+  // the next source instead of binding a port nobody asked for.
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port', '4004junk'], { DASHBOARD_PORT: '4005' }, {}) === 4005,
+    'resolveDashboardPort rejects a flag with trailing garbage'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '4005.5' }, {}) === 3333,
+    'resolveDashboardPort rejects a fractional environment port'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port=0'], {}, {}) === 3333,
+    'resolveDashboardPort rejects port 0'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port'], {}, {}) === 3333,
+    'resolveDashboardPort falls back when the flag has no value'
+  )
+
+  // A launch through a symlink (or an npm/npx shim) must still start the server
+  // instead of resolving argv[1] to the link and exiting 0 without a word.
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-link-'))
+  const linkPath = path.join(linkDir, 'dashboard-link.mjs')
+  fs.symlinkSync(dashboardPath, linkPath)
+  assert(isDirectInvocation(['node', linkPath]), 'isDirectInvocation follows a symlinked entry point')
+  assert(isDirectInvocation(['node', dashboardPath]), 'isDirectInvocation accepts the real path')
+  assert(
+    !isDirectInvocation(['node', path.join(linkDir, 'other.mjs')]),
+    'isDirectInvocation rejects another file'
+  )
+  assert(!isDirectInvocation(['node']), 'isDirectInvocation rejects a missing argv[1]')
+  assert(
+    !isDirectInvocation(['node', path.join(linkDir, 'gone.mjs')]),
+    'isDirectInvocation rejects an unresolvable path'
+  )
+
+  assert(formatListenError({ code: 'EADDRINUSE' }, 3333).includes('3333'), 'formatListenError names the busy port')
+  assert(/already in use/.test(formatListenError({ code: 'EADDRINUSE' }, 3333)), 'formatListenError explains a busy port')
+  assert(/Not allowed/.test(formatListenError({ code: 'EACCES' }, 80)), 'formatListenError explains a privileged port')
+  assert(
+    formatListenError(new Error('boom'), 3333).includes('boom'),
+    'formatListenError falls back to the error message'
+  )
+
+  assert(isAllowedHost('localhost:3333'), 'isAllowedHost accepts localhost with port')
+  assert(isAllowedHost('127.0.0.1:3333'), 'isAllowedHost accepts loopback ip')
+  assert(isAllowedHost('[::1]:3333'), 'isAllowedHost accepts ipv6 loopback')
+  assert(!isAllowedHost('evil.example.com:3333'), 'isAllowedHost rejects external host')
+  assert(!isAllowedHost('localhost.evil.com'), 'isAllowedHost rejects host suffix trick')
+  assert(!isAllowedHost(undefined), 'isAllowedHost rejects missing host')
+
+  assert(normalizeAgentStatus('WORKING') === 'working', 'normalizeAgentStatus working')
+  assert(normalizeAgentStatus('blocked') === 'blocked', 'normalizeAgentStatus blocked')
+  assert(normalizeAgentStatus('Done') === 'done', 'normalizeAgentStatus done')
+  assert(normalizeAgentStatus('idle') === 'idle', 'normalizeAgentStatus idle')
+  assert(normalizeAgentStatus('unknown') === 'idle', 'normalizeAgentStatus fallback')
+
+  const herdrAgent = parseHerdrAgent({
+    pane_id: 'p1',
+    agent: 'pi',
+    agent_status: 'working',
+    cwd: '/path/to/herdr',
+    terminal_title: 'Title',
+    focused: true,
+  })
+  assert(herdrAgent.source === 'herdr', 'parseHerdrAgent source')
+  assert(herdrAgent.status === 'working', 'parseHerdrAgent status')
+  assert(herdrAgent.cwd === '/path/to/herdr', 'parseHerdrAgent cwd')
+  assert(herdrAgent.displayName === 'Title', 'parseHerdrAgent displayName')
+
+  const orcaAgent = parseOrcaAgent(
+    { path: '/path/to/orca', displayName: 'Orca Repo', branch: 'refs/heads/feature' },
+    { paneKey: 'k1', agentType: 'claude', state: 'done', prompt: 'hi' }
+  )
+  assert(orcaAgent.source === 'orca', 'parseOrcaAgent source')
+  assert(orcaAgent.status === 'done', 'parseOrcaAgent status')
+  assert(orcaAgent.cwd === '/path/to/orca', 'parseOrcaAgent cwd')
+  assert(orcaAgent.branch === 'feature', 'parseOrcaAgent branch stripped')
+  assert(orcaAgent.prompt === 'hi', 'parseOrcaAgent prompt')
+
+  // Untrusted CLI payloads: wrong-typed or missing fields must degrade, not throw.
+  const malformedHerdr = parseHerdrAgent({ agent_status: { nope: true }, pane_id: 42, cwd: null, terminal_title: 7 })
+  assert(malformedHerdr.id === 'herdr-42', 'parseHerdrAgent keeps a numeric pane id distinct')
+  assert(malformedHerdr.status === 'idle' && malformedHerdr.cwd === '', 'parseHerdrAgent coerces bad status and cwd')
+  assert(parseHerdrAgent(null).id === 'herdr-pane-0', 'parseHerdrAgent survives a null element')
+  assert(
+    parseHerdrAgent({}, 1).id === 'herdr-pane-1',
+    'parseHerdrAgent keys a missing pane id by row position'
+  )
+
+  assert(parseOrcaAgent(null, null).id === 'orca-pane-0', 'parseOrcaAgent survives a null worktree and agent')
+  assert(
+    parseOrcaAgent({}, {}, 3).id === 'orca-pane-3',
+    'parseOrcaAgent keys a missing pane key by row position'
+  )
+  assert(parseOrcaAgent({ branch: 42 }, {}).branch === '', 'parseOrcaAgent rejects a non-string branch')
+  assert(parseOrcaAgent({}, { prompt: 99 }).prompt === null, 'parseOrcaAgent rejects a non-string prompt')
+
+  // Service & Update tests
+  assert(getServicePlatform() === process.platform, 'getServicePlatform matches process.platform')
+  assert(resolveServiceRuntime('/custom/bun').includes('bun'), 'resolveServiceRuntime detects bun')
+  assert(typeof resolveServiceRuntime() === 'string', 'resolveServiceRuntime returns string')
+
+  const systemd = buildSystemdUnit('/usr/bin/node', '/path/dashboard.mjs', '/path', 4006)
+  assert(
+    systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs --port 4006'),
+    'buildSystemdUnit ExecStart carries the port the install reported'
+  )
+  assert(systemd.includes('WorkingDirectory=/path'), 'buildSystemdUnit WorkingDirectory')
+
+  // A path with spaces must stay one argv element; % is a systemd specifier.
+  const spaced = buildSystemdUnit('/opt/my node/node', '/repo dir/dashboard.mjs', '/repo dir', 4006)
+  assert(spaced.includes('ExecStart="/opt/my node/node" "/repo dir/dashboard.mjs"'), 'buildSystemdUnit quotes argv with spaces')
+  // `WorkingDirectory=` takes no quoting: a quoted value is rejected by systemd as
+  // "not absolute", while a bare space is preserved.
+  assert(spaced.includes('WorkingDirectory=/repo dir'), 'buildSystemdUnit leaves a spaced working directory bare')
+  assert(buildSystemdUnit('/usr/bin/node', '/path/100%.mjs', '/path', 4006).includes('100%%.mjs'), 'buildSystemdUnit escapes % specifiers')
+  assert(
+    buildSystemdUnit('/usr/bin/node', '/path/a$b.mjs', '/path', 4006).includes('ExecStart=/usr/bin/node "/path/a$$b.mjs"'),
+    'buildSystemdUnit escapes $ expansion in ExecStart'
+  )
+  assert(
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/a$b', 4006).includes('WorkingDirectory=/path/a$b'),
+    'buildSystemdUnit leaves a literal $ alone in WorkingDirectory'
+  )
+  let newlineRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path\nExecStartPre=/bin/true', 4006)
+  } catch {
+    newlineRejected = true
+  }
+  assert(newlineRejected, 'buildSystemdUnit refuses a newline instead of injecting a directive')
+  let backslashRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/ends-with\\', 4006)
+  } catch {
+    backslashRejected = true
+  }
+  assert(backslashRejected, 'buildSystemdUnit refuses a working directory ending in a backslash')
+  let invalidPortRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path', 70000)
+  } catch {
+    invalidPortRejected = true
+  }
+  assert(invalidPortRejected, 'buildSystemdUnit refuses a port outside the valid range')
+
+  const plist = buildLaunchdPlist('/usr/bin/node', '/path/dashboard.mjs', '/path', 4006)
+  assert(plist.includes('<string>dev.agent-notify.dashboard</string>'), 'buildLaunchdPlist label')
+  assert(plist.includes('<string>/usr/bin/node</string>'), 'buildLaunchdPlist node')
+  assert(
+    plist.includes('<string>--port</string>\n        <string>4006</string>'),
+    'buildLaunchdPlist passes the port the install reported'
+  )
+  assert(
+    buildLaunchdPlist('/usr/bin/node', '/path/a&b.mjs', '/path<c>', 4006).includes('/path/a&amp;b.mjs'),
+    'buildLaunchdPlist escapes XML in paths'
+  )
+
+  const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs', 4006)
+  assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')
+  assert(vbs.includes('--port 4006'), 'buildWindowsVbs passes the port the install reported')
+  let vbsQuoteRejected = false
+  try {
+    buildWindowsVbs('C:\\node.exe', 'C:\\quoted"script.mjs', 4006)
+  } catch {
+    vbsQuoteRejected = true
+  }
+  assert(vbsQuoteRejected, 'buildWindowsVbs refuses a quote that would break the launcher')
+
+  // The launchd installer has to replace a job that is already loaded: `load` on
+  // its own leaves the previous definition (and its old port) running. Exercised
+  // through the real installer with a fake `launchctl` on PATH and a throwaway
+  // HOME, so the plist lands somewhere harmless and no supervisor is touched.
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-launchd-'))
+  const binDir = path.join(fakeHome, 'bin')
+  const launchctlLog = path.join(fakeHome, 'launchctl.log')
+  const loadedMarker = path.join(fakeHome, 'loaded')
+  const launchedPlist = path.join(fakeHome, 'Library', 'LaunchAgents', 'dev.agent-notify.dashboard.plist')
+  fs.mkdirSync(binDir, { recursive: true })
+  const fakeLaunchctl = path.join(binDir, 'launchctl')
+  fs.writeFileSync(
+    fakeLaunchctl,
+    [
+      '#!/bin/sh',
+      // `list` is the probe for a loaded job, so only the mutating calls are logged.
+      `if [ "$1" != list ]; then printf '%s\\n' "$*" >> ${JSON.stringify(launchctlLog)}; fi`,
+      `if [ "$1" = list ] && [ -f ${JSON.stringify(loadedMarker)} ]; then printf '4242\\t0\\tdev.agent-notify.dashboard\\n'; fi`,
+      'exit 0',
+      '',
+    ].join('\n')
+  )
+  fs.chmodSync(fakeLaunchctl, 0o755)
+  const savedHome = process.env.HOME
+  const savedPath = process.env.PATH
+  process.env.HOME = fakeHome
+  process.env.PATH = `${binDir}:${savedPath}`
+  try {
+    const installContext = {
+      nodeBin: '/usr/bin/node',
+      scriptPath: path.join(fakeHome, 'dashboard.mjs'),
+      repoDir: fakeHome,
+      port: 4501,
+    }
+    captureConsole(() => installDarwinService(installContext))
+    assert(
+      fs.readFileSync(launchctlLog, 'utf8').trim() === `load -w ${launchedPlist}`,
+      'launchd install loads a job that was not running'
+    )
+    assert(
+      fs.readFileSync(launchedPlist, 'utf8').includes('<string>4501</string>'),
+      'launchd install writes the reported port into the plist'
+    )
+
+    fs.writeFileSync(launchctlLog, '')
+    fs.writeFileSync(loadedMarker, '1')
+    captureConsole(() => installDarwinService(installContext))
+    assert(
+      fs.readFileSync(launchctlLog, 'utf8').trim().split('\n').join(' | ') ===
+        `unload -w ${launchedPlist} | load -w ${launchedPlist}`,
+      'launchd reinstall unloads the running job before loading the rewritten plist'
+    )
+  } finally {
+    process.env.HOME = savedHome
+    process.env.PATH = savedPath
+    fs.rmSync(fakeHome, { recursive: true, force: true })
+  }
+
+  // No remote configured, so this stays offline: it must report a git checkout
+  // it cannot resolve, rather than reaching out to the network.
+  const tmpRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-update-'))
+  execSync('git init', { cwd: tmpRepoDir, stdio: 'ignore' })
+  const updateStatus = fetchUpdateStatus(tmpRepoDir)
+  assert(typeof updateStatus === 'object', 'fetchUpdateStatus returns object')
+  assert(updateStatus.isGit === true, 'fetchUpdateStatus isGit')
+  assert(updateStatus.hasUpdate === false, 'fetchUpdateStatus reports no update without a target')
+  assert(Boolean(updateStatus.unavailable), 'fetchUpdateStatus explains the missing target')
+  assert(fetchUpdateStatus('/nonexistent').isGit === false, 'fetchUpdateStatus non-git directory')
+
+  // The dashboard route must not run the probe on its event loop. A 0ms timer
+  // proves the loop kept running while the probe was in flight: with a
+  // synchronous probe the timer is cancelled before it can fire, because the
+  // awaiting continuation is a microtask that runs first. The probe entry is the
+  // real dashboard script, but the target is a non-git temp directory, so the
+  // child re-enters the script and the check stays offline.
+  let loopRanWhileProbing = false
+  const probeTimer = setTimeout(() => {
+    loopRanWhileProbing = true
+  }, 0)
+  const firstStatus = await checkUpdateStatusAsync(linkDir, [dashboardPath])
+  clearTimeout(probeTimer)
+  assert(firstStatus.isGit === false, 'checkUpdateStatusAsync reports a non-git directory')
+  assert(typeof firstStatus.checkedAt === 'number', 'checkUpdateStatusAsync returns a status with checkedAt')
+  assert(loopRanWhileProbing, 'checkUpdateStatusAsync does not block the event loop')
+  assert(
+    (await checkUpdateStatusAsync(linkDir, [dashboardPath])) === firstStatus,
+    'checkUpdateStatusAsync serves a repeat call from cache'
+  )
+  // The cache and the in-flight probe are keyed by checkout: with one shared slot
+  // the second call would answer with the first directory's status.
+  const otherStatus = await checkUpdateStatusAsync(tmpRepoDir, [dashboardPath])
+  assert(otherStatus.isGit === true, 'checkUpdateStatusAsync keys the cache by directory')
+  assert(otherStatus !== firstStatus, 'checkUpdateStatusAsync does not reuse another directory status')
+
+  // A probe that cannot run reports the last known status instead of nothing, and
+  // the entry is aged past the TTL first: that is the only way this path is
+  // reached, so the failure path cannot read it through the TTL gate.
+  const staleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-stale-'))
+  const lastKnown = { isGit: true, hasUpdate: true, checkedAt: Date.now() - 3 * 60 * 60 * 1000 }
+  writeUpdateCheckCache(staleDir, lastKnown, Date.now() - 2 * 60 * 60 * 1000)
+  const staleStatus = await checkUpdateStatusAsync(staleDir, [path.join(staleDir, 'no-such-probe.mjs')])
+  assert(staleStatus.hasUpdate === true, 'a failed update probe reports the last known status')
+  assert(staleStatus.stale === true, 'the last known status is marked stale')
+  assert(staleStatus.checkedAt === lastKnown.checkedAt, 'the stale status keeps its original checkedAt')
+  const noHistoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nohistory-'))
+  const noHistory = await checkUpdateStatusAsync(noHistoryDir, [path.join(noHistoryDir, 'no-such-probe.mjs')])
+  assert(noHistory.unavailable === 'the update check could not run', 'a failed probe without history says so')
+  assert(noHistory.stale === undefined, 'a status with no history is not labelled stale')
+  fs.rmSync(staleDir, { recursive: true, force: true })
+  fs.rmSync(noHistoryDir, { recursive: true, force: true })
+  await assertUpdateFailureAndBanner()
+
+  // Installing must restart an already-running unit: `enable --now` leaves a
+  // running unit on its previous definition, so reinstalling after an edit would
+  // keep serving the old ExecStart. A fake systemctl on PATH records the calls it
+  // receives, so the real install path runs without touching the user's units.
+  if (getServicePlatform() === 'linux') {
+    const runInstall = (isActive) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-monitor-home-'))
+      const binDir = path.join(home, 'bin')
+      fs.mkdirSync(binDir, { recursive: true })
+      const callsLog = path.join(home, 'calls.log')
+      fs.writeFileSync(
+        path.join(binDir, 'systemctl'),
+        [
+          '#!/bin/sh',
+          `echo "$@" >> "${callsLog}"`,
+          '[ "$2" = "is-active" ] && exit "${FAKE_IS_ACTIVE:-0}"',
+          'exit 0',
+          '',
+        ].join('\n'),
+        { mode: 0o755 }
+      )
+      const stdout = execSync(`"${process.execPath}" "${dashboardPath}" --service install`, {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+          DASHBOARD_PORT: '4321',
+          FAKE_IS_ACTIVE: isActive ? '0' : '3',
+        },
+      })
+      return { calls: fs.readFileSync(callsLog, 'utf8'), stdout, home }
+    }
+
+    const freshInstall = runInstall(false)
+    assert(freshInstall.calls.includes('--user daemon-reload'), 'service install reloads systemd units')
+    assert(freshInstall.calls.includes('--user enable agent-monitor.service'), 'service install enables the unit')
+    assert(freshInstall.calls.includes('--user start agent-monitor.service'), 'service install starts a stopped unit')
+    assert(freshInstall.stdout.includes('http://localhost:4321'), 'service install reports the resolved port')
+    assert(
+      fs.existsSync(path.join(freshInstall.home, '.config', 'systemd', 'user', 'agent-monitor.service')),
+      'service install writes the unit file'
+    )
+
+    const reinstall = runInstall(true)
+    assert(reinstall.calls.includes('--user restart agent-monitor.service'), 'service install restarts an active unit')
+    assert(
+      !reinstall.calls.includes('--user start agent-monitor.service'),
+      'service install does not start an already active unit'
+    )
+  }
+  fs.rmSync(tmpRepoDir, { recursive: true, force: true })
+
+  // This check runs inside the HTTP server: git must never sit on a credential
+  // prompt there. Proven against real git rather than asserted: without the
+  // guard git reaches for the terminal, with it git refuses outright.
+  const promptProbe = (env) => {
+    try {
+      execSync('git -c credential.helper= credential fill', {
+        input: 'protocol=https\nhost=agent-notify.invalid\n\n',
+        env: { ...process.env, ...env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      })
+      return ''
+    } catch (err) {
+      return String(err.stderr || '')
+    }
+  }
+  assert(
+    nonInteractiveGitEnv().GIT_TERMINAL_PROMPT === '0',
+    'nonInteractiveGitEnv disables terminal prompts'
+  )
+  assert(
+    nonInteractiveGitEnv().GIT_ASKPASS === '',
+    'nonInteractiveGitEnv clears GIT_ASKPASS'
+  )
+  assert(
+    /terminal prompts disabled/.test(promptProbe(nonInteractiveGitEnv())),
+    'git refuses to prompt for credentials with nonInteractiveGitEnv'
+  )
+  // getExtendedPathEnv() spreads process.env, so an askpass program set by the
+  // caller would survive unless the guard overwrites it. /bin/echo satisfies
+  // the fill when consulted, which makes a bypass observable instead of silent.
+  const inheritedAskpass = process.env.GIT_ASKPASS
+  process.env.GIT_ASKPASS = '/bin/echo'
+  try {
+    assert(
+      /terminal prompts disabled/.test(promptProbe(nonInteractiveGitEnv())),
+      'nonInteractiveGitEnv overrides an inherited GIT_ASKPASS'
+    )
+  } finally {
+    if (inheritedAskpass === undefined) delete process.env.GIT_ASKPASS
+    else process.env.GIT_ASKPASS = inheritedAskpass
+  }
+
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.4.0' }) ===
+      'orca 1.1.0 → 1.2.0 · herdr 0.3.0 → 0.4.0',
+    'buildVersionLabel both changed'
+  )
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.3.0' }) === 'orca 1.1.0 → 1.2.0',
+    'buildVersionLabel only changed manifest'
+  )
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.1.0', herdr: '0.3.0' }) === null,
+    'buildVersionLabel unchanged returns null'
+  )
+  assert(buildVersionLabel({}, {}) === null, 'buildVersionLabel empty returns null')
+
+  // Catalog tests
+  // The collection cache and its in-flight slot are process-wide, so the ordering
+  // this needs (a cold cache with a non-forced collection in flight) is set up in
+  // a child process instead of depending on what ran before it.
+  const coalesceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-coalesce-'))
+  const coalesceProbe = path.join(coalesceDir, 'probe.mjs')
+  fs.writeFileSync(
+    coalesceProbe,
+    `import { getLiveAgents } from ${JSON.stringify(catalogPath)}\n` +
+      `const nonForced = getLiveAgents()\n` +
+      `const forced = getLiveAgents({ forceFresh: true })\n` +
+      `const forcedAgain = getLiveAgents({ forceFresh: true })\n` +
+      `const [first, second, third] = await Promise.all([nonForced, forced, forcedAgain])\n` +
+      // An async function wraps its return value, so coalescing is observable in
+      // the resolved state objects, not in promise identity.
+      `console.log(JSON.stringify({ staleForced: second === first, forcedCoalesced: second === third }))\n`
+  )
+  const coalesced = JSON.parse(execFileSync(process.execPath, [coalesceProbe], { encoding: 'utf8' }))
+  assert(!coalesced.staleForced, 'getLiveAgents does not answer a forced request with an older collection')
+  assert(coalesced.forcedCoalesced, 'getLiveAgents coalesces concurrent forced collections')
+  fs.rmSync(coalesceDir, { recursive: true, force: true })
+
+  const liveState = await getLiveAgents()
+  assert(Array.isArray(liveState.agents), 'getLiveAgents returns agents array')
+  assert(typeof liveState.sources === 'object', 'getLiveAgents returns sources object')
+  // Callers that arrive together share one collection instead of spawning the
+  // runtimes once per request.
+  const [coalescedA, coalescedB] = await Promise.all([
+    getLiveAgents({ forceFresh: true }),
+    getLiveAgents({ forceFresh: true }),
+  ])
+  assert(coalescedA === coalescedB, 'getLiveAgents coalesces concurrent collections')
+
+  // `herdr agent list` has no branch field, so the branch comes from the directory.
+  const tmpBranchRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-branch-'))
+  execSync('git init', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  execSync('git checkout -b branch-probe', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  execSync('git -c user.email=t@e.c -c user.name=t commit --allow-empty -m init', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch reads the directory branch')
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch serves a repeat lookup from cache')
+  assert((await resolveBranch('/nonexistent')) === '', 'resolveBranch missing directory')
+  assert((await resolveBranch('')) === '', 'resolveBranch empty directory')
+  // A probe that rejects is one row's problem, not the snapshot's: the value has
+  // to come back empty rather than propagating into the whole collection.
+  const failingProbe = () => Promise.reject(new Error('git could not be spawned'))
+  assert(
+    (await resolveBranch(`${tmpBranchRepo}-rejected`, failingProbe)) === '',
+    'resolveBranch survives a probe that rejects'
+  )
+  assert(
+    (await resolveBranch(`${tmpBranchRepo}-thrower`, () => {
+      throw new Error('probe threw synchronously')
+    })) === '',
+    'resolveBranch survives a probe that throws before returning'
+  )
+  // A failed probe is reported as empty but must not be cached: caching it would
+  // hide a branch that resolves fine again as soon as the probe recovers, for the
+  // whole TTL. A result the probe did produce is cached, detached HEAD included.
+  let probeAttempts = 0
+  const recoveringProbe = () => {
+    probeAttempts += 1
+    return probeAttempts === 1
+      ? Promise.reject(new Error('git could not be spawned'))
+      : Promise.resolve('branch-probe')
+  }
+  const recoveringDir = `${tmpBranchRepo}-recovering`
+  assert((await resolveBranch(recoveringDir, recoveringProbe)) === '', 'resolveBranch reports the first failed probe as empty')
+  assert(
+    (await resolveBranch(recoveringDir, recoveringProbe)) === 'branch-probe',
+    'resolveBranch retries after a failed probe instead of serving the failure for the TTL'
+  )
+  let headProbes = 0
+  const headProbe = async () => {
+    headProbes += 1
+    return 'HEAD'
+  }
+  const headDir = `${tmpBranchRepo}-detached`
+  assert((await resolveBranch(headDir, headProbe)) === '', 'resolveBranch hides a detached HEAD')
+  assert((await resolveBranch(headDir, headProbe)) === '', 'resolveBranch serves a detached HEAD from cache')
+  assert(headProbes === 1, 'resolveBranch caches a result the probe produced')
+  fs.rmSync(tmpBranchRepo, { recursive: true, force: true })
+  // Intentional: a removed directory keeps its branch for the cache TTL, and the
+  // row it belonged to is gone long before that matters.
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch serves a deleted directory from cache')
+  assert((await resolveBranch(`${tmpBranchRepo}-never-cached`)) === '', 'resolveBranch never-cached directory')
+  // A 0ms timer proves the loop kept running while git was in flight: a
+  // synchronous probe would run to completion before the timer could fire.
+  const branchLoopDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-branch-loop-'))
+  let loopRanWhileResolving = false
+  const branchTimer = setTimeout(() => {
+    loopRanWhileResolving = true
+  }, 0)
+  await resolveBranch(branchLoopDir)
+  clearTimeout(branchTimer)
+  assert(loopRanWhileResolving, 'resolveBranch does not block the event loop')
+  fs.rmSync(branchLoopDir, { recursive: true, force: true })
+
+  // A snapshot can hold any number of rows, so the probes it triggers are capped.
+  // The peak is measured while ten items run through three slots.
+  let probesInFlight = 0
+  let peakProbes = 0
+  const visited = []
+  await mapWithConcurrency([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3, async (n) => {
+    probesInFlight += 1
+    peakProbes = Math.max(peakProbes, probesInFlight)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    visited.push(n)
+    probesInFlight -= 1
+    return n * 2
+  })
+  assert(peakProbes <= 3, `mapWithConcurrency caps probes in flight (peak ${peakProbes})`)
+  assert(visited.length === 10, 'mapWithConcurrency visits every item')
+
+  // The runtimes are faked on PATH so discovery, id assignment, and branch
+  // filling are exercised end to end: execEnv keeps the inherited PATH, so a temp
+  // directory in front of it is found.
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-fake-bin-'))
+  const writeFakeRuntime = (name, payload) => {
+    const file = path.join(fakeBin, name)
+    fs.writeFileSync(file, `#!/bin/sh\necho '${payload}'\n`)
+    fs.chmodSync(file, 0o755)
+  }
+  writeFakeRuntime(
+    'herdr',
+    // The second row supplies the id the first row falls back to, so both resolve
+    // to herdr-pane-0 before de-duplication.
+    '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"idle","pane_id":"pane-0"},{"agent_status":"working","pane_id":"pane-7"}]}}'
+  )
+  writeFakeRuntime('orca', '{"result":{"worktrees":[{"path":"/tmp","agents":[{},{}]}]}}')
+  const stateProbe = path.join(fakeBin, 'probe.mjs')
+  fs.writeFileSync(
+    stateProbe,
+    `import { collectLiveState } from ${JSON.stringify(catalogPath)}\nconsole.log(JSON.stringify(await collectLiveState()))\n`
+  )
+  const probedState = JSON.parse(
+    execFileSync(process.execPath, [stateProbe], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH}` },
+    })
+  )
+  const idsFor = (source) =>
+    probedState.agents.filter((agent) => agent.source === source).map((agent) => agent.id)
+  assert(idsFor('herdr').length === 3, 'collectLiveState reads a runtime from the extended PATH')
+  assert(idsFor('herdr').includes('herdr-pane-7'), 'collectLiveState keeps an id the runtime supplied')
+  assert(
+    new Set(idsFor('herdr')).size === 3,
+    'collectLiveState keeps herdr ids unique when an id collides with a fallback'
+  )
+  assert(new Set(idsFor('orca')).size === 2, 'collectLiveState keeps orca ids unique without paneKey')
+  assert(
+    probedState.agents.every((agent) => typeof agent.branch === 'string'),
+    'collectLiveState leaves a string branch on every record'
+  )
+  fs.rmSync(fakeBin, { recursive: true, force: true })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -553,6 +1271,7 @@ async function main() {
   await runUnitTests()
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
+  await runDashboardUnitTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {

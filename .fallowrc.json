@@ -3,6 +3,7 @@
   "entry": [
     "main.mjs",
     "herdr/herdr-adapter.mjs",
+    "dashboard.mjs",
     "test_cases.test.js"
   ],
   "health": {
@@ -12,6 +13,24 @@
         "maxUnitSize": 250,
         "maxCrap": 80,
         "reason": "Integration harness is intentionally linear and long"
+      },
+      {
+        "files": ["dashboard.mjs"],
+        "maxUnitSize": 600,
+        "maxCrap": 200,
+        "reason": "Standalone dashboard server contains self-contained HTML/CSS/JS template"
+      },
+      {
+        "files": ["shared/service.mjs"],
+        "maxUnitSize": 250,
+        "maxCrap": 150,
+        "reason": "OS service management and update execution commands"
+      },
+      {
+        "files": ["shared/catalog.mjs"],
+        "maxUnitSize": 250,
+        "maxCrap": 200,
+        "reason": "Multi-runtime agent discovery and schema normalization"
       }
     ]
   }

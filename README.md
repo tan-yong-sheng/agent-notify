@@ -166,6 +166,71 @@ cp /path/to/agent-notify/.env "$CONFIG_DIR/.env"
 herdr plugin action invoke test --plugin agent-notify
 ```
 
+## Agent Monitor Dashboard
+
+A lightweight, zero-dependency local web dashboard to monitor which coding agents (Pi, Claude, Codex, etc.) are currently running, waiting for input, or finished across both **Orca** worktrees and **Herdr** sessions in one place.
+
+### Launch the Dashboard
+
+```bash
+node dashboard.mjs
+# Or start with bun for lower memory usage:
+bun dashboard.mjs
+# Or specify a custom port:
+node dashboard.mjs --port 8080
+```
+
+Then visit [http://localhost:3333](http://localhost:3333).
+
+- **Real-time status**: Polls live agent state across Orca and Herdr every 3 seconds without UI flicker.
+- **Low Memory / Multi-Runtime**: Runs on standard Node.js or opportunistically under Bun (~35 MB RSS vs ~57 MB RSS).
+- **Compact dense table**: Clean layout showing status badges (🟢 Working, 🔴 Blocked, ⚪ Done / Idle), host environment (`Orca` / `Herdr`), agent type (`pi`), workspace directory, git branch, and active tool / prompt.
+- **Search & Filter**: Real-time filter box and quick tabs (`All`, `Working`, `Blocked`, `Settled`).
+- **Click-to-copy & Inspect**: Click any directory path to copy it to your clipboard, or click a prompt to expand its full text.
+- **Configurable**: Set `DASHBOARD_PORT=3333` in `.env` or pass `--port <number>`.
+
+### Background Service Management
+
+You can install the dashboard as a persistent background daemon that starts on login:
+- **Linux**: Managed via `systemd --user` (`~/.config/systemd/user/agent-monitor.service`)
+- **macOS**: Managed via `launchd` (`~/Library/LaunchAgents/dev.agent-notify.dashboard.plist`), logging to `~/Library/Logs/agent-monitor`
+- **Windows**: Managed via user Startup folder shortcut
+- **Opportunistic Bun**: Automatically selects `bun` if installed on your system to minimize daemon background RAM usage (~35 MB), falling back to `node`.
+
+```bash
+# Install and start service on login
+node dashboard.mjs --service install
+
+# Check service status
+node dashboard.mjs --service status
+
+# Restart service
+node dashboard.mjs --service restart
+
+# View logs (Linux journalctl or macOS stdout log)
+node dashboard.mjs --service logs
+
+# Stop and uninstall service
+node dashboard.mjs --service uninstall
+```
+
+### Updates
+
+The dashboard checks the branch your checkout actually tracks (falling back to `origin/main` for read-only checks) and shows a banner only when you are genuinely *behind*, with the manifest version delta when it changed (e.g. `orca 1.1.0 → 1.2.0`). You can also check and update from the terminal:
+
+```bash
+# Check if updates are available
+node dashboard.mjs --check-update
+
+# The same result as JSON, optionally for another checkout
+node dashboard.mjs --update-status-json [path]
+
+# Fast-forward the tracked upstream; restarts the service only if HEAD moved
+node dashboard.mjs --update
+```
+
+`--update` requires the current checkout to be on a branch that tracks the update target. It refuses to act on a detached HEAD or a differently-branched checkout instead of reporting a success that never happened, and prints `nothing changed` rather than claiming an update when the pull is a no-op.
+
 ## Test
 
 ```bash
