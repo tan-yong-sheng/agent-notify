@@ -46,7 +46,7 @@ import {
   getServicePlatform,
   resolveServiceRuntime,
   buildVersionLabel,
-  checkUpdateStatus,
+  fetchUpdateStatus,
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
@@ -639,10 +639,17 @@ async function runDashboardUnitTests() {
   const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs')
   assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')
 
-  const updateStatus = checkUpdateStatus(process.cwd())
-  assert(typeof updateStatus === 'object', 'checkUpdateStatus returns object')
-  assert(updateStatus.isGit === true, 'checkUpdateStatus isGit')
-  assert(typeof updateStatus.behind === 'number' || updateStatus.unavailable, 'checkUpdateStatus reports behind or unavailable')
+  // No remote configured, so this stays offline: it must report a git checkout
+  // it cannot resolve, rather than reaching out to the network.
+  const tmpRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-update-'))
+  execSync('git init', { cwd: tmpRepoDir, stdio: 'ignore' })
+  const updateStatus = fetchUpdateStatus(tmpRepoDir)
+  assert(typeof updateStatus === 'object', 'fetchUpdateStatus returns object')
+  assert(updateStatus.isGit === true, 'fetchUpdateStatus isGit')
+  assert(updateStatus.hasUpdate === false, 'fetchUpdateStatus reports no update without a target')
+  assert(Boolean(updateStatus.unavailable), 'fetchUpdateStatus explains the missing target')
+  assert(fetchUpdateStatus('/nonexistent').isGit === false, 'fetchUpdateStatus non-git directory')
+  fs.rmSync(tmpRepoDir, { recursive: true, force: true })
 
   assert(
     buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.4.0' }) ===

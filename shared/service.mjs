@@ -345,7 +345,11 @@ export function buildVersionLabel(localVersions, remoteVersions) {
   return parts.length ? parts.join(' · ') : null
 }
 
-function fetchGitUpdateStatus(repoDir, now) {
+// Uncached probe. Does a `git fetch` of the update target, so it mutates the
+// repo's remote-tracking refs and needs network access; callers that render the
+// UI should go through checkUpdateStatus instead.
+export function fetchUpdateStatus(repoDir) {
+  const now = Date.now()
   const env = getExtendedPathEnv()
   if (!tryGit(['rev-parse', '--is-inside-work-tree'], repoDir, env)) {
     return { isGit: false, hasUpdate: false, checkedAt: now }
@@ -393,7 +397,7 @@ export function checkUpdateStatus(repoDir) {
   if (cachedUpdateCheck && now - lastUpdateCheckTime < UPDATE_CHECK_INTERVAL_MS) {
     return cachedUpdateCheck
   }
-  cachedUpdateCheck = fetchGitUpdateStatus(repoDir, now)
+  cachedUpdateCheck = fetchUpdateStatus(repoDir)
   lastUpdateCheckTime = now
   return cachedUpdateCheck
 }
