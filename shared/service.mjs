@@ -668,13 +668,20 @@ export async function checkUpdateStatusAsync(repoDir, probeArgv) {
   if (pending) return pending
 
   const probe = probeUpdateStatusInChild(repoDir, probeArgv)
-    .then((status) => {
-      if (status) {
-        writeUpdateCheckCache(repoDir, status)
-        return status
-      }
-      return failedProbeStatus(repoDir)
-    })
+    .then(
+      (status) => {
+        if (status) {
+          writeUpdateCheckCache(repoDir, status)
+          return status
+        }
+        return failedProbeStatus(repoDir)
+      },
+      // execFile validates its arguments before it ever calls back, so an
+      // unusable probe path rejects this promise instead of resolving null.
+      // Callers are request handlers that can only render a status, so the
+      // fallback covers that path too rather than rejecting into them.
+      () => failedProbeStatus(repoDir)
+    )
     .finally(() => {
       pendingUpdateChecks.delete(repoDir)
     })

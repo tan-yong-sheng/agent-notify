@@ -54,6 +54,14 @@ const REPO_DIR = path.dirname(SCRIPT_PATH)
 
 export { normalizeAgentStatus, parseHerdrAgent, parseOrcaAgent, collectLiveState }
 
+// The banner label for an update status. Exported and embedded into the page, so
+// the browser runs the same code the tests exercise: a status the dashboard could
+// not refresh says so, instead of looking like a check that just succeeded.
+export function updateBannerLabel(data) {
+  const label = data.versionLabel || ((data.localSha || '') + ' → ' + (data.remoteSha || 'new'))
+  return data.stale ? label + ' (last known, the update check could not run)' : label
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -611,13 +619,15 @@ export function renderDashboardHtml() {
     fetchAgents();
     setInterval(fetchAgents, 3000);
 
+    const updateBannerLabel = ${updateBannerLabel.toString()};
+
     // Update check (on load and every 10 minutes)
     async function checkUpdate() {
       try {
         const res = await fetch('/api/update');
         const data = await res.json();
         if (data.hasUpdate) {
-          document.getElementById('update-commit').innerText = data.versionLabel || ((data.localSha || '') + ' → ' + (data.remoteSha || 'new'));
+          document.getElementById('update-commit').innerText = updateBannerLabel(data);
           document.getElementById('update-banner').style.display = 'flex';
         }
       } catch {}

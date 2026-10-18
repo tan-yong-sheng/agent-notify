@@ -35,6 +35,8 @@ import {
   isAllowedHost,
   isDirectInvocation,
   formatListenError,
+  renderDashboardHtml,
+  updateBannerLabel,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
 import {
@@ -78,6 +80,27 @@ function captureConsole(fn) {
     console.error = realError
   }
   return lines
+}
+
+// Function.prototype.toString() is re-serialized by some runtimes (Bun emits its
+// own formatting, semicolons included), so the function embedded in the page is
+// sliced by matching braces instead of by a regex over its source.
+function sliceEmbeddedFunction(source, prelude) {
+  const start = source.indexOf(prelude)
+  if (start === -1) return null
+  const from = start + prelude.length
+  let depth = 0
+  let seenBrace = false
+  for (let i = from; i < source.length; i++) {
+    if (source[i] === '{') {
+      depth++
+      seenBrace = true
+    } else if (source[i] === '}') {
+      depth--
+      if (seenBrace && depth === 0) return source.slice(from, i + 1)
+    }
+  }
+  return null
 }
 
 function assert(condition, label) {
@@ -593,6 +616,65 @@ function runOrcaMainUnitTests() {
   assert(isSettleAlreadyNotified(pane, 'done') === false, 'forgotten pane notifies again')
 }
 
+// The update check's failure paths and the banner they feed. Kept out of the
+// dashboard assertions above: the branching here is what makes a failed check
+// readable, and it reads better as its own case.
+async function assertUpdateFailureAndBanner() {
+
+  // runtime with no process.execPath is the real case), so this promise rejects
+  // rather than resolving null. /api/update awaits it with no catch, so a
+  // rejection here would surface as a failed request instead of a status.
+  const spawnFailDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nospawn-'))
+  const realExecPath = process.execPath
+  let spawnFailStatus = null
+  let spawnFailRejected = null
+  try {
+    process.execPath = ''
+    spawnFailStatus = await checkUpdateStatusAsync(spawnFailDir, [dashboardPath]).catch((err) => {
+      spawnFailRejected = err
+      return null
+    })
+  } finally {
+    process.execPath = realExecPath
+  }
+  assert(spawnFailRejected === null, 'a probe that cannot spawn does not reject the update check')
+  assert(
+    spawnFailStatus?.unavailable === 'the update check could not run',
+    'a probe that cannot spawn reports that the check could not run'
+  )
+  fs.rmSync(spawnFailDir, { recursive: true, force: true })
+
+  // A stale status is one the dashboard could not refresh, so the banner has to
+  // say that instead of looking like a check that just succeeded. The page embeds
+  // the same function the tests call, so the two cannot drift apart.
+  const dashboardHtml = renderDashboardHtml()
+  assert(
+    updateBannerLabel({ versionLabel: 'v1 → v2', stale: true }).endsWith('(last known, the update check could not run)'),
+    'updateBannerLabel marks a stale status as last known'
+  )
+  assert(
+    updateBannerLabel({ localSha: 'aaaaaaa', remoteSha: 'bbbbbbb' }) === 'aaaaaaa → bbbbbbb',
+    'updateBannerLabel renders the revision pair'
+  )
+  assert(
+    dashboardHtml.includes('.innerText = updateBannerLabel('),
+    'the dashboard labels the update banner through it'
+  )
+  const embeddedLabel = sliceEmbeddedFunction(dashboardHtml, 'const updateBannerLabel = ')
+  assert(embeddedLabel !== null, 'the dashboard embeds the update banner label')
+  const pageLabel = new Function(`return ${embeddedLabel}`)()
+  const staleCase = { localSha: 'aaaaaaa', remoteSha: 'bbbbbbb', stale: true }
+  assert(
+    pageLabel(staleCase) === updateBannerLabel(staleCase),
+    'the embedded update banner label matches the tested one for a stale status'
+  )
+  const freshCase = { localSha: 'aaaaaaa', remoteSha: 'bbbbbbb' }
+  assert(
+    pageLabel(freshCase) === updateBannerLabel(freshCase),
+    'the embedded update banner label matches the tested one for a fresh status'
+  )
+}
+
 async function runDashboardUnitTests() {
   console.log('\nRunning dashboard.mjs unit tests...\n')
 
@@ -911,6 +993,7 @@ async function runDashboardUnitTests() {
   assert(noHistory.stale === undefined, 'a status with no history is not labelled stale')
   fs.rmSync(staleDir, { recursive: true, force: true })
   fs.rmSync(noHistoryDir, { recursive: true, force: true })
+  await assertUpdateFailureAndBanner()
 
   // Installing must restart an already-running unit: `enable --now` leaves a
   // running unit on its previous definition, so reinstalling after an edit would
@@ -1078,6 +1161,31 @@ async function runDashboardUnitTests() {
     })) === '',
     'resolveBranch survives a probe that throws before returning'
   )
+  // A failed probe is reported as empty but must not be cached: caching it would
+  // hide a branch that resolves fine again as soon as the probe recovers, for the
+  // whole TTL. A result the probe did produce is cached, detached HEAD included.
+  let probeAttempts = 0
+  const recoveringProbe = () => {
+    probeAttempts += 1
+    return probeAttempts === 1
+      ? Promise.reject(new Error('git could not be spawned'))
+      : Promise.resolve('branch-probe')
+  }
+  const recoveringDir = `${tmpBranchRepo}-recovering`
+  assert((await resolveBranch(recoveringDir, recoveringProbe)) === '', 'resolveBranch reports the first failed probe as empty')
+  assert(
+    (await resolveBranch(recoveringDir, recoveringProbe)) === 'branch-probe',
+    'resolveBranch retries after a failed probe instead of serving the failure for the TTL'
+  )
+  let headProbes = 0
+  const headProbe = async () => {
+    headProbes += 1
+    return 'HEAD'
+  }
+  const headDir = `${tmpBranchRepo}-detached`
+  assert((await resolveBranch(headDir, headProbe)) === '', 'resolveBranch hides a detached HEAD')
+  assert((await resolveBranch(headDir, headProbe)) === '', 'resolveBranch serves a detached HEAD from cache')
+  assert(headProbes === 1, 'resolveBranch caches a result the probe produced')
   fs.rmSync(tmpBranchRepo, { recursive: true, force: true })
   // Intentional: a removed directory keeps its branch for the cache TTL, and the
   // row it belonged to is gone long before that matters.

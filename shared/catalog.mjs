@@ -118,13 +118,16 @@ function readBranchCache(cwd) {
 // A probe failure is one row's problem: a rejected probe would otherwise reject
 // the worker, abort `mapWithConcurrency`, and fail the whole snapshot over a
 // single unusable directory. The probe is injectable so that path is testable.
+// A failure returns null, which is not a branch, so `resolveBranch` can tell it
+// apart from a directory that genuinely has no branch to show.
 async function probeBranch(cwd, probe) {
   try {
     const detected = await probe(cwd)
     // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
-    return detected === 'HEAD' ? '' : detected
+    if (!detected || detected === 'HEAD') return ''
+    return detected
   } catch {
-    return ''
+    return null
   }
 }
 
@@ -143,6 +146,11 @@ export async function resolveBranch(cwd, probe = detectGitBranchAsync) {
 
   const lookup = probeBranch(cwd, probe)
     .then((branch) => {
+      // A failed probe is reported as an empty branch but not cached: caching it
+      // would serve the failure for the whole TTL after the probe recovered.
+      // An empty result from a probe that ran is cached, because a detached HEAD
+      // will not become a branch before the TTL expires.
+      if (branch === null) return ''
       if (branchCache.size >= BRANCH_CACHE_LIMIT && !branchCache.has(cwd)) branchCache.clear()
       branchCache.set(cwd, { branch, at: Date.now() })
       return branch
