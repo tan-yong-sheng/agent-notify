@@ -13,3 +13,6 @@ coverage/
 coverage-v8/
 .ocr-probe/
 .nyc_output/
+
+# Verification run output (regenerate with .agents/skills/verify)
+.agents/skills/verify/artifacts/
