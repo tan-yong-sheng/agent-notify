@@ -74,6 +74,40 @@ if (isDirty(REPO_ROOT, { trackedOnly: true })) {
   process.exit(2)
 }
 
+// This driver edits tracked files in place, so two runs in one checkout race:
+// each restores the other's mutation and the evidence file is written twice.
+const lockFile = path.join(ARTIFACTS, '.mutate.lock')
+fs.mkdirSync(ARTIFACTS, { recursive: true })
+for (let attempt = 0; ; attempt++) {
+  try {
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: 'wx' })
+    break
+  } catch (err) {
+    if (err.code !== 'EEXIST' || attempt > 1) {
+      console.error(`refusing to run: cannot take the mutation lock at ${lockFile} (${err.code || err.message})`)
+      process.exit(2)
+    }
+    let holder = null
+    try {
+      holder = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+    } catch {}
+    let alive = false
+    try {
+      if (holder?.pid) alive = process.kill(holder.pid, 0) || true
+    } catch {}
+    if (alive) {
+      console.error(`refusing to run: another mutation driver (pid ${holder.pid}, started ${holder.at}) is working in this checkout`)
+      process.exit(2)
+    }
+    fs.rmSync(lockFile, { force: true })
+  }
+}
+const releaseLock = () => {
+  try {
+    fs.rmSync(lockFile, { force: true })
+  } catch {}
+}
+
 function classify(mutation, output) {
   if (output.includes(`✗ ${mutation.expectTest}`)) return { ok: true, detail: `caught by "${mutation.expectTest}"` }
   if (!/Results:/.test(output)) {
@@ -126,6 +160,7 @@ function restoreOnce() {
       console.error(`could not restore ${file}: ${err.message}`)
     }
   }
+  releaseLock()
 }
 process.on('exit', restoreOnce)
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -166,6 +201,7 @@ try {
   }
 } finally {
   restoreAll()
+  releaseLock()
 }
 
 if (noticedByAbort) {
