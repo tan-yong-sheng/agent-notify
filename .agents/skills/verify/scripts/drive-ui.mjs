@@ -2,13 +2,15 @@
 
 // Drives the dashboard UI in a real browser against deterministic fixtures.
 //
-// Usage: node .agents/skills/verify/scripts/drive-ui.mjs [--port 4742] [--out .agents/skills/verify/artifacts/ui]
+// Usage: node .agents/skills/verify/scripts/drive-ui.mjs [--port <free port>] [--out .agents/skills/verify/artifacts/ui]
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import {
   parseArgs,
   flagValue,
+  freePort,
   sleep,
   httpGet,
   waitForDashboard,
@@ -20,13 +22,23 @@ import {
 } from './lib.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
-const port = flags.port && flags.port !== true ? Number(flags.port) : 4742
+// Default to a port nothing else can claim. A fixed default would let the browser
+// attach to an instance this run did not start, which silently proves the wrong thing.
+const port = flags.port && flags.port !== true ? Number(flags.port) : await freePort()
 const stubScript = path.join(REPO_ROOT, '.agents', 'skills', 'verify', 'scripts', 'serve-stub.mjs')
 const outDir = path.resolve(REPO_ROOT, flagValue(flags, 'out', path.join(ARTIFACTS, 'ui')))
 const report = makeReport('drive-ui')
+// A private session file: `launch` can never adopt a browser someone else
+// started, and `close` can only ever stop the Chrome this run launched.
+const browserState = path.join(os.tmpdir(), `verify-browser-${process.pid}.json`)
+console.log(`drive-ui: driving a stub on port ${port}`)
+
+function runBrowserHere(args) {
+  return runBrowser(['--state', browserState, ...args])
+}
 
 function browser(args) {
-  const result = runBrowser(args)
+  const result = runBrowserHere(args)
   if (result.status !== 0) {
     throw new Error(`browser ${args[0]} failed: ${(result.stderr || result.stdout).trim().split('\n').slice(-2).join(' ')}`)
   }
@@ -74,7 +86,7 @@ try {
   if (!stubReady.ready) throw new Error(`stub never became ready: ${stubReady.reason}\n${stub.output}`)
   fs.mkdirSync(outDir, { recursive: true })
 
-  const launched = runBrowser(['launch'])
+  const launched = runBrowserHere(['launch'])
   browserStarted = launched.status === 0 || /already running/.test(launched.stdout)
   if (!browserStarted) throw new Error(`cannot launch a browser: ${launched.stderr.trim()}`)
   browser(['open', `http://127.0.0.1:${port}/`])
@@ -174,7 +186,7 @@ try {
 
   report.writeEvidence('drive-ui.json')
 } finally {
-  if (browserStarted) runBrowser(['close'])
+  if (browserStarted) runBrowserHere(['close'])
   stub.stop()
   report.finish()
 }

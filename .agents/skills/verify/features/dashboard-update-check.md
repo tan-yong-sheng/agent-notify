@@ -24,11 +24,18 @@ The dashboard tells you when your checkout is behind the branch it tracks: a ban
 
 Preconditions:
 
-- The page journeys use `scripts/serve-stub.mjs`, whose `/api/update` returns a deliberately stale status (`stale: true`, `hasUpdate: true`, `aaaaaaa → bbbbbbb`).
+- The page journeys use `scripts/serve-stub.mjs`, whose `/api/update` returns a deliberately stale status (`stale: true`, `hasUpdate: true`, `aaaaaaa → bbbbbbb`). Start it yourself for a manual read — `drive-ui.mjs` starts and stops its own:
+
+```bash
+node .agents/skills/verify/scripts/serve-stub.mjs --port 4742 &
+node .agents/skills/verify/scripts/browser.mjs launch
+node .agents/skills/verify/scripts/browser.mjs open http://127.0.0.1:4742/
+```
+
 - The terminal journeys run against a checkout this run owns. Never run `--update` in the user's working checkout, and never in the worktree you are editing.
 
-- **See the banner.** Open the page. Run `node .agents/skills/verify/scripts/drive-ui.mjs --port 4742` and read `document.getElementById("update-banner").style.display`. It is not `none`, and `#update-commit` ends with `(last known, the update check could not run)` because the stub's status is stale.
-- **Check from the terminal.** Run `node dashboard.mjs --check-update`. Exit code `0`. With nothing to do it prints `✨ Up to date with origin/main (<sha>)`; when behind it prints `📦 Update available on <upstream>: <local> → <remote>` plus the commit count and the command to run.
+- **See the banner.** Open the page (`drive-ui.mjs` already asserts this as *a stale update status is labelled as last known*) and read `document.getElementById("update-banner").style.display`. It is not `none`, and `#update-commit` ends with `(last known, the update check could not run)` because the stub's status is stale.
+- **Check from the terminal.** Run `node dashboard.mjs --check-update`. Exit code `0`. With a clean checkout it prints `✨ Already up to date (commit: <sha>).`; with local commits it prints `✨ Up to date with origin/main (<sha>); N local commit(s) not on the remote.`; when behind it prints `📦 Update available on <upstream>: <local> → <remote>` plus the commit count and the command to run.
 - **Read the structured form.** Run `node dashboard.mjs --update-status-json`. It prints one JSON object with `isGit`, `hasUpdate`, `localSha`, `remoteSha`, `behind`, `ahead`, `upstream`, `tracks`, `fetchFailed`, `versionLabel`, `checkedAt`, and exits `0`. `"fetchFailed":false` distinguishes "checked and current" from "could not check".
 - **Report on another checkout.** Run `node dashboard.mjs --update-status-json /path/to/other/checkout`. The JSON describes that directory instead of the script's own.
 - **The endpoint agrees.** Run `curl -fsS "http://127.0.0.1:$PORT/api/update"`. It returns an object with a boolean `hasUpdate`.

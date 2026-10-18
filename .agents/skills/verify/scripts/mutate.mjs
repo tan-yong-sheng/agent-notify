@@ -8,7 +8,9 @@
 //   node .agents/skills/verify/scripts/mutate.mjs [--only <id>] [--runtime node|bun]
 //
 // The run refuses to start on a dirty worktree: it edits tracked files in place
-// and restores them from memory, so a clean tree is the recovery path.
+// and restores them from memory, so a clean tree is the recovery path. It also
+// restores on SIGINT/SIGTERM/SIGHUP and on exit; a `kill -9` is the one case that
+// cannot be covered, which is exactly what the dirty-tree refusal is for.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -75,11 +77,17 @@ if (isDirty(REPO_ROOT, { trackedOnly: true })) {
 function classify(mutation, output) {
   if (output.includes(`✗ ${mutation.expectTest}`)) return { ok: true, detail: `caught by "${mutation.expectTest}"` }
   if (!/Results:/.test(output)) {
-    // An uncaught error kills the suite before it prints its summary. That still
-    // fails the build, but it only counts when the trace names the mutated file:
-    // otherwise the replacement did not parse and proves nothing about the test.
+    // An uncaught error kills the suite before it prints a summary. That fails
+    // the build, but it is not proof that the named test bites: the run may have
+    // died before reaching it. Report it as an abort — never as a caught test.
     if (/SyntaxError/.test(output)) return { ok: false, detail: 'the replacement does not parse' }
-    if (output.includes(mutation.file)) return { ok: true, detail: `aborted the suite inside ${mutation.file} before it could print a summary` }
+    if (output.includes(mutation.file)) {
+      return {
+        ok: true,
+        abort: true,
+        detail: `the suite aborted inside ${mutation.file} before printing a summary, so "${mutation.expectTest}" never reported — abort evidence, not a caught test`,
+      }
+    }
     return { ok: false, detail: 'the suite aborted without naming the mutated file' }
   }
   return { ok: false, detail: `SURVIVED: "${mutation.expectTest}" still passed` }
@@ -95,12 +103,37 @@ function writeMutationLog(id, output) {
 
 const report = makeReport('mutate')
 const touched = new Map()
+let noticedByAbort = 0
+const abortedIds = []
 
 function restoreAll() {
   for (const [file, source] of touched) {
     fs.writeFileSync(file, source)
     if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
   }
+}
+
+// The `finally` below covers ordinary failures. A signal arriving while the test
+// child runs would skip it, so restore from the in-memory copy on the way out.
+let restored = false
+function restoreOnce() {
+  if (restored) return
+  restored = true
+  for (const [file, source] of touched) {
+    try {
+      fs.writeFileSync(file, source)
+    } catch (err) {
+      console.error(`could not restore ${file}: ${err.message}`)
+    }
+  }
+}
+process.on('exit', restoreOnce)
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    restoreOnce()
+    console.error(`\n${signal}: restored ${touched.size} tracked file(s) before exiting`)
+    process.exit(signal === 'SIGINT' ? 130 : 143)
+  })
 }
 
 try {
@@ -123,12 +156,21 @@ try {
     }
     const reported = /Results:/.test(output)
     const verdict = classify(mutation, output)
+    if (verdict.abort) {
+      noticedByAbort++
+      abortedIds.push(mutation.id)
+    }
     const seconds = ((Date.now() - started) / 1000).toFixed(0)
     const detail = `${mutation.description} — ${verdict.detail}${reported ? '' : ` (see ${path.relative(REPO_ROOT, writeMutationLog(mutation.id, output))})`} in ${seconds}s`
     report.check(mutation.id, verdict.ok, detail)
   }
 } finally {
   restoreAll()
+}
+
+if (noticedByAbort) {
+  console.log(`\nNOTE  ${noticedByAbort} mutation(s) were noticed only by an abort inside the mutated file: ${abortedIds.join(', ')}`)
+  console.log('      Their named test never reported, so they are not proof that it bites. The captured output is in artifacts/mutations/<id>.log.')
 }
 
 if (isDirty(REPO_ROOT, { trackedOnly: true })) {

@@ -111,6 +111,43 @@ function writeState(state) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2))
 }
 
+// Chrome is started with a private --user-data-dir, and that path is the only
+// durable fact about the process we started. A recorded pid is not an identity:
+// once Chrome exits the number can be reused by an unrelated process, and this
+// driver must never signal one.
+const PROC_AVAILABLE = fs.existsSync('/proc/self/cmdline')
+function pidIsOurChrome(pid, userDataDir) {
+  if (!PROC_AVAILABLE) return true
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(userDataDir)
+  } catch {
+    return false
+  }
+}
+
+// A Chrome that cannot start because its own sandbox is unavailable is the one
+// case worth retrying with the sandbox off. Any other startup failure is a real
+// failure and must not silently produce an unsandboxed browser.
+const SANDBOX_REFUSAL = /sandbox|namespace|Operation not permitted|clone\(CLONE_NEWUSER\)/i
+const tailOf = (log) =>
+  log
+    .trim()
+    .split('\n')
+    .slice(-4)
+    .join('\n')
+
+async function evalOrThrow(cdp, expression, sessionId, extra = {}) {
+  const res = await cdp.send(
+    'Runtime.evaluate',
+    { expression, returnByValue: true, awaitPromise: true, ...extra },
+    sessionId
+  )
+  if (res.exceptionDetails) {
+    throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text)
+  }
+  return res.result.value
+}
+
 async function freePort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer()
@@ -141,6 +178,10 @@ class Cdp {
   }
 
   static async connect(wsUrl) {
+    // Node < 22 has no global WebSocket; fail with the floor instead of "WebSocket is not defined".
+    if (typeof WebSocket !== 'function') {
+      throw new Error(`the CDP client needs a global WebSocket (Node >= 22); this runtime reports ${process.version}`)
+    }
     const ws = new WebSocket(wsUrl)
     await new Promise((resolve, reject) => {
       ws.addEventListener('open', resolve, { once: true })
@@ -174,10 +215,17 @@ async function pageSession() {
   const state = readState()
   const cdp = await Cdp.connect(state.ws)
   const { targetInfos } = await cdp.send('Target.getTargets')
-  const page = targetInfos.find((t) => t.targetId === state.targetId) || targetInfos.find((t) => t.type === 'page')
-  if (!page) throw new Error('no page target; run "browser.mjs open <url>"')
+  // Only the page this session opened. Falling back to any page target would
+  // silently drive Chrome's own about:blank tab and report its results as ours.
+  const page = targetInfos.find((t) => t.targetId === state.targetId)
+  if (!page) {
+    throw new Error(
+      state.targetId
+        ? 'the page this session opened is gone; run "browser.mjs open <url>"'
+        : 'this session has not opened a page; run "browser.mjs open <url>"'
+    )
+  }
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true })
-  if (page.targetId !== state.targetId) writeState({ ...state, targetId: page.targetId })
   return { cdp, sessionId, state }
 }
 
@@ -236,14 +284,19 @@ async function launch() {
   let attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: [] })
   let sandbox = 'on'
   if (!attempt.info) {
+    const log = attempt.log
     attempt.child.kill('SIGKILL')
+    if (!SANDBOX_REFUSAL.test(log)) {
+      throw new Error(
+        `Chrome did not expose a debugger on port ${port}, and the failure is not a sandbox refusal, so it is not retried with the sandbox off\n${tailOf(log)}`
+      )
+    }
     attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: ['--no-sandbox', '--disable-setuid-sandbox'] })
     sandbox = 'off'
   }
   if (!attempt.info) {
     attempt.child.kill('SIGKILL')
-    const tail = attempt.log.trim().split('\n').slice(-4).join('\n')
-    throw new Error(`Chrome did not expose a debugger on port ${port}\n${tail}`)
+    throw new Error(`Chrome did not expose a debugger on port ${port}\n${tailOf(attempt.log)}`)
   }
   writeState({ pid: attempt.child.pid, port, ws: attempt.info.webSocketDebuggerUrl, userDataDir, chrome, sandbox, targetId: null })
   // The browser outlives this command; drop the pipes and the child handle so
@@ -284,15 +337,7 @@ async function waitFor(sessionId, expression, timeout, cdp) {
 async function evaluate(expression) {
   const { cdp, sessionId } = await pageSession()
   try {
-    const res = await cdp.send(
-      'Runtime.evaluate',
-      { expression, returnByValue: true, awaitPromise: true },
-      sessionId
-    )
-    if (res.exceptionDetails) {
-      throw new Error(res.exceptionDetails.exception?.description || res.exceptionDetails.text)
-    }
-    console.log(JSON.stringify(res.result.value))
+    console.log(JSON.stringify(await evalOrThrow(cdp, expression, sessionId)))
   } finally {
     cdp.close()
   }
@@ -355,22 +400,18 @@ async function type() {
   const value = String(flags.value ?? '')
   const { cdp, sessionId } = await pageSession()
   try {
-    await cdp.send(
-      'Runtime.evaluate',
-      {
-        expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error('no ${selector}');
-          el.focus(); el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`,
-        returnByValue: true,
-      },
+    await evalOrThrow(
+      cdp,
+      // The selector reaches the page as data in both places; interpolating it
+      // into the throw message would let a quote in a selector run code.
+      `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error(${JSON.stringify(`no element matches ${selector}`)});
+        el.focus(); el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`,
       sessionId
     )
     await cdp.send('Input.insertText', { text: value }, sessionId)
-    const { result } = await cdp.send(
-      'Runtime.evaluate',
-      { expression: `document.querySelector(${JSON.stringify(selector)}).value`, returnByValue: true },
-      sessionId
-    )
-    console.log(JSON.stringify(result.value))
+    const typed = await evalOrThrow(cdp, `document.querySelector(${JSON.stringify(selector)}).value`, sessionId)
+    if (typed !== value) throw new Error(`the field holds ${JSON.stringify(typed)} after typing ${JSON.stringify(value)}`)
+    console.log(JSON.stringify(typed))
   } finally {
     cdp.close()
   }
@@ -397,23 +438,27 @@ async function close() {
     if (state.targetId) await cdp.send('Target.closeTarget', { targetId: state.targetId }).catch(() => {})
     cdp.close()
   }
-  try {
-    process.kill(state.pid, 'SIGTERM')
-  } catch {}
-  // Wait for the process to go before touching its profile: Chrome keeps writing
-  // into the user-data dir while it shuts down.
-  const deadline = Date.now() + 5000
-  while (Date.now() < deadline) {
+  const ours = pidIsOurChrome(state.pid, state.userDataDir)
+  if (!ours) console.log(`pid ${state.pid} is no longer this session's Chrome (it exited and the pid was reused); not signalling it`)
+  if (ours) {
     try {
-      process.kill(state.pid, 0)
-      await sleep(100)
-    } catch {
-      break
+      process.kill(state.pid, 'SIGTERM')
+    } catch {}
+    // Wait for the process to go before touching its profile: Chrome keeps writing
+    // into the user-data dir while it shuts down.
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      try {
+        process.kill(state.pid, 0)
+        await sleep(100)
+      } catch {
+        break
+      }
     }
+    try {
+      process.kill(state.pid, 'SIGKILL')
+    } catch {}
   }
-  try {
-    process.kill(state.pid, 'SIGKILL')
-  } catch {}
   fs.rmSync(statePath, { force: true })
   try {
     fs.rmSync(state.userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })

@@ -28,8 +28,17 @@ Preconditions:
 - A dashboard this run started is healthy at the port under test (`doctor.mjs` reports a drivable instance).
 - For the table journeys, the page is served by `scripts/serve-stub.mjs` with the `mixed` fixture, which the stub sets by default.
 - The fixture is restored with `GET /control/fixture?name=mixed` before a journey that changed it.
+- Run the automated journey first: `node .agents/skills/verify/scripts/drive-ui.mjs` runs the stub, the browser, every check below, and tears everything down. It defaults to a free port; add `--port 4742` to pin one. Because it tears the stub down on exit, the manual journeys below need their own:
 
-- **Open the page.** Start the page journey. Run `node .agents/skills/verify/scripts/drive-ui.mjs --port 4742`. It launches Chrome, opens `http://127.0.0.1:4742/`, and the title check reads `Agent Monitor` while the header names the product.
+```bash
+node .agents/skills/verify/scripts/serve-stub.mjs --port 4742 &   # record the PID
+node .agents/skills/verify/scripts/browser.mjs launch
+node .agents/skills/verify/scripts/browser.mjs open http://127.0.0.1:4742/
+# ... journey ...
+node .agents/skills/verify/scripts/browser.mjs close && kill <stub pid>
+```
+
+- **Open the page.** Open `http://127.0.0.1:4742/` in the browser session, or run the whole automated journey (`drive-ui.mjs`). The title check reads `Agent Monitor` while the header names the product.
 - **Read the status counts.** Look at the counters above the table. Run `node .agents/skills/verify/scripts/browser.mjs eval 'document.getElementById("count-working").innerText'`. Against the `mixed` fixture the counts are working `1`, blocked `1`, settled `1`, total `3`.
 - **Read the rows.** Scan the table body. Run `node .agents/skills/verify/scripts/browser.mjs eval 'Array.from(document.querySelectorAll("#agent-table-body tr")).map((tr) => tr.innerText)'`. Three rows appear, carrying `WORKING`, `BLOCKED`, `DONE / IDLE`, the host tags `Orca` and `Herdr`, and the branch `feat/alpha`.
 - **See a missing value.** Look at the Herdr row `herdr:charlie`. Run the row eval above. Its branch cell renders `—` because the fixture row has no branch.
@@ -37,7 +46,7 @@ Preconditions:
 - **Search with no match.** Type a query that matches nothing. Run `node .agents/skills/verify/scripts/browser.mjs type --selector '#search-box' --value zzz-nothing`. The table shows the single empty-state row `No agents match the current filter.`
 - **Filter.** Choose the `Blocked` tab. Run `node .agents/skills/verify/scripts/browser.mjs click --selector '.filter-tab[data-filter="blocked"]'`. Only `orca:bravo` remains; the `Working` tab then leaves only `orca:alpha`, and `all` restores three rows.
 - **Inspect a prompt.** Click a row's activity cell. Run `node .agents/skills/verify/scripts/browser.mjs click --selector '.action-text[data-agent-id="orca:alpha"]'`. `getComputedStyle(document.getElementById("modal-backdrop")).display` is `flex` and the panel contains `TOOL: Bash` and `PROMPT:`. Choosing `.modal-close` returns the display to `none`.
-- **Watch it refresh.** Start with the poll count, wait longer than one interval, read it again. Run `curl -fsS "http://127.0.0.1:4742/control/polls"`, wait 7 s, and run it again. The count grows by at least two and `performance.getEntriesByType("navigation").length` is still `1` — the page updated without reloading.
+- **Watch it refresh.** Read the poll count from the stub, wait longer than one interval, read it again. With the stub from the preconditions running: run `curl -fsS "http://127.0.0.1:4742/control/polls"`, wait 7 s, and run it again. The count grows by at least two and `performance.getEntriesByType("navigation").length` is still `1` — the page updated without reloading.
 - **Proof.** Capture the populated table. Run `node .agents/skills/verify/scripts/browser.mjs aria --path .agents/skills/verify/artifacts/ui/mixed.aria.txt` and `.../browser.mjs screenshot --path .agents/skills/verify/artifacts/ui/mixed.png`. Both artifacts identify Agent Monitor and the three fixture rows.
 
 ## Gotchas

@@ -114,8 +114,11 @@ export function startDashboard({ script = DASHBOARD, port, args = [] }) {
   child.stdout.on('data', (d) => (state.output += d))
   child.stderr.on('data', (d) => (state.output += d))
   state.closed = new Promise((resolve) => {
-    child.on('close', (code) => resolve(code))
-    setTimeout(() => resolve(null), 15000)
+    const timer = setTimeout(() => resolve(null), 15000)
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve(code)
+    })
   })
   return state
 }

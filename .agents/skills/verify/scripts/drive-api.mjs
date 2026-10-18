@@ -39,7 +39,8 @@ try {
   report.check('a cold start reaches a usable state', ready.ready, ready.ready ? `in ${Date.now() - t0}ms` : ready.reason)
 
   if (ready.ready) {
-    report.check('startup names the port it bound', proc.output.includes(String(basePort)), proc.output.trim().split('\n')[1] || '')
+    const banner = (proc.output.match(/running at: (\S+)/) || [])[1] || ''
+    report.check('startup names the port it bound', banner.endsWith(`:${basePort}`), banner || proc.output.trim().split('\n')[0])
 
     const page = await httpGet(`http://127.0.0.1:${basePort}/`)
     report.check('the page is the dashboard', page.status === 200 && page.text.includes('<title>Agent Monitor</title>'), `HTTP ${page.status}`)
@@ -49,7 +50,7 @@ try {
     report.check('agents payload carries rows and source health', Array.isArray(agents.json?.agents) && 'orca' in sources && 'herdr' in sources, `${agents.json?.agents?.length ?? '?'} agents`)
 
     const update = await httpGet(`http://127.0.0.1:${basePort}/api/update`)
-    report.check('update payload is a status object', typeof update.json?.hasUpdate === 'boolean', `hasUpdate=${update.json?.hasUpdate}`)
+    report.check('update payload is a status object', update.status === 200 && typeof update.json?.hasUpdate === 'boolean', `HTTP ${update.status}, hasUpdate=${update.json?.hasUpdate}`)
 
     const missing = await httpGet(`http://127.0.0.1:${basePort}/nope`)
     report.check('an unknown route is a 404', missing.status === 404, `HTTP ${missing.status}`)
@@ -70,10 +71,13 @@ try {
   const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-link-'))
   const link = path.join(linkDir, 'dashboard-link.mjs')
   fs.symlinkSync(DASHBOARD, link)
-  const symlinkPort = basePort + 1
+  const symlinkPort = await freePort()
   const linked = launch(symlinkPort, link)
   const linkedReady = await waitForDashboard(symlinkPort)
-  report.check('a symlinked dashboard still serves', linkedReady.ready, linkedReady.ready ? '' : linkedReady.reason)
+  const linkedBanner = (linked.output.match(/running at: (\S+)/) || [])[1] || ''
+  // The banner is the child's own claim: readiness alone could be an unrelated
+  // server that happened to hold the port.
+  report.check('a symlinked dashboard still serves', linkedReady.ready && linkedBanner.endsWith(`:${symlinkPort}`), linkedReady.ready ? linkedBanner : linkedReady.reason)
   linked.stop()
   fs.rmSync(linkDir, { recursive: true, force: true })
 

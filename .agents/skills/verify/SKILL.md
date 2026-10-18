@@ -12,7 +12,7 @@ Two user-facing surfaces live in this repo:
 
 This skill drives the dashboard end to end and covers the plugins where the host accepts them. The feature map in `features/` is the maintained list; read `features/README.md` before driving, then use the matching feature file as the recipe.
 
-Every command in this skill is run from the repo root.
+Every command in this skill is run from the repo root. The skill itself lives in `.agents/skills/verify/` rather than the `.claude/skills/` a generated skill usually targets: `.claude/` is gitignored in this repo (`.gitignore:7`), so a skill committed there would need `git add -f` and would be invisible to everyone else. Pi discovers `.agents/skills/` from the working directory up to the repo root (see `docs/skills.md` in the Pi install). Claude Code does **not** load a `/verify` from `.agents/`; do not move the directory back.
 
 ## Launch
 
@@ -30,7 +30,7 @@ Prefer `scripts/drive-api.mjs` and `scripts/drive-ui.mjs`: each picks a free por
 curl -fsS "http://127.0.0.1:$PORT/api/agents" | head -c 200
 ```
 
-A usable instance returns `{"agents":[...],"sources":{...}}` with HTTP 200. Startup prints the bound port on its own line.
+A usable instance returns `{"agents":[...],"sources":{...}}` with HTTP 200. Startup prints the URL it bound: `⚡ Agent Monitor Dashboard running at: http://localhost:<port>` (the port is inside the URL, not on a line of its own).
 
 Both runtimes are supported: `node dashboard.mjs` and `bun dashboard.mjs`. Run the suite and at least one driver under each when a change touches shared code.
 
@@ -52,12 +52,22 @@ Three drivers, each self-contained and each ending with a pass/fail count and a 
 ```bash
 node .agents/skills/verify/scripts/drive-api.mjs     # HTTP surface: startup, endpoints, listen failure, symlinked entry point
 node .agents/skills/verify/scripts/drive-ui.mjs      # real browser: the table, search, filter tabs, detail panel, update banner, polling
+node .agents/skills/verify/scripts/mutate.mjs --preflight   # run this first: every mutation anchor must still match the shipped code
 node .agents/skills/verify/scripts/mutate.mjs        # prove the suite still bites: revert each shipped fix, the named test must fail
-node .agents/skills/verify/scripts/mutate.mjs --preflight   # check every mutation anchor, write nothing
 node .agents/skills/verify/scripts/mutate.mjs --only unit-port-dropped --runtime bun
 ```
 
+`mutate.mjs` refuses to run on a worktree with uncommitted tracked changes, because it edits the tracked files it reverts. Commit first, or run it in a copy. It restores every file it touched on `SIGINT`/`SIGTERM`/`SIGHUP` and on exit; a `kill -9` is the one case it cannot cover, which is why a dirty tree is refused. A replacement that kills the suite before its summary is reported as an **abort inside the mutated file**, never as "caught by <test>": the trace goes to `artifacts/mutations/<id>.log`, and every fix that has such an entry also has a variant whose named test fails, so no fix rests on an abort alone.
+
 `drive-ui.mjs` serves the **real page** (`renderDashboardHtml()` from `dashboard.mjs`) from `scripts/serve-stub.mjs` with deterministic fixtures instead of live Orca/Herdr probes, so the table's contents are fixed and a failure is a UI failure. The stub exposes `/control/fixture?name=mixed|swapped|empty` and `/control/polls`; `/api/update` returns a deliberately stale status.
+
+Both drivers default to a free port, start their own instance, and tear it down when they exit — so a `browser.mjs` or `curl` step after the driver has finished has nothing to talk to. For a manual journey, start the stub yourself and keep it running:
+
+```bash
+node .agents/skills/verify/scripts/serve-stub.mjs --port 4742 &
+# ... browser.mjs / curl against http://127.0.0.1:4742 ...
+kill <pid>
+```
 
 The browser driver is `scripts/browser.mjs`, a CDP client with no dependencies:
 
@@ -72,7 +82,7 @@ node .agents/skills/verify/scripts/browser.mjs type --selector '#search-box' --v
 node .agents/skills/verify/scripts/browser.mjs close
 ```
 
-Commands: `launch open eval text aria wait click type screenshot close`. It resolves Chrome itself (`google-chrome`, `chromium`, `chromium-browser`, or the Playwright cache) and clicks through `Input.dispatchMouseEvent`, so a click goes through the page's real event handlers.
+Commands: `launch open eval text aria wait click type screenshot close`. Run `launch` then `open` first: every other command attaches to the session `launch` recorded in `artifacts/browser.json`. It resolves Chrome itself (`google-chrome`, `chromium`, `chromium-browser`, or the Playwright cache) and clicks through `Input.dispatchMouseEvent`, so a click goes through the page's real event handlers.
 
 Prefer the page's own stable handles over position: `#agent-table-body tr`, `.action-text[data-agent-id="<id>"]`, `.filter-tab[data-filter="all|working|blocked|settled"]`, `#search-box`, `#count-working`, `#tab-count-all`, `#update-banner`, `#update-commit`, `#sources-status`, `#last-updated`. Read the ARIA snapshot when a handle is not obvious.
 
@@ -120,8 +130,11 @@ The drivers clean up after themselves, including on failure: each stops the inst
 
 Driver traps worth knowing before you edit them:
 
+- Runtime floor: Node >= 22, or Bun. `browser.mjs` needs the global `WebSocket` and fails with an explicit message on an older Node instead of `WebSocket is not defined`.
+- `drive-ui.mjs` passes its own `--state` file (`$TMPDIR/verify-browser-<pid>.json`), so it never adopts or closes a browser session you started by hand, and `close` checks the recorded pid still belongs to the Chrome carrying that run's `--user-data-dir` before signalling it.
+- `browser.mjs` retries with `--no-sandbox` only when the first launch failed with a sandbox refusal; any other startup failure is reported as itself.
 - `fetch()` silently drops a custom `Host` header, so the DNS-rebinding check must go through `node:http` (`rawGet` in `lib.mjs`).
-- Chrome's own sandbox cannot start in a nested container: `browser.mjs` launches plain first and retries with `--no-sandbox --disable-setuid-sandbox`.
+- Chrome's own sandbox cannot start in a nested container: when the first launch fails with a sandbox refusal, `browser.mjs` retries once with `--no-sandbox --disable-setuid-sandbox`.
 - A spawned Chrome keeps the parent alive through inherited stdio; `browser.mjs` destroys and unrefs those pipes so `launch` exits.
 - `innerText` applies CSS `text-transform`. The status badges are uppercased by stylesheet (`WORKING`, `BLOCKED`, `DONE / IDLE`) while the host tags stay as authored (`Orca`, `Herdr`). Assert the rendered case.
 
@@ -130,7 +143,7 @@ Driver traps worth knowing before you edit them:
 These paths are part of the product but cannot be proven in this environment; report them as gaps rather than claiming coverage:
 
 - **macOS `launchd`** install/status/uninstall and the plist it writes. Only the pure builders (`buildLaunchdPlist`) are covered, by unit test.
-- **A real `systemd --user` install.** There is no user systemd in this sandbox; the install path is tested with a stubbed `execSync` and by reading the generated unit.
+- **A real `systemd --user` install.** Installing writes into the operator's own unit directory (`~/.config/systemd/user/`) and starts a job in their login session, so it needs explicit approval and never belongs in a routine run. `--service status` is read-only and also fine to run: this host does have a user systemd manager (`systemctl --user is-system-running` answers `degraded`), so it returns a real answer here. The install path is otherwise proven by putting a fake `systemctl` first on `PATH` and running the real `--service install` subprocess (`test_cases.test.js`), and by reading the unit the builders generate.
 - **The Windows Startup-folder path** and the generated `.vbs` launcher, which need Windows.
 - **Live notification delivery.** Desktop popups and ntfy publishes need a real Orca or Herdr host and a reachable ntfy server; the dispatcher is covered by unit tests with the publisher stubbed.
 - **Plugin loading by the real hosts.** `main.mjs` and `herdr-adapter.mjs` cannot be loaded without Orca or Herdr present; their event handling is covered by the suite.

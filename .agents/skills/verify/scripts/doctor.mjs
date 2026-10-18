@@ -20,7 +20,10 @@ function check(name, ok, detail) {
 }
 
 const agents = await httpGet(`http://127.0.0.1:${port}/api/agents`)
-const shapeOk = agents.status === 200 && Array.isArray(agents.json?.agents) && typeof agents.json?.sources === 'object'
+const sources = agents.json?.sources
+// `typeof null === 'object'`, so a null `sources` must be refused explicitly.
+const sourcesOk = Boolean(sources) && typeof sources === 'object' && !Array.isArray(sources) && 'orca' in sources && 'herdr' in sources
+const shapeOk = agents.status === 200 && Array.isArray(agents.json?.agents) && sourcesOk
 check(
   `port ${port} serves the dashboard API`,
   shapeOk,
