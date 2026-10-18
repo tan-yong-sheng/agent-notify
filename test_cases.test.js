@@ -48,6 +48,7 @@ import {
   resolveServiceRuntime,
   buildVersionLabel,
   fetchUpdateStatus,
+  nonInteractiveGitEnv,
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
@@ -584,7 +585,7 @@ async function runDashboardUnitTests() {
     'resolveDashboardConfig DASHBOARD_PORT env'
   )
   assert(
-    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '99999'], {}).port === 3333,
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '99999'], {}, {}).port === 3333,
     'resolveDashboardConfig rejects out-of-range port'
   )
 
@@ -696,6 +697,31 @@ async function runDashboardUnitTests() {
   assert(fetchUpdateStatus('/nonexistent').isGit === false, 'fetchUpdateStatus non-git directory')
   fs.rmSync(tmpRepoDir, { recursive: true, force: true })
 
+  // This check runs inside the HTTP server: git must never sit on a credential
+  // prompt there. Proven against real git rather than asserted: without the
+  // guard git reaches for the terminal, with it git refuses outright.
+  const promptProbe = (env) => {
+    try {
+      execSync('git -c credential.helper= credential fill', {
+        input: 'protocol=https\nhost=agent-notify.invalid\n\n',
+        env: { ...process.env, ...env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      })
+      return ''
+    } catch (err) {
+      return String(err.stderr || '')
+    }
+  }
+  assert(
+    nonInteractiveGitEnv().GIT_TERMINAL_PROMPT === '0',
+    'nonInteractiveGitEnv disables terminal prompts'
+  )
+  assert(
+    /terminal prompts disabled/.test(promptProbe(nonInteractiveGitEnv())),
+    'git refuses to prompt for credentials with nonInteractiveGitEnv'
+  )
+
   assert(
     buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.4.0' }) ===
       'orca 1.1.0 → 1.2.0 · herdr 0.3.0 → 0.4.0',
@@ -715,6 +741,13 @@ async function runDashboardUnitTests() {
   const liveState = await getLiveAgents()
   assert(Array.isArray(liveState.agents), 'getLiveAgents returns agents array')
   assert(typeof liveState.sources === 'object', 'getLiveAgents returns sources object')
+  // Callers that arrive together share one collection instead of spawning the
+  // runtimes once per request.
+  const [coalescedA, coalescedB] = await Promise.all([
+    getLiveAgents({ forceFresh: true }),
+    getLiveAgents({ forceFresh: true }),
+  ])
+  assert(coalescedA === coalescedB, 'getLiveAgents coalesces concurrent collections')
 
   // `herdr agent list` has no branch field, so the branch comes from the directory.
   const tmpBranchRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-branch-'))

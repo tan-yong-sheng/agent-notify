@@ -58,12 +58,11 @@ function resolvePort(value) {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null
 }
 
-export function resolveConfig(argv = process.argv, env = process.env) {
-  const envVars = loadDashboardEnv()
+export function resolveConfig(argv = process.argv, env = process.env, fileEnv = loadDashboardEnv()) {
   const cliPort = parseCliPort(argv)
   const port =
     resolvePort(cliPort) ||
-    resolvePort(env.DASHBOARD_PORT || envVars.DASHBOARD_PORT) ||
+    resolvePort(env.DASHBOARD_PORT || fileEnv.DASHBOARD_PORT) ||
     DEFAULT_PORT
   return { port }
 }
@@ -92,6 +91,8 @@ export function renderDashboardHtml() {
       --accent: #58a6ff;
       --green: #3fb950;
       --green-bg: rgba(63, 185, 80, 0.15);
+      --red: #f85149;
+      --red-bg: rgba(248, 81, 73, 0.15);
       --yellow: #d29922;
       --yellow-bg: rgba(210, 153, 34, 0.15);
       --gray: #8b949e;
@@ -181,7 +182,7 @@ export function renderDashboardHtml() {
       white-space: nowrap;
     }
     .badge-working { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63, 185, 80, 0.4); }
-    .badge-blocked { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(210, 153, 34, 0.4); }
+    .badge-blocked { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248, 81, 73, 0.4); }
     .badge-done, .badge-idle { background: var(--gray-bg); color: var(--gray); border: 1px solid rgba(139, 148, 158, 0.4); }
     .pulse-dot {
       width: 7px;
@@ -397,10 +398,10 @@ export function renderDashboardHtml() {
       </div>
     </div>
     <div class="stat-pill">
-      <div class="pulse-dot" style="color: var(--yellow);"></div>
+      <div class="pulse-dot" style="color: var(--red);"></div>
       <div>
         <div class="count" id="count-blocked">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Needs Attention</div>
+        <div style="font-size: 11px; color: var(--text-muted);">Blocked</div>
       </div>
     </div>
     <div class="stat-pill">
@@ -417,7 +418,7 @@ export function renderDashboardHtml() {
     <div class="filter-tabs">
       <button class="filter-tab active" data-filter="all" onclick="setFilter('all')">All (<span id="tab-count-all">0</span>)</button>
       <button class="filter-tab" data-filter="working" onclick="setFilter('working')">Working (<span id="tab-count-working">0</span>)</button>
-      <button class="filter-tab" data-filter="blocked" onclick="setFilter('blocked')">Needs Action (<span id="tab-count-blocked">0</span>)</button>
+      <button class="filter-tab" data-filter="blocked" onclick="setFilter('blocked')">Blocked (<span id="tab-count-blocked">0</span>)</button>
       <button class="filter-tab" data-filter="settled" onclick="setFilter('settled')">Settled (<span id="tab-count-settled">0</span>)</button>
     </div>
   </div>
@@ -531,7 +532,7 @@ export function renderDashboardHtml() {
 
     function badgeHTML(status) {
       if (status === 'working') return '<span class="badge badge-working"><span class="pulse-dot"></span> Working</span>';
-      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Needs Action</span>';
+      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Blocked</span>';
       return '<span class="badge badge-done">Done / Idle</span>';
     }
 

@@ -153,6 +153,7 @@ export async function collectLiveState() {
 
 let cachedState = null
 let lastFetch = 0
+let inFlight = null
 const CACHE_TTL_MS = 2000
 
 export async function getLiveAgents({ forceFresh = false } = {}) {
@@ -160,7 +161,20 @@ export async function getLiveAgents({ forceFresh = false } = {}) {
   if (!forceFresh && cachedState && now - lastFetch < CACHE_TTL_MS) {
     return cachedState
   }
-  cachedState = await collectLiveState()
-  lastFetch = now
-  return cachedState
+  // Requests that arrive before the cache is warm would otherwise each spawn the
+  // runtimes; share one collection instead.
+  if (inFlight) {
+    return inFlight
+  }
+
+  inFlight = collectLiveState()
+    .then((state) => {
+      cachedState = state
+      lastFetch = Date.now()
+      return state
+    })
+    .finally(() => {
+      inFlight = null
+    })
+  return inFlight
 }

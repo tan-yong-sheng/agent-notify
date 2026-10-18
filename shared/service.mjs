@@ -15,9 +15,13 @@ import { getExtendedPathEnv } from './env.mjs'
 const SERVICE_NAME = 'agent-monitor'
 const MACOS_LABEL = 'dev.agent-notify.dashboard'
 
-function runQuiet(command) {
+function runQuiet(command, args) {
   try {
-    execSync(command, { stdio: ['ignore', 'pipe', 'pipe'] })
+    if (Array.isArray(args)) {
+      execFileSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    } else {
+      execSync(command, { stdio: ['ignore', 'pipe', 'pipe'] })
+    }
     return { ok: true, detail: '' }
   } catch (err) {
     const stderr = err.stderr ? String(err.stderr) : ''
@@ -225,7 +229,7 @@ function installDarwinService({ nodeBin, scriptPath, repoDir }) {
   const plistPath = getLaunchdPlistPath()
   fs.writeFileSync(plistPath, buildLaunchdPlist(nodeBin, scriptPath, repoDir), 'utf8')
 
-  execSync(`launchctl load -w "${plistPath}"`, { stdio: 'inherit' })
+  execFileSync('launchctl', ['load', '-w', plistPath], { stdio: 'inherit' })
   console.log(`\n✅ Successfully installed and started ${MACOS_LABEL} via launchd!`)
   console.log(`   Status: http://localhost:3333`)
   console.log(`   Logs: /tmp/${SERVICE_NAME}.stdout.log\n`)
@@ -241,7 +245,7 @@ function stopDarwinService() {
   let removed = false
 
   if (runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok || fs.existsSync(plistPath)) {
-    const unload = runQuiet(`launchctl unload -w "${plistPath}"`)
+    const unload = runQuiet('launchctl', ['unload', '-w', plistPath])
     if (!unload.ok && !isUnitMissingError(unload)) failures.push(`unload: ${unload.detail}`)
     if (fs.existsSync(plistPath)) {
       fs.unlinkSync(plistPath)
@@ -362,6 +366,10 @@ let cachedUpdateCheck = null
 let lastUpdateCheckTime = 0
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000 // 1 hour
 const GIT_TIMEOUT_MS = 10000
+// The interactive `git pull` is not a local query: it may wait on a credential
+// prompt and on the network. A short limit would SIGTERM a pull that is still
+// making progress, so give it its own ceiling.
+const GIT_PULL_TIMEOUT_MS = 5 * 60 * 1000
 
 function git(args, repoDir, env) {
   return execFileSync('git', args, {
@@ -433,9 +441,16 @@ export function buildVersionLabel(localVersions, remoteVersions) {
 // Uncached probe. Does a `git fetch` of the update target, so it mutates the
 // repo's remote-tracking refs and needs network access; callers that render the
 // UI should go through checkUpdateStatus instead.
+// The update check runs inside the dashboard's HTTP server, where a git
+// credential prompt would block the event loop until the timeout expires and
+// stall every other request. This env makes git fail fast instead of asking.
+export function nonInteractiveGitEnv() {
+  return { ...getExtendedPathEnv(), GIT_TERMINAL_PROMPT: '0' }
+}
+
 export function fetchUpdateStatus(repoDir) {
   const now = Date.now()
-  const env = getExtendedPathEnv()
+  const env = nonInteractiveGitEnv()
   if (!tryGit(['rev-parse', '--is-inside-work-tree'], repoDir, env)) {
     return { isGit: false, hasUpdate: false, checkedAt: now }
   }
@@ -531,7 +546,7 @@ function restartServiceIfActive() {
     if (!fs.existsSync(getLaunchdPlistPath())) return
     if (!runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok) return
     console.log(`Restarting ${MACOS_LABEL} launchd service...`)
-    execSync(`launchctl kickstart -k gui/${process.getuid()}/${MACOS_LABEL}`, { stdio: 'inherit' })
+    execFileSync('launchctl', ['kickstart', '-k', `gui/${process.getuid()}/${MACOS_LABEL}`], { stdio: 'inherit' })
   }
 }
 
@@ -551,7 +566,7 @@ function executeGitUpdate(repoDir, env) {
   try {
     const before = git(['rev-parse', 'HEAD'], repoDir, env)
     const args = ['pull', '--ff-only']
-    execFileSync('git', args, { cwd: repoDir, env, stdio: 'inherit', timeout: GIT_TIMEOUT_MS })
+    execFileSync('git', args, { cwd: repoDir, env, stdio: 'inherit', timeout: GIT_PULL_TIMEOUT_MS })
     const after = git(['rev-parse', 'HEAD'], repoDir, env)
 
     if (after === before) {

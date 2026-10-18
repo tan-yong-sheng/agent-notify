@@ -184,8 +184,8 @@ Then visit [http://localhost:3333](http://localhost:3333).
 
 - **Real-time status**: Polls live agent state across Orca and Herdr every 3 seconds without UI flicker.
 - **Low Memory / Multi-Runtime**: Runs on standard Node.js or opportunistically under Bun (~35 MB RSS vs ~57 MB RSS).
-- **Compact dense table**: Clean layout showing status badges (🟢 Working, 🟡 Needs Action, ⚪ Done / Idle), host environment (`Orca` / `Herdr`), agent type (`pi`), workspace directory, git branch, and active tool / prompt.
-- **Search & Filter**: Real-time filter box and quick tabs (`All`, `Working`, `Needs Action`, `Settled`).
+- **Compact dense table**: Clean layout showing status badges (🟢 Working, 🔴 Blocked, ⚪ Done / Idle), host environment (`Orca` / `Herdr`), agent type (`pi`), workspace directory, git branch, and active tool / prompt.
+- **Search & Filter**: Real-time filter box and quick tabs (`All`, `Working`, `Blocked`, `Settled`).
 - **Click-to-copy & Inspect**: Click any directory path to copy it to your clipboard, or click a prompt to expand its full text.
 - **Configurable**: Set `DASHBOARD_PORT=3333` in `.env` or pass `--port <number>`.
 
