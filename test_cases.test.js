@@ -623,6 +623,16 @@ async function runDashboardUnitTests() {
   assert(orcaAgent.branch === 'feature', 'parseOrcaAgent branch stripped')
   assert(orcaAgent.prompt === 'hi', 'parseOrcaAgent prompt')
 
+  // Untrusted CLI payloads: wrong-typed or missing fields must degrade, not throw.
+  const malformedHerdr = parseHerdrAgent({ agent_status: { nope: true }, pane_id: 42, cwd: null, terminal_title: 7 })
+  assert(malformedHerdr.id === 'herdr-42', 'parseHerdrAgent keeps a numeric pane id distinct')
+  assert(malformedHerdr.status === 'idle' && malformedHerdr.cwd === '', 'parseHerdrAgent coerces bad status and cwd')
+  assert(parseHerdrAgent(null).id === 'herdr-pane', 'parseHerdrAgent survives a null element')
+
+  assert(parseOrcaAgent(null, null).id === 'orca-pane', 'parseOrcaAgent survives a null worktree and agent')
+  assert(parseOrcaAgent({ branch: 42 }, {}).branch === '', 'parseOrcaAgent rejects a non-string branch')
+  assert(parseOrcaAgent({}, { prompt: 99 }).prompt === null, 'parseOrcaAgent rejects a non-string prompt')
+
   // Service & Update tests
   assert(getServicePlatform() === process.platform, 'getServicePlatform matches process.platform')
   assert(resolveServiceRuntime('/custom/bun').includes('bun'), 'resolveServiceRuntime detects bun')
@@ -632,9 +642,43 @@ async function runDashboardUnitTests() {
   assert(systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs'), 'buildSystemdUnit ExecStart')
   assert(systemd.includes('WorkingDirectory=/path'), 'buildSystemdUnit WorkingDirectory')
 
+  // A path with spaces must stay one argv element; % is a systemd specifier.
+  const spaced = buildSystemdUnit('/opt/my node/node', '/repo dir/dashboard.mjs', '/repo dir')
+  assert(spaced.includes('ExecStart="/opt/my node/node" "/repo dir/dashboard.mjs"'), 'buildSystemdUnit quotes argv with spaces')
+  // `WorkingDirectory=` takes no quoting: a quoted value is rejected by systemd as
+  // "not absolute", while a bare space is preserved.
+  assert(spaced.includes('WorkingDirectory=/repo dir'), 'buildSystemdUnit leaves a spaced working directory bare')
+  assert(buildSystemdUnit('/usr/bin/node', '/path/100%.mjs', '/path').includes('100%%.mjs'), 'buildSystemdUnit escapes % specifiers')
+  assert(
+    buildSystemdUnit('/usr/bin/node', '/path/a$b.mjs', '/path').includes('ExecStart=/usr/bin/node "/path/a$$b.mjs"'),
+    'buildSystemdUnit escapes $ expansion in ExecStart'
+  )
+  assert(
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/a$b').includes('WorkingDirectory=/path/a$b'),
+    'buildSystemdUnit leaves a literal $ alone in WorkingDirectory'
+  )
+  let newlineRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path\nExecStartPre=/bin/true')
+  } catch {
+    newlineRejected = true
+  }
+  assert(newlineRejected, 'buildSystemdUnit refuses a newline instead of injecting a directive')
+  let backslashRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/ends-with\\')
+  } catch {
+    backslashRejected = true
+  }
+  assert(backslashRejected, 'buildSystemdUnit refuses a working directory ending in a backslash')
+
   const plist = buildLaunchdPlist('/usr/bin/node', '/path/dashboard.mjs', '/path')
   assert(plist.includes('<string>dev.agent-notify.dashboard</string>'), 'buildLaunchdPlist label')
   assert(plist.includes('<string>/usr/bin/node</string>'), 'buildLaunchdPlist node')
+  assert(
+    buildLaunchdPlist('/usr/bin/node', '/path/a&b.mjs', '/path<c>').includes('/path/a&amp;b.mjs'),
+    'buildLaunchdPlist escapes XML in paths'
+  )
 
   const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs')
   assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')

@@ -15,6 +15,65 @@ import { getExtendedPathEnv } from './env.mjs'
 const SERVICE_NAME = 'agent-monitor'
 const MACOS_LABEL = 'dev.agent-notify.dashboard'
 
+function runQuiet(command) {
+  try {
+    execSync(command, { stdio: ['ignore', 'pipe', 'pipe'] })
+    return { ok: true, detail: '' }
+  } catch (err) {
+    const stderr = err.stderr ? String(err.stderr) : ''
+    return { ok: false, detail: (stderr || err.message || '').trim().split('\n')[0] }
+  }
+}
+
+// Stopping an already-removed service is expected; any other failure is worth
+// reporting, because the unit file is deleted either way.
+function isUnitMissingError(result) {
+  return /not loaded|could not be found|could not find|no such file|not found|not running/i.test(result.detail || '')
+}
+
+function reportUninstallResult({ label, removed, failures }) {
+  if (failures.length) {
+    console.log(`\n⚠️  Uninstalled ${label} with ${failures.length} problem(s):`)
+    for (const failure of failures) console.log(`   - ${failure}`)
+    console.log(`   ${removed ? 'The unit file was removed' : 'No unit file was present'}; re-run --service install to restore it.\n`)
+    return
+  }
+  console.log(`\n🛑 Successfully stopped and uninstalled ${label}.\n`)
+}
+
+function rejectUnrepresentable(value) {
+  const raw = String(value)
+  if (/[\n\r\u0000]/.test(raw)) {
+    throw new Error('Refusing to write a systemd unit: a path contains a newline or NUL character')
+  }
+  return raw
+}
+
+// `WorkingDirectory=` is not a command line: it keeps internal spaces, and it
+// supports neither quoting nor C-style escapes (checked against the real parser:
+// a quoted path is rejected as "not absolute" and `\"`/`\\` arrive verbatim).
+// `%` is still a specifier, and a trailing `\` still continues the line.
+function systemdPathValue(value) {
+  const raw = rejectUnrepresentable(value)
+  if (raw.endsWith('\\')) {
+    throw new Error('Refusing to write a systemd unit: a path ends with a backslash, which would continue the line')
+  }
+  return raw.replace(/%/g, '%%')
+}
+
+// `ExecStart=` is a command line: it splits on unquoted whitespace, so an argument
+// containing a space is quoted, and `%` (specifier) and `$` (variable expansion)
+// are doubled. Escapes are processed here, unlike in `WorkingDirectory=`.
+function systemdExecValue(value) {
+  const escaped = rejectUnrepresentable(value).replace(/%/g, '%%').replace(/\$/g, () => '$$')
+  return /^[A-Za-z0-9_@./:+-]+$/.test(escaped) ? escaped : `"${escaped.replace(/(["\\])/g, '\\$1')}"`
+}
+
+// Plist values are XML text, so `&` or `<` in a path would corrupt the document.
+function xmlEscape(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]))
+}
+
 export function getServicePlatform() {
   return process.platform
 }
@@ -54,8 +113,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${repoDir}
-ExecStart=${nodeBin} ${scriptPath}
+WorkingDirectory=${systemdPathValue(repoDir)}
+ExecStart=${systemdExecValue(nodeBin)} ${systemdExecValue(scriptPath)}
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
@@ -79,19 +138,26 @@ function installLinuxService({ nodeBin, scriptPath, repoDir }) {
 }
 
 function uninstallLinuxService() {
-  try {
-    execSync(`systemctl --user stop ${SERVICE_NAME}.service`, { stdio: 'ignore' })
-  } catch {}
-  try {
-    execSync(`systemctl --user disable ${SERVICE_NAME}.service`, { stdio: 'ignore' })
-  } catch {}
+  const failures = []
+  for (const [action, command] of [
+    ['stop', `systemctl --user stop ${SERVICE_NAME}.service`],
+    ['disable', `systemctl --user disable ${SERVICE_NAME}.service`],
+  ]) {
+    const result = runQuiet(command)
+    if (!result.ok && !isUnitMissingError(result)) failures.push(`${action}: ${result.detail}`)
+  }
 
   const serviceFile = getSystemdServicePath()
+  let removed = false
   if (fs.existsSync(serviceFile)) {
     fs.unlinkSync(serviceFile)
+    removed = true
   }
-  execSync('systemctl --user daemon-reload', { stdio: 'ignore' })
-  console.log(`\n🛑 Successfully stopped and uninstalled ${SERVICE_NAME} systemd service.\n`)
+
+  const reload = runQuiet('systemctl --user daemon-reload')
+  if (!reload.ok) failures.push(`daemon-reload: ${reload.detail}`)
+
+  reportUninstallResult({ label: `${SERVICE_NAME}.service`, removed, failures })
 }
 
 function statusLinuxService() {
@@ -135,11 +201,11 @@ export function buildLaunchdPlist(nodeBin, scriptPath, repoDir) {
     <string>${MACOS_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${nodeBin}</string>
-        <string>${scriptPath}</string>
+        <string>${xmlEscape(nodeBin)}</string>
+        <string>${xmlEscape(scriptPath)}</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>${repoDir}</string>
+    <string>${xmlEscape(repoDir)}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -166,11 +232,28 @@ function installDarwinService({ nodeBin, scriptPath, repoDir }) {
 }
 
 function statusDarwinService() {
-  execSync(`launchctl list | grep ${SERVICE_NAME} || echo "Service not running"`, { stdio: 'inherit' })
+  execSync(`launchctl list | grep -F "${MACOS_LABEL}" || echo "${MACOS_LABEL} is not loaded."`, { stdio: 'inherit' })
+}
+
+function stopDarwinService() {
+  const plistPath = getLaunchdPlistPath()
+  const failures = []
+  let removed = false
+
+  if (runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok || fs.existsSync(plistPath)) {
+    const unload = runQuiet(`launchctl unload -w "${plistPath}"`)
+    if (!unload.ok && !isUnitMissingError(unload)) failures.push(`unload: ${unload.detail}`)
+    if (fs.existsSync(plistPath)) {
+      fs.unlinkSync(plistPath)
+      removed = true
+    }
+  }
+
+  return { failures, removed }
 }
 
 function restartDarwinService(context) {
-  uninstallDarwinService()
+  stopDarwinService()
   installDarwinService(context)
 }
 
@@ -181,14 +264,8 @@ function logsDarwinService() {
 }
 
 function uninstallDarwinService() {
-  const plistPath = getLaunchdPlistPath()
-  if (fs.existsSync(plistPath)) {
-    try {
-      execSync(`launchctl unload -w "${plistPath}"`, { stdio: 'ignore' })
-    } catch {}
-    fs.unlinkSync(plistPath)
-  }
-  console.log(`\n🛑 Successfully stopped and uninstalled ${MACOS_LABEL} launchd service.\n`)
+  const { failures, removed } = stopDarwinService()
+  reportUninstallResult({ label: MACOS_LABEL, removed, failures })
 }
 
 // ─── Windows (win32) ────────────────────────────────────────────────────────
@@ -427,18 +504,27 @@ function printCheckUpdateResult(status) {
   }
 }
 
-function restartLinuxIfActive() {
-  if (process.platform !== 'linux') return
-  try {
-    const isActive = execSync(`systemctl --user is-active ${SERVICE_NAME}.service`, {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-    }).trim()
-    if (isActive === 'active') {
-      console.log(`Restarting ${SERVICE_NAME} systemd service...`)
-      execSync(`systemctl --user restart ${SERVICE_NAME}.service`, { stdio: 'inherit' })
-    }
-  } catch {}
+function restartServiceIfActive() {
+  if (process.platform === 'linux') {
+    try {
+      const isActive = execSync(`systemctl --user is-active ${SERVICE_NAME}.service`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'ignore'],
+      }).trim()
+      if (isActive === 'active') {
+        console.log(`Restarting ${SERVICE_NAME} systemd service...`)
+        execSync(`systemctl --user restart ${SERVICE_NAME}.service`, { stdio: 'inherit' })
+      }
+    } catch {}
+    return
+  }
+
+  if (process.platform === 'darwin') {
+    if (!fs.existsSync(getLaunchdPlistPath())) return
+    if (!runQuiet(`launchctl list | grep -F "${MACOS_LABEL}"`).ok) return
+    console.log(`Restarting ${MACOS_LABEL} launchd service...`)
+    execSync(`launchctl kickstart -k gui/${process.getuid()}/${MACOS_LABEL}`, { stdio: 'inherit' })
+  }
 }
 
 function executeGitUpdate(repoDir, env) {
@@ -465,7 +551,7 @@ function executeGitUpdate(repoDir, env) {
       return
     }
     console.log(`✅ Updated ${before.slice(0, 7)} → ${after.slice(0, 7)} on ${target.upstream}.`)
-    restartLinuxIfActive()
+    restartServiceIfActive()
     console.log(`\n🚀 Update complete.\n`)
   } catch (err) {
     console.error(`❌ Update failed:`, err.message)

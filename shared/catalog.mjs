@@ -27,44 +27,61 @@ export function normalizeAgentStatus(rawStatus) {
   return s === 'done' ? 'done' : 'idle'
 }
 
+// Subprocess JSON is untrusted: a wrong-typed field must not throw and take the
+// whole catalog down (which would 500 the dashboard). Only real strings are
+// rendered; anything else falls back to a default instead of printing garbage.
+function asText(value, fallback = '') {
+  return typeof value === 'string' ? value : fallback
+}
+
+// Ids stay distinct even if a runtime emits numeric ones.
+function asId(value, fallback) {
+  if (typeof value === 'string' && value) return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return fallback
+}
+
 export function parseHerdrAgent(a = {}) {
-  const rawStatus = (a.agent_status || 'idle').toLowerCase()
+  const record = a && typeof a === 'object' ? a : {}
+  const rawStatus = asText(record.agent_status, 'idle').toLowerCase()
   return {
-    id: `herdr-${a.pane_id || 'pane'}`,
+    id: `herdr-${asId(record.pane_id, 'pane')}`,
     source: 'herdr',
-    agent: a.agent || 'pi',
+    agent: asText(record.agent) || 'pi',
     status: normalizeAgentStatus(rawStatus),
     rawStatus,
-    cwd: a.cwd || '',
-    displayName: a.terminal_title || a.pane_id || 'Herdr Agent',
+    cwd: asText(record.cwd),
+    displayName: asText(record.terminal_title) || asId(record.pane_id, 'Herdr Agent'),
     branch: '',
     tool: null,
     toolInput: null,
     prompt: null,
-    focused: Boolean(a.focused),
+    focused: Boolean(record.focused),
     updatedAt: Date.now(),
   }
 }
 
 export function parseOrcaAgent(wt = {}, a = {}) {
-  const rawStatus = (a.state || 'idle').toLowerCase()
-  const branch = wt.branch ? wt.branch.replace(/^refs\/heads\//, '') : ''
-  const displayName = wt.displayName || wt.repo || 'Orca Worktree'
+  const worktree = wt && typeof wt === 'object' ? wt : {}
+  const agent = a && typeof a === 'object' ? a : {}
+  const rawStatus = asText(agent.state, 'idle').toLowerCase()
+  const branch = asText(worktree.branch).replace(/^refs\/heads\//, '')
+  const displayName = asText(worktree.displayName) || asText(worktree.repo) || 'Orca Worktree'
 
   return {
-    id: `orca-${a.paneKey || 'pane'}`,
+    id: `orca-${asId(agent.paneKey, 'pane')}`,
     source: 'orca',
-    agent: a.agentType || 'pi',
+    agent: asText(agent.agentType) || 'pi',
     status: normalizeAgentStatus(rawStatus),
     rawStatus,
-    cwd: wt.path || '',
+    cwd: asText(worktree.path),
     displayName,
     branch,
-    tool: a.toolName ?? null,
-    toolInput: a.toolInput ?? null,
-    prompt: a.prompt ? a.prompt.trim() : null,
-    stateStartedAt: a.stateStartedAt ?? null,
-    updatedAt: a.updatedAt ?? Date.now(),
+    tool: agent.toolName ?? null,
+    toolInput: agent.toolInput ?? null,
+    prompt: asText(agent.prompt).trim() || null,
+    stateStartedAt: agent.stateStartedAt ?? null,
+    updatedAt: agent.updatedAt ?? Date.now(),
   }
 }
 
@@ -77,6 +94,7 @@ function extractOrcaAgents(orcaRes) {
   if (!orcaRes.ok || !Array.isArray(orcaRes.data?.result?.worktrees)) return []
   const list = []
   for (const wt of orcaRes.data.result.worktrees) {
+    if (!wt || typeof wt !== 'object') continue
     if (Array.isArray(wt.agents)) {
       for (const a of wt.agents) {
         list.push(parseOrcaAgent(wt, a))
