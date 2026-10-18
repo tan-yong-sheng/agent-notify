@@ -51,10 +51,20 @@ function loadDashboardEnv() {
   }
 }
 
+const DEFAULT_PORT = 3333
+
+function resolvePort(value) {
+  const parsed = parseInt(value, 10)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null
+}
+
 export function resolveConfig(argv = process.argv, env = process.env) {
   const envVars = loadDashboardEnv()
   const cliPort = parseCliPort(argv)
-  const port = cliPort || parseInt(env.DASHBOARD_PORT || envVars.DASHBOARD_PORT || '3333', 10)
+  const port =
+    resolvePort(cliPort) ||
+    resolvePort(env.DASHBOARD_PORT || envVars.DASHBOARD_PORT) ||
+    DEFAULT_PORT
   return { port }
 }
 
@@ -65,7 +75,7 @@ export { normalizeAgentStatus, parseHerdrAgent, parseOrcaAgent, collectLiveState
 
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
-function renderDashboardHtml() {
+export function renderDashboardHtml() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -362,7 +372,7 @@ function renderDashboardHtml() {
 
   <div id="update-banner" class="update-banner" style="display: none;">
     <div>
-      📦 <strong>Update Available:</strong> A newer commit is available (<code id="update-commit"></code>). Run <code>node dashboard.mjs --update</code> to upgrade.
+      📦 <strong>Update Available:</strong> A newer revision is available (<code id="update-commit"></code>). Run <code>node dashboard.mjs --update</code> to upgrade.
     </div>
     <button onclick="document.getElementById('update-banner').style.display='none'" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer;">✕</button>
   </div>
@@ -472,6 +482,18 @@ function renderDashboardHtml() {
       renderRows();
     });
 
+    // Delegated handler: agent data is read from data attributes instead of being
+    // interpolated into inline handlers, where HTML escaping is not JS escaping.
+    document.getElementById('agent-table-body').addEventListener('click', (e) => {
+      const copyTarget = e.target.closest('[data-copy-path]');
+      if (copyTarget) {
+        copyPath(copyTarget.dataset.copyPath);
+        return;
+      }
+      const modalTarget = e.target.closest('[data-agent-id]');
+      if (modalTarget) showModalById(modalTarget.dataset.agentId);
+    });
+
     async function fetchAgents() {
       try {
         const res = await fetch('/api/agents');
@@ -546,8 +568,7 @@ function renderDashboardHtml() {
         return;
       }
 
-      tbody.innerHTML = filtered.map((a, idx) => {
-        const fullDetails = (a.tool ? '[' + a.tool + '] ' : '') + (a.prompt || '');
+      tbody.innerHTML = filtered.map((a) => {
         return \`
           <tr>
             <td>\${badgeHTML(a.status)}</td>
@@ -555,11 +576,11 @@ function renderDashboardHtml() {
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
               <div style="font-weight:600; margin-bottom:2px;">\${escapeHTML(a.displayName)}</div>
-              <span class="path-chip" onclick="copyPath('\${escapeHTML(a.cwd)}')" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
+              <span class="path-chip" data-copy-path="\${escapeHTML(a.cwd)}" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
             </td>
-            <td>\${a.branch ? '<code style="color:var(--accent);">\${escapeHTML(a.branch)}</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td>\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
             <td style="max-width:340px;">
-              <div class="action-text" onclick="showModal('\${escapeHTML(a.displayName)}', \${idx})" title="Click to expand prompt">
+              <div class="action-text" data-agent-id="\${escapeHTML(a.id)}" title="Click to expand prompt">
                 \${a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : ''}
                 <span>\${escapeHTML(a.prompt || (a.status === 'working' ? 'Processing...' : 'Idle'))}</span>
               </div>
@@ -570,10 +591,10 @@ function renderDashboardHtml() {
       }).join('');
     }
 
-    function showModal(title, idx) {
-      const a = allAgents[idx];
+    function showModalById(id) {
+      const a = allAgents.find(x => x.id === id);
       if (!a) return;
-      document.getElementById('modal-title').innerText = title + ' (' + a.agent + ')';
+      document.getElementById('modal-title').innerText = (a.displayName || a.agent) + ' (' + a.agent + ')';
       let content = '';
       if (a.tool) content += 'TOOL: ' + a.tool + '\\n\\n';
       if (a.toolInput) content += 'TOOL INPUT:\\n' + (typeof a.toolInput === 'object' ? JSON.stringify(a.toolInput, null, 2) : a.toolInput) + '\\n\\n';
@@ -613,7 +634,7 @@ function renderDashboardHtml() {
         const res = await fetch('/api/update');
         const data = await res.json();
         if (data.hasUpdate) {
-          document.getElementById('update-commit').innerText = (data.localSha || '') + ' → ' + (data.remoteSha || 'new');
+          document.getElementById('update-commit').innerText = data.versionLabel || ((data.localSha || '') + ' → ' + (data.remoteSha || 'new'));
           document.getElementById('update-banner').style.display = 'flex';
         }
       } catch {}
@@ -627,7 +648,22 @@ function renderDashboardHtml() {
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 
+// Reject non-loopback Host headers so a DNS-rebinding page cannot read agent
+// state (prompts, tool input, workspace paths) through the loopback listener.
+const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
+
+export function isAllowedHost(hostHeader) {
+  if (!hostHeader) return false
+  const host = String(hostHeader).toLowerCase().replace(/:\d+$/, '')
+  return ALLOWED_HOSTS.includes(host)
+}
+
 const server = http.createServer(async (req, res) => {
+  if (!isAllowedHost(req.headers.host)) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' })
+    return res.end('Forbidden host')
+  }
+
   const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
 
   if (reqUrl.pathname === '/api/agents') {
@@ -672,6 +708,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
       console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
       console.log(`   Press Ctrl+C to stop.\n`)
+      // The remote-version query is synchronous, so warm the cache before any
+      // client polls: otherwise the first /api/update blocks agent polling.
+      setTimeout(() => checkUpdateStatus(path.dirname(fileURLToPath(import.meta.url))), 0)
     })
   }
 }

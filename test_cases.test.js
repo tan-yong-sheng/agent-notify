@@ -31,6 +31,7 @@ import {
 import { getExtendedPathEnv } from './shared/env.mjs'
 import {
   resolveConfig as resolveDashboardConfig,
+  isAllowedHost,
 } from './dashboard.mjs'
 import {
   normalizeAgentStatus,
@@ -44,6 +45,7 @@ import {
   buildWindowsVbs,
   getServicePlatform,
   resolveServiceRuntime,
+  buildVersionLabel,
   checkUpdateStatus,
 } from './shared/service.mjs'
 
@@ -580,6 +582,17 @@ async function runDashboardUnitTests() {
     resolveDashboardConfig(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '5555' }).port === 5555,
     'resolveDashboardConfig DASHBOARD_PORT env'
   )
+  assert(
+    resolveDashboardConfig(['node', 'dashboard.mjs', '--port', '99999'], {}).port === 3333,
+    'resolveDashboardConfig rejects out-of-range port'
+  )
+
+  assert(isAllowedHost('localhost:3333'), 'isAllowedHost accepts localhost with port')
+  assert(isAllowedHost('127.0.0.1:3333'), 'isAllowedHost accepts loopback ip')
+  assert(isAllowedHost('[::1]:3333'), 'isAllowedHost accepts ipv6 loopback')
+  assert(!isAllowedHost('evil.example.com:3333'), 'isAllowedHost rejects external host')
+  assert(!isAllowedHost('localhost.evil.com'), 'isAllowedHost rejects host suffix trick')
+  assert(!isAllowedHost(undefined), 'isAllowedHost rejects missing host')
 
   assert(normalizeAgentStatus('WORKING') === 'working', 'normalizeAgentStatus working')
   assert(normalizeAgentStatus('blocked') === 'blocked', 'normalizeAgentStatus blocked')
@@ -629,6 +642,22 @@ async function runDashboardUnitTests() {
   const updateStatus = checkUpdateStatus(process.cwd())
   assert(typeof updateStatus === 'object', 'checkUpdateStatus returns object')
   assert(updateStatus.isGit === true, 'checkUpdateStatus isGit')
+  assert(typeof updateStatus.behind === 'number' || updateStatus.unavailable, 'checkUpdateStatus reports behind or unavailable')
+
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.4.0' }) ===
+      'orca 1.1.0 → 1.2.0 · herdr 0.3.0 → 0.4.0',
+    'buildVersionLabel both changed'
+  )
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.2.0', herdr: '0.3.0' }) === 'orca 1.1.0 → 1.2.0',
+    'buildVersionLabel only changed manifest'
+  )
+  assert(
+    buildVersionLabel({ orca: '1.1.0', herdr: '0.3.0' }, { orca: '1.1.0', herdr: '0.3.0' }) === null,
+    'buildVersionLabel unchanged returns null'
+  )
+  assert(buildVersionLabel({}, {}) === null, 'buildVersionLabel empty returns null')
 
   // Catalog tests
   const liveState = await getLiveAgents()

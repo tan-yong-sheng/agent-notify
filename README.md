@@ -216,15 +216,17 @@ node dashboard.mjs --service uninstall
 
 ### Updates
 
-The dashboard automatically checks for updates against GitHub and displays a banner when a newer commit is available. You can also check and update from the terminal:
+The dashboard checks the branch your checkout actually tracks (falling back to `origin/main` for read-only checks) and shows a banner only when you are genuinely *behind*, with the manifest version delta when it changed (e.g. `orca 1.1.0 → 1.2.0`). You can also check and update from the terminal:
 
 ```bash
 # Check if updates are available
 node dashboard.mjs --check-update
 
-# Fast-forward pull latest changes and restart service
+# Fast-forward the tracked upstream; restarts the service only if HEAD moved
 node dashboard.mjs --update
 ```
+
+`--update` requires the current checkout to be on a branch that tracks the update target. It refuses to act on a detached HEAD or a differently-branched checkout instead of reporting a success that never happened, and prints `nothing changed` rather than claiming an update when the pull is a no-op.
 
 ## Test
 
