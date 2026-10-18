@@ -4,6 +4,7 @@
 
 import { execFile } from 'node:child_process'
 import { getExtendedPathEnv } from './env.mjs'
+import { detectGitBranch } from './git.mjs'
 
 const execEnv = getExtendedPathEnv()
 
@@ -90,6 +91,28 @@ function extractHerdrAgents(herdrRes) {
   return herdrRes.data.result.agents.map(parseHerdrAgent)
 }
 
+// `herdr agent list` reports no branch field at all, so the branch is read from
+// the agent's own directory instead. Branches rarely change but this spawns git,
+// so results are cached well past the 2s snapshot TTL.
+const branchCache = new Map()
+const BRANCH_TTL_MS = 30000
+const BRANCH_CACHE_LIMIT = 200
+
+export function resolveBranch(cwd) {
+  if (!cwd) return ''
+
+  const cached = branchCache.get(cwd)
+  if (cached && Date.now() - cached.at < BRANCH_TTL_MS) return cached.branch
+
+  const detected = detectGitBranch(cwd)
+  // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
+  const branch = detected === 'HEAD' ? '' : detected
+
+  if (branchCache.size >= BRANCH_CACHE_LIMIT) branchCache.clear()
+  branchCache.set(cwd, { branch, at: Date.now() })
+  return branch
+}
+
 function extractOrcaAgents(orcaRes) {
   if (!orcaRes.ok || !Array.isArray(orcaRes.data?.result?.worktrees)) return []
   const list = []
@@ -110,8 +133,14 @@ export async function collectLiveState() {
     execCommand('orca', ['worktree', 'ps', '--json'], 3500),
   ])
 
+  const agents = [...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)]
+  // Orca supplies the branch; fill it in from the directory for the runtimes that do not.
+  for (const agent of agents) {
+    if (!agent.branch) agent.branch = resolveBranch(agent.cwd)
+  }
+
   return {
-    agents: [...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)],
+    agents,
     sources: {
       herdr: { available: herdrRes.ok, error: herdrRes.error },
       orca: { available: orcaRes.ok, error: orcaRes.error },

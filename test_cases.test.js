@@ -38,6 +38,7 @@ import {
   parseHerdrAgent,
   parseOrcaAgent,
   getLiveAgents,
+  resolveBranch,
 } from './shared/catalog.mjs'
 import {
   buildSystemdUnit,
@@ -714,6 +715,21 @@ async function runDashboardUnitTests() {
   const liveState = await getLiveAgents()
   assert(Array.isArray(liveState.agents), 'getLiveAgents returns agents array')
   assert(typeof liveState.sources === 'object', 'getLiveAgents returns sources object')
+
+  // `herdr agent list` has no branch field, so the branch comes from the directory.
+  const tmpBranchRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-branch-'))
+  execSync('git init', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  execSync('git checkout -b branch-probe', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  execSync('git -c user.email=t@e.c -c user.name=t commit --allow-empty -m init', { cwd: tmpBranchRepo, stdio: 'ignore' })
+  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch reads the directory branch')
+  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch serves a repeat lookup from cache')
+  assert(resolveBranch('/nonexistent') === '', 'resolveBranch missing directory')
+  assert(resolveBranch('') === '', 'resolveBranch empty directory')
+  fs.rmSync(tmpBranchRepo, { recursive: true, force: true })
+  // Intentional: a removed directory keeps its branch for the cache TTL, and the
+  // row it belonged to is gone long before that matters.
+  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch serves a deleted directory from cache')
+  assert(resolveBranch(`${tmpBranchRepo}-never-cached`) === '', 'resolveBranch never-cached directory')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
