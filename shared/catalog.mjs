@@ -4,20 +4,28 @@
 
 import { execFile } from 'node:child_process'
 import { getExtendedPathEnv } from './env.mjs'
-import { detectGitBranch } from './git.mjs'
+import { detectGitBranchAsync } from './git.mjs'
 
 const execEnv = getExtendedPathEnv()
+// `orca worktree ps --json` grows with the number of worktrees, and the 1 MiB
+// default would turn a busy machine into a truncation and a JSON parse error.
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 
 function execCommand(cmd, args, timeoutMs = 3000) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { encoding: 'utf8', timeout: timeoutMs, env: execEnv }, (err, stdout) => {
-      if (err) return resolve({ ok: false, error: err.message, data: null })
-      try {
-        resolve({ ok: true, data: JSON.parse(stdout) })
-      } catch {
-        resolve({ ok: false, error: 'JSON parse error', data: null })
+    execFile(
+      cmd,
+      args,
+      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_COMMAND_OUTPUT_BYTES, env: execEnv },
+      (err, stdout) => {
+        if (err) return resolve({ ok: false, error: err.message, data: null })
+        try {
+          resolve({ ok: true, data: JSON.parse(stdout) })
+        } catch {
+          resolve({ ok: false, error: 'JSON parse error', data: null })
+        }
       }
-    })
+    )
   })
 }
 
@@ -95,22 +103,41 @@ function extractHerdrAgents(herdrRes) {
 // the agent's own directory instead. Branches rarely change but this spawns git,
 // so results are cached well past the 2s snapshot TTL.
 const branchCache = new Map()
+const pendingBranches = new Map()
 const BRANCH_TTL_MS = 30000
 const BRANCH_CACHE_LIMIT = 200
 
-export function resolveBranch(cwd) {
+function readBranchCache(cwd) {
+  const cached = branchCache.get(cwd)
+  return cached && Date.now() - cached.at < BRANCH_TTL_MS ? cached.branch : null
+}
+
+// Async because callers are request paths that resolve a branch per agent:
+// spawning git synchronously would block the dashboard for up to the timeout for
+// each worktree, and every row would pay it again on each cache expiry.
+// Callers that arrive together for one directory share a single probe.
+export async function resolveBranch(cwd) {
   if (!cwd) return ''
 
-  const cached = branchCache.get(cwd)
-  if (cached && Date.now() - cached.at < BRANCH_TTL_MS) return cached.branch
+  const cached = readBranchCache(cwd)
+  if (cached !== null) return cached
 
-  const detected = detectGitBranch(cwd)
-  // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
-  const branch = detected === 'HEAD' ? '' : detected
+  const pending = pendingBranches.get(cwd)
+  if (pending) return pending
 
-  if (branchCache.size >= BRANCH_CACHE_LIMIT) branchCache.clear()
-  branchCache.set(cwd, { branch, at: Date.now() })
-  return branch
+  const probe = detectGitBranchAsync(cwd)
+    .then((detected) => {
+      // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
+      const branch = detected === 'HEAD' ? '' : detected
+      if (branchCache.size >= BRANCH_CACHE_LIMIT && !branchCache.has(cwd)) branchCache.clear()
+      branchCache.set(cwd, { branch, at: Date.now() })
+      return branch
+    })
+    .finally(() => {
+      pendingBranches.delete(cwd)
+    })
+  pendingBranches.set(cwd, probe)
+  return probe
 }
 
 function extractOrcaAgents(orcaRes) {
@@ -134,10 +161,13 @@ export async function collectLiveState() {
   ])
 
   const agents = [...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)]
-  // Orca supplies the branch; fill it in from the directory for the runtimes that do not.
-  for (const agent of agents) {
-    if (!agent.branch) agent.branch = resolveBranch(agent.cwd)
-  }
+  // Orca supplies the branch; fill it in from the directory for the runtimes that
+  // do not. Concurrent rows in one directory share a single probe.
+  await Promise.all(
+    agents.map(async (agent) => {
+      if (!agent.branch) agent.branch = await resolveBranch(agent.cwd)
+    })
+  )
 
   return {
     agents,

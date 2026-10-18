@@ -111,7 +111,18 @@ function getSystemdServicePath() {
   return path.join(getSystemdDir(), `${SERVICE_NAME}.service`)
 }
 
-export function buildSystemdUnit(nodeBin, scriptPath, repoDir) {
+// The unit and the plist must launch the dashboard on the port the install
+// message reports, so a value that cannot be a port is refused instead of being
+// written into a service definition.
+function requireDashboardPort(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`refusing to build a service definition for the invalid port: ${port}`)
+  }
+  return port
+}
+
+export function buildSystemdUnit(nodeBin, scriptPath, repoDir, port) {
+  const dashboardPort = requireDashboardPort(port)
   return `[Unit]
 Description=Agent Monitor Dashboard (Orca & Herdr)
 After=network.target
@@ -119,7 +130,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${systemdPathValue(repoDir)}
-ExecStart=${systemdExecValue(nodeBin)} ${systemdExecValue(scriptPath)}
+ExecStart=${systemdExecValue(nodeBin)} ${systemdExecValue(scriptPath)} --port ${dashboardPort}
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
@@ -139,7 +150,7 @@ function installLinuxService({ nodeBin, scriptPath, repoDir, port }) {
   const dir = getSystemdDir()
   fs.mkdirSync(dir, { recursive: true })
   const serviceFile = getSystemdServicePath()
-  fs.writeFileSync(serviceFile, buildSystemdUnit(nodeBin, scriptPath, repoDir), 'utf8')
+  fs.writeFileSync(serviceFile, buildSystemdUnit(nodeBin, scriptPath, repoDir, port), 'utf8')
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' })
   // `enable --now` leaves a unit that is already running on its previous
@@ -218,7 +229,8 @@ function getLaunchdLogPath(stream) {
   return path.join(getLaunchdLogDir(), `${stream}.log`)
 }
 
-export function buildLaunchdPlist(nodeBin, scriptPath, repoDir) {
+export function buildLaunchdPlist(nodeBin, scriptPath, repoDir, port) {
+  const dashboardPort = requireDashboardPort(port)
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -229,6 +241,8 @@ export function buildLaunchdPlist(nodeBin, scriptPath, repoDir) {
     <array>
         <string>${xmlEscape(nodeBin)}</string>
         <string>${xmlEscape(scriptPath)}</string>
+        <string>--port</string>
+        <string>${dashboardPort}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${xmlEscape(repoDir)}</string>
@@ -250,9 +264,13 @@ function installDarwinService({ nodeBin, scriptPath, repoDir, port }) {
   fs.mkdirSync(dir, { recursive: true })
   // launchd opens the log files before the job starts, so the directory has to
   // exist first or the job fails to load.
-  fs.mkdirSync(getLaunchdLogDir(), { recursive: true })
+  // The directory holds prompts and worktree paths, so it stays owner-only.
+  // mkdir does not re-mode an existing directory, hence the explicit chmod.
+  const logDir = getLaunchdLogDir()
+  fs.mkdirSync(logDir, { recursive: true, mode: 0o700 })
+  fs.chmodSync(logDir, 0o700)
   const plistPath = getLaunchdPlistPath()
-  fs.writeFileSync(plistPath, buildLaunchdPlist(nodeBin, scriptPath, repoDir), 'utf8')
+  fs.writeFileSync(plistPath, buildLaunchdPlist(nodeBin, scriptPath, repoDir, port), 'utf8')
 
   execFileSync('launchctl', ['load', '-w', plistPath], { stdio: 'inherit' })
   console.log(`\n✅ Successfully installed and started ${MACOS_LABEL} via launchd!`)
@@ -304,14 +322,15 @@ function getWindowsStartupDir() {
   return path.join(appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
 }
 
-export function buildWindowsVbs(nodeBin, scriptPath) {
-  return `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${nodeBin}"" ""${scriptPath}""", 0, False\n`
+export function buildWindowsVbs(nodeBin, scriptPath, port) {
+  const dashboardPort = requireDashboardPort(port)
+  return `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${nodeBin}"" ""${scriptPath}"" --port ${dashboardPort}", 0, False\n`
 }
 
-function installWindowsService({ nodeBin, scriptPath }) {
+function installWindowsService({ nodeBin, scriptPath, port }) {
   const startupDir = getWindowsStartupDir()
   const vbsPath = path.join(startupDir, `${SERVICE_NAME}.vbs`)
-  fs.writeFileSync(vbsPath, buildWindowsVbs(nodeBin, scriptPath), 'utf8')
+  fs.writeFileSync(vbsPath, buildWindowsVbs(nodeBin, scriptPath, port), 'utf8')
   console.log(`\n✅ Installed Windows Startup shortcut at: ${vbsPath}\n`)
 }
 
@@ -390,9 +409,24 @@ export function handleServiceCommand(argv, { port } = {}) {
 
 // ─── Update Check & Perform ──────────────────────────────────────────────────
 
-let cachedUpdateCheck = null
-let lastUpdateCheckTime = 0
+// Keyed by checkout: the dashboard probes its own directory, but the CLI accepts
+// an explicit target (`--update-status-json <dir>`), and one shared slot would
+// report whichever repository was probed first.
+const updateCheckCache = new Map()
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000 // 1 hour
+const UPDATE_CHECK_CACHE_LIMIT = 16
+
+function readUpdateCheckCache(repoDir) {
+  const entry = updateCheckCache.get(repoDir)
+  return entry && Date.now() - entry.at < UPDATE_CHECK_INTERVAL_MS ? entry.status : null
+}
+
+function writeUpdateCheckCache(repoDir, status) {
+  if (updateCheckCache.size >= UPDATE_CHECK_CACHE_LIMIT && !updateCheckCache.has(repoDir)) {
+    updateCheckCache.clear()
+  }
+  updateCheckCache.set(repoDir, { status, at: Date.now() })
+}
 const GIT_TIMEOUT_MS = 10000
 // The interactive `git pull` is not a local query: it may wait on a credential
 // prompt and on the network. A short limit would SIGTERM a pull that is still
@@ -524,13 +558,11 @@ export function fetchUpdateStatus(repoDir) {
 }
 
 function checkUpdateStatus(repoDir) {
-  const now = Date.now()
-  if (cachedUpdateCheck && now - lastUpdateCheckTime < UPDATE_CHECK_INTERVAL_MS) {
-    return cachedUpdateCheck
-  }
-  cachedUpdateCheck = fetchUpdateStatus(repoDir)
-  lastUpdateCheckTime = now
-  return cachedUpdateCheck
+  const cached = readUpdateCheckCache(repoDir)
+  if (cached) return cached
+  const status = fetchUpdateStatus(repoDir)
+  writeUpdateCheckCache(repoDir, status)
+  return status
 }
 
 // The probe fetches from the remote, which takes seconds on a real network, and
@@ -539,7 +571,7 @@ function checkUpdateStatus(repoDir) {
 // stalls agent polling. A child process keeps the blocking work off this loop;
 // the CLI keeps using the synchronous form above.
 const PROBE_TIMEOUT_MS = 30000
-let pendingUpdateCheck = null
+const pendingUpdateChecks = new Map()
 
 function probeUpdateStatusInChild(repoDir, probeArgv) {
   if (!probeArgv?.length) return Promise.resolve(null)
@@ -563,39 +595,38 @@ function probeUpdateStatusInChild(repoDir, probeArgv) {
 
 // Same 1h cache as the CLI form, but callers that arrive together share one
 // in-flight probe, and a probe that cannot run degrades to the last known
-// status instead of throwing into the request handler.
+// status instead of throwing into the request handler. In-flight work and cache
+// are both keyed by repoDir, so a probe for one checkout never answers for
+// another.
 // repoDir is the checkout to report on and probeArgv is the entry point to run
 // the probe as, e.g. the dashboard script: the child re-enters it with
 // --update-status-json and the repoDir, so the target never depends on how the
 // child runtime resolves its own entry path (Bun rewrites argv[1] to the
 // resolved realpath, Node keeps it).
 export async function checkUpdateStatusAsync(repoDir, probeArgv) {
-  const now = Date.now()
-  if (cachedUpdateCheck && now - lastUpdateCheckTime < UPDATE_CHECK_INTERVAL_MS) {
-    return cachedUpdateCheck
-  }
-  if (!pendingUpdateCheck) {
-    pendingUpdateCheck = probeUpdateStatusInChild(repoDir, probeArgv)
-      .then((status) => {
-        if (status) {
-          cachedUpdateCheck = status
-          lastUpdateCheckTime = Date.now()
+  const cached = readUpdateCheckCache(repoDir)
+  if (cached) return cached
+  const pending = pendingUpdateChecks.get(repoDir)
+  if (pending) return pending
+
+  const probe = probeUpdateStatusInChild(repoDir, probeArgv)
+    .then((status) => {
+      if (status) writeUpdateCheckCache(repoDir, status)
+      return (
+        status ||
+        readUpdateCheckCache(repoDir) || {
+          isGit: false,
+          hasUpdate: false,
+          unavailable: 'the update check could not run',
+          checkedAt: Date.now(),
         }
-        return (
-          status ||
-          cachedUpdateCheck || {
-            isGit: false,
-            hasUpdate: false,
-            unavailable: 'the update check could not run',
-            checkedAt: Date.now(),
-          }
-        )
-      })
-      .finally(() => {
-        pendingUpdateCheck = null
-      })
-  }
-  return pendingUpdateCheck
+      )
+    })
+    .finally(() => {
+      pendingUpdateChecks.delete(repoDir)
+    })
+  pendingUpdateChecks.set(repoDir, probe)
+  return probe
 }
 
 function printCheckUpdateResult(status) {

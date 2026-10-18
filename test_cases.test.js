@@ -606,6 +606,28 @@ async function runDashboardUnitTests() {
     resolveDashboardPort(['node', 'dashboard.mjs', '--port', '4003'], {}, {}) === 4003,
     'resolveDashboardPort prefers the flag'
   )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port=4003'], {}, {}) === 4003,
+    'resolveDashboardPort accepts the flag=value form'
+  )
+  // parseInt reads a numeric prefix, so a malformed value must fall through to
+  // the next source instead of binding a port nobody asked for.
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port', '4004junk'], { DASHBOARD_PORT: '4005' }, {}) === 4005,
+    'resolveDashboardPort rejects a flag with trailing garbage'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs'], { DASHBOARD_PORT: '4005.5' }, {}) === 3333,
+    'resolveDashboardPort rejects a fractional environment port'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port=0'], {}, {}) === 3333,
+    'resolveDashboardPort rejects port 0'
+  )
+  assert(
+    resolveDashboardPort(['node', 'dashboard.mjs', '--port'], {}, {}) === 3333,
+    'resolveDashboardPort falls back when the flag has no value'
+  )
 
   // A launch through a symlink (or an npm/npx shim) must still start the server
   // instead of resolving argv[1] to the link and exiting 0 without a word.
@@ -683,50 +705,65 @@ async function runDashboardUnitTests() {
   assert(resolveServiceRuntime('/custom/bun').includes('bun'), 'resolveServiceRuntime detects bun')
   assert(typeof resolveServiceRuntime() === 'string', 'resolveServiceRuntime returns string')
 
-  const systemd = buildSystemdUnit('/usr/bin/node', '/path/dashboard.mjs', '/path')
-  assert(systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs'), 'buildSystemdUnit ExecStart')
+  const systemd = buildSystemdUnit('/usr/bin/node', '/path/dashboard.mjs', '/path', 4006)
+  assert(
+    systemd.includes('ExecStart=/usr/bin/node /path/dashboard.mjs --port 4006'),
+    'buildSystemdUnit ExecStart carries the port the install reported'
+  )
   assert(systemd.includes('WorkingDirectory=/path'), 'buildSystemdUnit WorkingDirectory')
 
   // A path with spaces must stay one argv element; % is a systemd specifier.
-  const spaced = buildSystemdUnit('/opt/my node/node', '/repo dir/dashboard.mjs', '/repo dir')
+  const spaced = buildSystemdUnit('/opt/my node/node', '/repo dir/dashboard.mjs', '/repo dir', 4006)
   assert(spaced.includes('ExecStart="/opt/my node/node" "/repo dir/dashboard.mjs"'), 'buildSystemdUnit quotes argv with spaces')
   // `WorkingDirectory=` takes no quoting: a quoted value is rejected by systemd as
   // "not absolute", while a bare space is preserved.
   assert(spaced.includes('WorkingDirectory=/repo dir'), 'buildSystemdUnit leaves a spaced working directory bare')
-  assert(buildSystemdUnit('/usr/bin/node', '/path/100%.mjs', '/path').includes('100%%.mjs'), 'buildSystemdUnit escapes % specifiers')
+  assert(buildSystemdUnit('/usr/bin/node', '/path/100%.mjs', '/path', 4006).includes('100%%.mjs'), 'buildSystemdUnit escapes % specifiers')
   assert(
-    buildSystemdUnit('/usr/bin/node', '/path/a$b.mjs', '/path').includes('ExecStart=/usr/bin/node "/path/a$$b.mjs"'),
+    buildSystemdUnit('/usr/bin/node', '/path/a$b.mjs', '/path', 4006).includes('ExecStart=/usr/bin/node "/path/a$$b.mjs"'),
     'buildSystemdUnit escapes $ expansion in ExecStart'
   )
   assert(
-    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/a$b').includes('WorkingDirectory=/path/a$b'),
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/a$b', 4006).includes('WorkingDirectory=/path/a$b'),
     'buildSystemdUnit leaves a literal $ alone in WorkingDirectory'
   )
   let newlineRejected = false
   try {
-    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path\nExecStartPre=/bin/true')
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path\nExecStartPre=/bin/true', 4006)
   } catch {
     newlineRejected = true
   }
   assert(newlineRejected, 'buildSystemdUnit refuses a newline instead of injecting a directive')
   let backslashRejected = false
   try {
-    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/ends-with\\')
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path/ends-with\\', 4006)
   } catch {
     backslashRejected = true
   }
   assert(backslashRejected, 'buildSystemdUnit refuses a working directory ending in a backslash')
+  let invalidPortRejected = false
+  try {
+    buildSystemdUnit('/usr/bin/node', '/path/x.mjs', '/path', 70000)
+  } catch {
+    invalidPortRejected = true
+  }
+  assert(invalidPortRejected, 'buildSystemdUnit refuses a port outside the valid range')
 
-  const plist = buildLaunchdPlist('/usr/bin/node', '/path/dashboard.mjs', '/path')
+  const plist = buildLaunchdPlist('/usr/bin/node', '/path/dashboard.mjs', '/path', 4006)
   assert(plist.includes('<string>dev.agent-notify.dashboard</string>'), 'buildLaunchdPlist label')
   assert(plist.includes('<string>/usr/bin/node</string>'), 'buildLaunchdPlist node')
   assert(
-    buildLaunchdPlist('/usr/bin/node', '/path/a&b.mjs', '/path<c>').includes('/path/a&amp;b.mjs'),
+    plist.includes('<string>--port</string>\n        <string>4006</string>'),
+    'buildLaunchdPlist passes the port the install reported'
+  )
+  assert(
+    buildLaunchdPlist('/usr/bin/node', '/path/a&b.mjs', '/path<c>', 4006).includes('/path/a&amp;b.mjs'),
     'buildLaunchdPlist escapes XML in paths'
   )
 
-  const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs')
+  const vbs = buildWindowsVbs('C:\\node.exe', 'C:\\dashboard.mjs', 4006)
   assert(vbs.includes('WshShell.Run'), 'buildWindowsVbs Run')
+  assert(vbs.includes('--port 4006'), 'buildWindowsVbs passes the port the install reported')
 
   // No remote configured, so this stays offline: it must report a git checkout
   // it cannot resolve, rather than reaching out to the network.
@@ -758,6 +795,11 @@ async function runDashboardUnitTests() {
     (await checkUpdateStatusAsync(linkDir, [dashboardPath])) === firstStatus,
     'checkUpdateStatusAsync serves a repeat call from cache'
   )
+  // The cache and the in-flight probe are keyed by checkout: with one shared slot
+  // the second call would answer with the first directory's status.
+  const otherStatus = await checkUpdateStatusAsync(tmpRepoDir, [dashboardPath])
+  assert(otherStatus.isGit === true, 'checkUpdateStatusAsync keys the cache by directory')
+  assert(otherStatus !== firstStatus, 'checkUpdateStatusAsync does not reuse another directory status')
 
   // Installing must restart an already-running unit: `enable --now` leaves a
   // running unit on its previous definition, so reinstalling after an edit would
@@ -887,15 +929,26 @@ async function runDashboardUnitTests() {
   execSync('git init', { cwd: tmpBranchRepo, stdio: 'ignore' })
   execSync('git checkout -b branch-probe', { cwd: tmpBranchRepo, stdio: 'ignore' })
   execSync('git -c user.email=t@e.c -c user.name=t commit --allow-empty -m init', { cwd: tmpBranchRepo, stdio: 'ignore' })
-  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch reads the directory branch')
-  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch serves a repeat lookup from cache')
-  assert(resolveBranch('/nonexistent') === '', 'resolveBranch missing directory')
-  assert(resolveBranch('') === '', 'resolveBranch empty directory')
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch reads the directory branch')
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch serves a repeat lookup from cache')
+  assert((await resolveBranch('/nonexistent')) === '', 'resolveBranch missing directory')
+  assert((await resolveBranch('')) === '', 'resolveBranch empty directory')
   fs.rmSync(tmpBranchRepo, { recursive: true, force: true })
   // Intentional: a removed directory keeps its branch for the cache TTL, and the
   // row it belonged to is gone long before that matters.
-  assert(resolveBranch(tmpBranchRepo) === 'branch-probe', 'resolveBranch serves a deleted directory from cache')
-  assert(resolveBranch(`${tmpBranchRepo}-never-cached`) === '', 'resolveBranch never-cached directory')
+  assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch serves a deleted directory from cache')
+  assert((await resolveBranch(`${tmpBranchRepo}-never-cached`)) === '', 'resolveBranch never-cached directory')
+  // A 0ms timer proves the loop kept running while git was in flight: a
+  // synchronous probe would run to completion before the timer could fire.
+  const branchLoopDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-branch-loop-'))
+  let loopRanWhileResolving = false
+  const branchTimer = setTimeout(() => {
+    loopRanWhileResolving = true
+  }, 0)
+  await resolveBranch(branchLoopDir)
+  clearTimeout(branchTimer)
+  assert(loopRanWhileResolving, 'resolveBranch does not block the event loop')
+  fs.rmSync(branchLoopDir, { recursive: true, force: true })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

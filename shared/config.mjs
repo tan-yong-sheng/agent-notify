@@ -42,18 +42,28 @@ function portValueFrom(argv, index) {
   return arg.startsWith('--port=') ? arg.slice('--port='.length) : argv[index + 1]
 }
 
+// Returns the raw flag value so resolvePort can judge the whole string; parsing
+// here would hide a malformed value behind a valid numeric prefix.
 function parseCliPort(argv = []) {
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--port' || argv[i].startsWith('--port=')) {
-      return parseInt(portValueFrom(argv, i), 10)
+      return portValueFrom(argv, i)
     }
   }
   return null
 }
 
+// `parseInt` accepts a numeric prefix and ignores the rest, so a trailing-garbage
+// flag (`--port=3333junk`) or a fractional environment value
+// (`DASHBOARD_PORT=3333.5`) would silently bind 3333 instead of falling back.
 function resolvePort(value) {
-  const parsed = parseInt(value, 10)
-  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : null
+  const text = String(value ?? '').trim()
+  return /^\d+$/.test(text) ? asPortNumber(text) : null
+}
+
+function asPortNumber(text) {
+  const parsed = Number(text)
+  return parsed >= 1 && parsed <= 65535 ? parsed : null
 }
 
 export function resolveDashboardPort(argv = process.argv, env = process.env, fileEnv = {}) {
