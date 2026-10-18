@@ -1,6 +1,7 @@
 // ─── .env file parser ────────────────────────────────────────────────────────
 
 import fs from 'node:fs'
+import path from 'node:path'
 
 function stripQuotes(value) {
   const quote = value[0]
@@ -29,4 +30,15 @@ export function loadEnv(filePath) {
     if (parsed) env[parsed[0]] = parsed[1]
   }
   return env
+}
+
+const DEFAULT_EXTRA_DIRS = ['/home/linuxbrew/.linuxbrew/bin', '/usr/local/bin', '/opt/homebrew/bin']
+
+// Builds process.env with common binary directories prepended to PATH if they exist.
+export function getExtendedPathEnv(extraDirs) {
+  const dirs = extraDirs ?? DEFAULT_EXTRA_DIRS
+  const pathStr = process.env.PATH ?? ''
+  const current = pathStr.split(path.delimiter)
+  const additions = dirs.filter((d) => !current.includes(d) && fs.existsSync(d))
+  return { ...process.env, PATH: [...additions, ...current].join(path.delimiter) }
 }

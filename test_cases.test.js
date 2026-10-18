@@ -415,10 +415,54 @@ async function runHerdrUnitTests() {
   assert(extractAgent({ data: { agent: 'Pi' } }, {}) === 'Pi', 'extractAgent from event')
   assert(extractAgent({ data: { display_agent: 'Display' } }, {}) === 'Display', 'extractAgent prefers display_agent')
 
+  // A workspace label is not a path: the adapter resolves this value as a
+  // directory and runs git in it, so a label must never be returned here.
   const ws = extractWorkspaceContext({ data: { workspace: 'repo', tab: 'editor', pane_id: 'p1' } }, {})
-  assert(ws.workspace === 'repo', 'extractWorkspaceContext workspace')
+  assert(ws.workspace === '', 'extractWorkspaceContext ignores the workspace label')
   assert(ws.tab === 'editor', 'extractWorkspaceContext tab')
   assert(ws.paneId === 'p1', 'extractWorkspaceContext paneId')
+
+  const wsLabels = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { workspace_label: 'my-project', focused_pane_workspace: 'my-project', workspace: 'my-project' }
+  )
+  assert(wsLabels.workspace === '', 'extractWorkspaceContext ignores label-only context')
+
+  // With no event pane id there is nothing to match against, so the focused
+  // pane's cwd is not evidence and the snapshot lookup has to decide instead.
+  const wsUnprovenPane = extractWorkspaceContext(
+    { data: {} },
+    { focused_pane_id: 'wG5:p3', focused_pane_cwd: '/home/user/focused-project' }
+  )
+  assert(
+    wsUnprovenPane.workspace === '',
+    'extractWorkspaceContext needs the event pane to accept focused_pane_cwd'
+  )
+  assert(
+    wsUnprovenPane.paneId === 'wG5:p3',
+    'extractWorkspaceContext still reports the context pane for the snapshot lookup'
+  )
+
+  const wsHerdrCwd = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { workspace_cwd: '/home/user/project', tab_label: 'terminal 1' }
+  )
+  assert(wsHerdrCwd.workspace === '/home/user/project', 'extractWorkspaceContext Herdr workspace_cwd')
+  assert(wsHerdrCwd.tab === 'terminal 1', 'extractWorkspaceContext Herdr tab_label')
+  assert(wsHerdrCwd.paneId === 'wG5:p3', 'extractWorkspaceContext Herdr pane_id')
+
+  const wsFocusedCwd = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { focused_pane_id: 'wG5:p3', focused_pane_cwd: '/home/user/focused-project' }
+  )
+  assert(wsFocusedCwd.workspace === '/home/user/focused-project', 'extractWorkspaceContext Herdr focused_pane_cwd when pane matches')
+
+  // When focused_pane_id does NOT match the event pane, focused_pane_cwd must be ignored.
+  const wsMismatchedPane = extractWorkspaceContext(
+    { data: { pane_id: 'wG5:p3' } },
+    { focused_pane_id: 'wG5:other', focused_pane_cwd: '/home/user/other-project' }
+  )
+  assert(wsMismatchedPane.workspace === '', 'extractWorkspaceContext ignores focused_pane_cwd when pane ID mismatches')
 
   const sup = extractSupplementaryStatus({ data: { custom_status: 'cs', title: 't', state_labels: { error: 'e' } } }, {})
   assert(sup.customStatus === 'cs', 'extractSupplementaryStatus custom_status')
