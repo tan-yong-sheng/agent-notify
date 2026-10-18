@@ -454,11 +454,20 @@ function readUpdateCheckCache(repoDir) {
   return entry && Date.now() - entry.at < UPDATE_CHECK_INTERVAL_MS ? entry.status : null
 }
 
-function writeUpdateCheckCache(repoDir, status) {
+// Exported for tests: the hourly TTL cannot be waited out, and a failure path
+// that only runs on an expired entry has to be reachable.
+export function writeUpdateCheckCache(repoDir, status, at = Date.now()) {
   if (updateCheckCache.size >= UPDATE_CHECK_CACHE_LIMIT && !updateCheckCache.has(repoDir)) {
     updateCheckCache.clear()
   }
-  updateCheckCache.set(repoDir, { status, at: Date.now() })
+  updateCheckCache.set(repoDir, { status, at })
+}
+
+// The last successful status regardless of age: an entry that has aged past the
+// TTL is exactly the case in which a new probe is attempted, so the failure path
+// cannot ask `readUpdateCheckCache` for it.
+function readLastUpdateCheck(repoDir) {
+  return updateCheckCache.get(repoDir)?.status ?? null
 }
 const GIT_TIMEOUT_MS = 10000
 // The interactive `git pull` is not a local query: it may wait on a credential
@@ -636,6 +645,22 @@ function probeUpdateStatusInChild(repoDir, probeArgv) {
 // --update-status-json and the repoDir, so the target never depends on how the
 // child runtime resolves its own entry path (Bun rewrites argv[1] to the
 // resolved realpath, Node keeps it).
+// A probe that cannot run is reported as the last known status, marked stale: the
+// dashboard polls this from a host that is offline or behind a failing remote, and
+// the status carries its own checkedAt, so hiding it would be the less honest
+// option. Nothing is written back, so the entry keeps its real age.
+function failedProbeStatus(repoDir) {
+  const last = readLastUpdateCheck(repoDir)
+  return last
+    ? { ...last, stale: true }
+    : {
+        isGit: false,
+        hasUpdate: false,
+        unavailable: 'the update check could not run',
+        checkedAt: Date.now(),
+      }
+}
+
 export async function checkUpdateStatusAsync(repoDir, probeArgv) {
   const cached = readUpdateCheckCache(repoDir)
   if (cached) return cached
@@ -644,16 +669,11 @@ export async function checkUpdateStatusAsync(repoDir, probeArgv) {
 
   const probe = probeUpdateStatusInChild(repoDir, probeArgv)
     .then((status) => {
-      if (status) writeUpdateCheckCache(repoDir, status)
-      return (
-        status ||
-        readUpdateCheckCache(repoDir) || {
-          isGit: false,
-          hasUpdate: false,
-          unavailable: 'the update check could not run',
-          checkedAt: Date.now(),
-        }
-      )
+      if (status) {
+        writeUpdateCheckCache(repoDir, status)
+        return status
+      }
+      return failedProbeStatus(repoDir)
     })
     .finally(() => {
       pendingUpdateChecks.delete(repoDir)

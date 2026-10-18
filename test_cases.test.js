@@ -50,6 +50,7 @@ import {
   buildLaunchdPlist,
   buildWindowsVbs,
   installDarwinService,
+  writeUpdateCheckCache,
   getServicePlatform,
   resolveServiceRuntime,
   buildVersionLabel,
@@ -894,6 +895,23 @@ async function runDashboardUnitTests() {
   assert(otherStatus.isGit === true, 'checkUpdateStatusAsync keys the cache by directory')
   assert(otherStatus !== firstStatus, 'checkUpdateStatusAsync does not reuse another directory status')
 
+  // A probe that cannot run reports the last known status instead of nothing, and
+  // the entry is aged past the TTL first: that is the only way this path is
+  // reached, so the failure path cannot read it through the TTL gate.
+  const staleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-stale-'))
+  const lastKnown = { isGit: true, hasUpdate: true, checkedAt: Date.now() - 3 * 60 * 60 * 1000 }
+  writeUpdateCheckCache(staleDir, lastKnown, Date.now() - 2 * 60 * 60 * 1000)
+  const staleStatus = await checkUpdateStatusAsync(staleDir, [path.join(staleDir, 'no-such-probe.mjs')])
+  assert(staleStatus.hasUpdate === true, 'a failed update probe reports the last known status')
+  assert(staleStatus.stale === true, 'the last known status is marked stale')
+  assert(staleStatus.checkedAt === lastKnown.checkedAt, 'the stale status keeps its original checkedAt')
+  const noHistoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nohistory-'))
+  const noHistory = await checkUpdateStatusAsync(noHistoryDir, [path.join(noHistoryDir, 'no-such-probe.mjs')])
+  assert(noHistory.unavailable === 'the update check could not run', 'a failed probe without history says so')
+  assert(noHistory.stale === undefined, 'a status with no history is not labelled stale')
+  fs.rmSync(staleDir, { recursive: true, force: true })
+  fs.rmSync(noHistoryDir, { recursive: true, force: true })
+
   // Installing must restart an already-running unit: `enable --now` leaves a
   // running unit on its previous definition, so reinstalling after an edit would
   // keep serving the old ExecStart. A fake systemctl on PATH records the calls it
@@ -1047,6 +1065,19 @@ async function runDashboardUnitTests() {
   assert((await resolveBranch(tmpBranchRepo)) === 'branch-probe', 'resolveBranch serves a repeat lookup from cache')
   assert((await resolveBranch('/nonexistent')) === '', 'resolveBranch missing directory')
   assert((await resolveBranch('')) === '', 'resolveBranch empty directory')
+  // A probe that rejects is one row's problem, not the snapshot's: the value has
+  // to come back empty rather than propagating into the whole collection.
+  const failingProbe = () => Promise.reject(new Error('git could not be spawned'))
+  assert(
+    (await resolveBranch(`${tmpBranchRepo}-rejected`, failingProbe)) === '',
+    'resolveBranch survives a probe that rejects'
+  )
+  assert(
+    (await resolveBranch(`${tmpBranchRepo}-thrower`, () => {
+      throw new Error('probe threw synchronously')
+    })) === '',
+    'resolveBranch survives a probe that throws before returning'
+  )
   fs.rmSync(tmpBranchRepo, { recursive: true, force: true })
   // Intentional: a removed directory keeps its branch for the cache TTL, and the
   // row it belonged to is gone long before that matters.
@@ -1089,7 +1120,12 @@ async function runDashboardUnitTests() {
     fs.writeFileSync(file, `#!/bin/sh\necho '${payload}'\n`)
     fs.chmodSync(file, 0o755)
   }
-  writeFakeRuntime('herdr', '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"idle"}]}}')
+  writeFakeRuntime(
+    'herdr',
+    // The second row supplies the id the first row falls back to, so both resolve
+    // to herdr-pane-0 before de-duplication.
+    '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"idle","pane_id":"pane-0"},{"agent_status":"working","pane_id":"pane-7"}]}}'
+  )
   writeFakeRuntime('orca', '{"result":{"worktrees":[{"path":"/tmp","agents":[{},{}]}]}}')
   const stateProbe = path.join(fakeBin, 'probe.mjs')
   fs.writeFileSync(
@@ -1104,8 +1140,12 @@ async function runDashboardUnitTests() {
   )
   const idsFor = (source) =>
     probedState.agents.filter((agent) => agent.source === source).map((agent) => agent.id)
-  assert(idsFor('herdr').length === 2, 'collectLiveState reads a runtime from the extended PATH')
-  assert(new Set(idsFor('herdr')).size === 2, 'collectLiveState keeps herdr ids unique without pane_id')
+  assert(idsFor('herdr').length === 3, 'collectLiveState reads a runtime from the extended PATH')
+  assert(idsFor('herdr').includes('herdr-pane-7'), 'collectLiveState keeps an id the runtime supplied')
+  assert(
+    new Set(idsFor('herdr')).size === 3,
+    'collectLiveState keeps herdr ids unique when an id collides with a fallback'
+  )
   assert(new Set(idsFor('orca')).size === 2, 'collectLiveState keeps orca ids unique without paneKey')
   assert(
     probedState.agents.every((agent) => typeof agent.branch === 'string'),

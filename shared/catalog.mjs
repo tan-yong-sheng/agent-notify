@@ -115,11 +115,24 @@ function readBranchCache(cwd) {
   return cached && Date.now() - cached.at < BRANCH_TTL_MS ? cached.branch : null
 }
 
+// A probe failure is one row's problem: a rejected probe would otherwise reject
+// the worker, abort `mapWithConcurrency`, and fail the whole snapshot over a
+// single unusable directory. The probe is injectable so that path is testable.
+async function probeBranch(cwd, probe) {
+  try {
+    const detected = await probe(cwd)
+    // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
+    return detected === 'HEAD' ? '' : detected
+  } catch {
+    return ''
+  }
+}
+
 // Async because callers are request paths that resolve a branch per agent:
 // spawning git synchronously would block the dashboard for up to the timeout for
 // each worktree, and every row would pay it again on each cache expiry.
 // Callers that arrive together for one directory share a single probe.
-export async function resolveBranch(cwd) {
+export async function resolveBranch(cwd, probe = detectGitBranchAsync) {
   if (!cwd) return ''
 
   const cached = readBranchCache(cwd)
@@ -128,10 +141,8 @@ export async function resolveBranch(cwd) {
   const pending = pendingBranches.get(cwd)
   if (pending) return pending
 
-  const probe = detectGitBranchAsync(cwd)
-    .then((detected) => {
-      // A detached HEAD resolves to "HEAD", which is not a branch worth displaying.
-      const branch = detected === 'HEAD' ? '' : detected
+  const lookup = probeBranch(cwd, probe)
+    .then((branch) => {
       if (branchCache.size >= BRANCH_CACHE_LIMIT && !branchCache.has(cwd)) branchCache.clear()
       branchCache.set(cwd, { branch, at: Date.now() })
       return branch
@@ -139,8 +150,8 @@ export async function resolveBranch(cwd) {
     .finally(() => {
       pendingBranches.delete(cwd)
     })
-  pendingBranches.set(cwd, probe)
-  return probe
+  pendingBranches.set(cwd, lookup)
+  return lookup
 }
 
 // The snapshot size is decided by the runtimes, so the probes it triggers are
@@ -177,13 +188,32 @@ function extractOrcaAgents(orcaRes) {
   return list
 }
 
+// Two rows keyed alike make one row render the other's state: a runtime that
+// reports a real id equal to another row's positional fallback (`pane-1`) would
+// otherwise collide, and duplicate ids from a runtime collide with themselves.
+// Repeats get a suffix instead of being dropped, so no row disappears.
+function withUniqueIds(agents) {
+  const seen = new Set()
+  return agents.map((agent) => {
+    if (!seen.has(agent.id)) {
+      seen.add(agent.id)
+      return agent
+    }
+    let suffix = 2
+    while (seen.has(`${agent.id}~${suffix}`)) suffix += 1
+    const uniqueId = `${agent.id}~${suffix}`
+    seen.add(uniqueId)
+    return { ...agent, id: uniqueId }
+  })
+}
+
 export async function collectLiveState() {
   const [herdrRes, orcaRes] = await Promise.all([
     execCommand('herdr', ['agent', 'list'], 2500),
     execCommand('orca', ['worktree', 'ps', '--json'], 3500),
   ])
 
-  const agents = [...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)]
+  const agents = withUniqueIds([...extractHerdrAgents(herdrRes), ...extractOrcaAgents(orcaRes)])
   // Orca supplies the branch; fill it in from the directory for the runtimes that
   // do not. Rows in one directory share a single probe, and the spawns are capped
   // so a large snapshot cannot start one git per row at once.
@@ -223,6 +253,11 @@ export async function getLiveAgents({ forceFresh = false } = {}) {
   // will do (it is not asking for freshness) or when the collection in flight was
   // itself forced fresh now. A forced caller must not be answered with a
   // collection that began before it asked.
+  //
+  // Sharing a forced collection that is already running is deliberate: the wait is
+  // bounded by one collection, while starting a probe per request would put back
+  // the unbounded fan-out the branch probes were capped to avoid. Every forced
+  // caller therefore waits for a collection no older than the one it joins.
   if (inFlight && (inFlightIsForced || !forceFresh)) {
     return inFlight
   }
