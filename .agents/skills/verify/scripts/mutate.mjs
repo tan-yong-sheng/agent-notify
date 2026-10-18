@@ -231,5 +231,7 @@ if (isDirty(REPO_ROOT, { trackedOnly: true })) {
   report.check('the worktree is clean after the run', true)
 }
 report.check('the run matches the checked-out revision', true, gitHead())
-report.writeEvidence('mutations.json')
+// A `--only` run must not overwrite the full catalogue's evidence with three
+// checks, so a focused run gets its own file next to it.
+report.writeEvidence(only ? 'mutations-partial.json' : 'mutations.json')
 report.finish()
