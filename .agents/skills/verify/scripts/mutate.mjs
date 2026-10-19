@@ -214,7 +214,7 @@ function reportUnrecovered() {
   }
   console.error('           these files look like a shipped fix reverted in the working tree, which is what a leftover of a killed run looks like once it has been edited:')
   for (const file of reverted) console.error(`             ${file.file} (${file.id})`)
-  console.error('           undo them by hand; --restore only handles a file that matches a leftover exactly')
+  console.error('           check them by hand; --restore only handles a file that matches a leftover exactly')
 }
 
 // A run that was killed outright never reached its restore step, so it left one
