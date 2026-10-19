@@ -24,6 +24,23 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { findLeftoverMutations, expectedBytes, readCommittedFile, readWorkingFile } from './leftover.mjs'
 
+// Whether the file really sits inside the repository. The leaf is checked
+// separately, because a link there is the operator's own file; this resolves
+// the directories above it, which a link can point out of the repository.
+//
+// The recovery does not use the shared helpers for this: they live in a
+// module the driver loads before the gate, and the recovery must not depend
+// on anything that is not behind the gate.
+function insideRepo(repoRoot, target) {
+  try {
+    const root = fs.realpathSync(repoRoot)
+    const dir = fs.realpathSync(path.dirname(target))
+    return dir === root || dir.startsWith(root + path.sep)
+  } catch {
+    return false
+  }
+}
+
 // Put the committed bytes back for every leftover found, and report the files
 // that were restored so the operator can see what changed.
 //
@@ -44,6 +61,14 @@ import { findLeftoverMutations, expectedBytes, readCommittedFile, readWorkingFil
 // text in git, so it cannot be a leftover in the first place; the case that
 // matters is an operator who replaced a tracked file with a link, and that
 // file is theirs to put back.
+//
+// The directories above the file are resolved as well, because a link there
+// would put the committed content outside the repository just as surely as a
+// link at the file itself.
+//
+// The temporary file is created exclusively, at a path that is fixed and
+// therefore predictable: a link planted there must not receive the committed
+// bytes either.
 //
 // `beforeWrite` is called before each write, and again just before the
 // rename. Returning anything falsy stops the recovery, so a driver that has
@@ -71,13 +96,21 @@ export function restoreLeftoverMutations({ repoRoot, mutations, beforeWrite, cac
         continue
       }
     } catch {}
+    if (!insideRepo(repoRoot, target)) {
+      skipped.push({ file: leftover.file, reason: 'the file is reached through a link that leaves the repository, so the recovery does not write through it' })
+      continue
+    }
     let mode = 0o644
     try {
       mode = fs.statSync(target).mode & 0o777
     } catch {}
     const temp = `${target}.restore-tmp`
     try {
-      fs.writeFileSync(temp, committed, { mode })
+      // The temporary path is predictable, so anything standing there is
+      // removed first and the file is created exclusively: the committed
+      // bytes cannot land in a link's destination.
+      fs.rmSync(temp, { force: true })
+      fs.writeFileSync(temp, committed, { mode, flag: 'wx' })
       fs.chmodSync(temp, mode)
       if (beforeWrite && !beforeWrite(leftover)) break
       const latest = readWorkingFile(repoRoot, leftover.file)

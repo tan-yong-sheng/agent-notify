@@ -19,7 +19,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
+import { fileURLToPath } from 'node:url'
+import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -244,28 +245,40 @@ const lockIsOurs = () => lockReleased || lockState() === 'ours'
 // writing would corrupt that run's evidence.
 let restored = false
 function restoreOnce() {
-  if (restored) return
+  if (restored) return 0
   restored = true
   if (!lockIsOurs()) {
     console.error(`not restoring the files this driver touched: ${lockProblem()}`)
     releaseLock()
-    return
+    return 0
   }
+  let count = 0
   for (const [file, source] of touched) {
     try {
       fs.writeFileSync(file, source)
+      count++
     } catch (err) {
       console.error(`could not restore ${file}: ${err.message}`)
     }
   }
   releaseLock()
+  return count
 }
-process.on('exit', restoreOnce)
+
+// What the driver did on its way out, in words that do not claim a restore
+// that did not happen: a driver that lost the lock leaves the files it
+// touched alone, and the message says so instead of counting them.
+function restoreSummary(count) {
+  if (count > 0) return `restored ${count} tracked file(s) before exiting`
+  if (touched.size === 0) return 'there was nothing to restore'
+  return 'left the files this driver touched alone, because this driver no longer holds the lock'
+}
+process.on('exit', () => { restoreOnce() })
 const INTERRUPTS = new Set(['SIGINT', 'SIGTERM', 'SIGHUP'])
 for (const signal of INTERRUPTS) {
   process.on(signal, () => {
-    restoreOnce()
-    console.error(`\n${signal}: restored ${touched.size} tracked file(s) before exiting`)
+    const count = restoreOnce()
+    console.error(`\n${signal}: ${restoreSummary(count)}`)
     process.exit(signal === 'SIGINT' ? 130 : 143)
   })
 }
@@ -330,15 +343,40 @@ function reportUnrecovered() {
 // Only once the gate has passed is the recovery path loaded. Both halves are
 // behind the gate, not just the writing one, because the reading half decides
 // which of the operator's files the recovery would overwrite.
+//
+// The gate asks git about the content of the modules, not about their
+// timestamps. `git status` answers from the index's stat cache, so a module
+// the operator marked assume-unchanged or skip-worktree is reported as clean
+// while its bytes differ from the committed ones, and the recovery would then
+// run the operator's version of itself. Hashing the file reads the bytes that
+// are on disk; comparing that hash with the blob at HEAD answers the question
+// the gate actually asks: is this the shipped file?
+//
+// The paths come from the driver's own location, and the root comes from git,
+// so nothing an operator can edit in another module can point the gate at
+// the wrong files.
+const GATE_SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url))
 const RECOVERY_MODULES = ['leftover.mjs', 'restore.mjs', 'mutations.mjs']
 function recoveryPathState() {
   try {
-    const paths = RECOVERY_MODULES.map((name) => path.join(SKILL_ROOT, 'scripts', name))
-    const out = execFileSync('git', ['status', '--porcelain', '--untracked-files=no', '--', ...paths], {
-      cwd: REPO_ROOT,
+    const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: GATE_SCRIPTS_DIR,
       stdio: ['ignore', 'pipe', 'pipe'],
-    }).toString()
-    return out.trim() === '' ? false : true
+    }).toString().trim()
+    const scriptsDir = path.relative(root, GATE_SCRIPTS_DIR).split(path.sep).join('/')
+    const differs = RECOVERY_MODULES.some((name) => {
+      const rel = `${scriptsDir}/${name}`
+      const working = execFileSync('git', ['hash-object', `--path=${rel}`, path.join(GATE_SCRIPTS_DIR, name)], {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).toString().trim()
+      const committed = execFileSync('git', ['rev-parse', `HEAD:${rel}`], {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).toString().trim()
+      return working !== committed
+    })
+    return differs
   } catch {
     return null
   }
@@ -425,6 +463,11 @@ if (dirty) {
 }
 
 // The tree is clean, so the gate passed and the catalogue is loaded.
+if (!MUTATIONS) {
+  console.error('refusing to run: the mutation catalogue was not loaded')
+  releaseLock()
+  process.exit(2)
+}
 const selected = MUTATIONS.filter((m) => !only || m.id === only)
 if (!selected.length) {
   console.error(only ? `no mutation with id "${only}"` : 'no mutations defined')
