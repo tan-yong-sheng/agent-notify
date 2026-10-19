@@ -31,15 +31,17 @@ const runtime = flagValue(flags, 'runtime', 'node')
 const testFile = path.join(REPO_ROOT, 'test_cases.test.js')
 const testSource = fs.readFileSync(testFile, 'utf8')
 
-// The driver's own recovery path must not be mutated. A killed run that left
-// these files changed would leave the recovery unable to recognise a leftover,
-// and an inverted comparison in the recovery would overwrite the operator's own
-// work. The catalogue targets shipped fixes in the application, not the
-// tooling that verifies it, so the driver refuses such an entry outright.
-const PROTECTED_FILES = new Set([
-  '.agents/skills/verify/scripts/mutate.mjs',
-  '.agents/skills/verify/scripts/restore.mjs',
-])
+// The catalogue targets shipped fixes in the application, never the tooling
+// that verifies it. A killed run that left these files changed would leave the
+// recovery unable to recognise a leftover, and an inverted comparison in the
+// recovery would overwrite the operator's own work. The check is on the
+// resolved path, so no spelling of the same file slips past it.
+const SCRIPTS_DIR = path.resolve(REPO_ROOT, '.agents/skills/verify/scripts')
+
+function isProtectedFile(file) {
+  const target = path.resolve(REPO_ROOT, file)
+  return target === SCRIPTS_DIR || target.startsWith(SCRIPTS_DIR + path.sep)
+}
 
 // An anchor that is gone from the worktree but still in HEAD is what a killed
 // run leaves behind. An anchor that is gone from both was reverted in a commit,
@@ -54,7 +56,7 @@ function missingAnchorReason(mutation) {
 
 function inspect(mutation) {
   const target = path.join(REPO_ROOT, mutation.file)
-  if (PROTECTED_FILES.has(mutation.file)) {
+  if (isProtectedFile(mutation.file)) {
     return { usable: false, reason: "this file carries the driver's own recovery path and must not be mutated" }
   }
   if (!fs.existsSync(target)) return { usable: false, reason: `missing file ${mutation.file}` }
