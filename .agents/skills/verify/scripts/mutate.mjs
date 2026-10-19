@@ -21,7 +21,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
-import { restoreLeftoverMutations, readCommittedFile, findRevertedFixes, isProtectedFile, scriptsDir } from './restore.mjs'
+import { restoreLeftoverMutations, readCommittedFile, findRevertedFixes, isProtectedFile, scriptsAreDirty } from './restore.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -202,17 +202,6 @@ for (const signal of INTERRUPTS) {
 // The recovery runs code from the worktree. If the operator has uncommitted
 // edits to the scripts that carry it, that code is theirs and not the shipped
 // one, so the recovery is skipped rather than run against their other work.
-function scriptsAreDirty() {
-  try {
-    const out = execFileSync('git', ['status', '--porcelain', '--', path.relative(REPO_ROOT, scriptsDir(REPO_ROOT))], {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-    }).trim()
-    return out !== ''
-  } catch {
-    return false
-  }
-}
 
 // Say what the recovery found, in facts rather than guesses about who owns the
 // changes. A leftover that the operator has since edited no longer matches
@@ -238,7 +227,7 @@ function reportUnrecovered() {
 // The lock is re-checked before every write: a driver that lost the lock to a
 // takeover must not rewrite the file the new owner is mutating.
 let recovered = []
-if (scriptsAreDirty()) {
+if (scriptsAreDirty(REPO_ROOT)) {
   console.error('skipping the leftover recovery: the verification scripts have uncommitted changes, so the recovery is not the shipped one')
 } else {
   try {

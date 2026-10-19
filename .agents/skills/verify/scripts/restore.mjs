@@ -27,6 +27,23 @@ export function scriptsDir(repoRoot) {
   return path.resolve(repoRoot, '.agents/skills/verify/scripts')
 }
 
+// Whether the verification scripts have uncommitted changes. The recovery runs
+// code from the worktree, so when that code is the operator's uncommitted
+// version it is not the shipped recovery and must not be trusted with the
+// tree. Only tracked modifications count: a stray untracked file in the
+// directory does not change the code the recovery runs.
+export function scriptsAreDirty(repoRoot) {
+  try {
+    const out = execFileSync('git', ['status', '--porcelain', '--untracked-files=no', '--', path.relative(repoRoot, scriptsDir(repoRoot))], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    }).trim()
+    return out !== ''
+  } catch {
+    return false
+  }
+}
+
 // The files the mutation catalogue must not target. The suite is protected for
 // the same reason as the scripts: the driver reads it to decide whether a
 // mutation was caught, so an entry that deleted an assertion would unmake the

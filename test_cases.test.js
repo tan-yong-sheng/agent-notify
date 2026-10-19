@@ -40,7 +40,7 @@ import {
   nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
-import { findLeftoverMutations, restoreLeftoverMutations, findRevertedFixes, isProtectedFile } from './.agents/skills/verify/scripts/restore.mjs'
+import { findLeftoverMutations, restoreLeftoverMutations, findRevertedFixes, isProtectedFile, scriptsAreDirty } from './.agents/skills/verify/scripts/restore.mjs'
 import { MUTATIONS } from './.agents/skills/verify/scripts/mutations.mjs'
 import {
   normalizeAgentStatus,
@@ -1741,6 +1741,20 @@ async function runMutationRestoreTests() {
     const stopped = restoreLeftoverMutations({ repoRoot: dir, mutations, beforeWrite: () => false })
     assert(stopped.length === 0, 'a driver that lost the lock restores nothing')
     assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the lock is lost')
+
+    // The recovery runs code from the worktree, so it must not run against
+    // the operator's uncommitted version of that code. A stray untracked file
+    // in the directory does not change the code, so it does not count.
+    const scripts = path.join(dir, '.agents/skills/verify/scripts')
+    fs.mkdirSync(scripts, { recursive: true })
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), 'the shipped recovery\n')
+    execSync('git add .agents/skills/verify/scripts/restore.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m scripts', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    assert(scriptsAreDirty(dir) === false, 'a clean scripts directory is not dirty')
+    fs.writeFileSync(path.join(scripts, 'stray.mjs'), 'a stray file\n')
+    assert(scriptsAreDirty(dir) === false, 'an untracked file in the scripts directory does not make it dirty')
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), 'the operator is editing the recovery\n')
+    assert(scriptsAreDirty(dir) === true, "an edit to the recovery is the operator's code, not the shipped one")
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
