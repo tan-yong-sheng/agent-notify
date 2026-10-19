@@ -134,7 +134,7 @@ export function findLeftoverMutations({ repoRoot, mutations, cache }) {
     if (expected === null) continue
     const working = readWorkingFile(repoRoot, mutation.file)
     if (working === null) continue
-    if (working.equals(expected)) continue
+    if (!working.equals(expected)) continue
     leftovers.push({ id: mutation.id, file: mutation.file, committed, expected, mutation })
   }
   return leftovers
