@@ -1266,12 +1266,135 @@ async function runDashboardUnitTests() {
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 
+// The Orca CLI shim lives in Orca's config dir, not /usr/bin, and a service does
+// not inherit the PATH an Orca pane injects. Without that directory the name
+// resolves to GNOME's screen reader, which rejects `worktree ps --json`.
+function orcaShimDir() {
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'orca', 'linux-orca-cli-shim')
+}
+
+function shimOutranksUsrBin(dirs, shimDir) {
+  const bin = dirs.indexOf('/usr/bin')
+  return bin === -1 || dirs.indexOf(shimDir) < bin
+}
+
+// DEFAULT_EXTRA_DIRS is built at import time, so a config home other than the real
+// one needs its own module instance: the query string keeps the two apart.
+async function extendedPathWithConfigHome(configHome) {
+  const saved = process.env.XDG_CONFIG_HOME
+  process.env.XDG_CONFIG_HOME = configHome
+  try {
+    const env = await import(`./shared/env.mjs?configHome=${encodeURIComponent(configHome)}`)
+    return { dirs: env.getExtendedPathEnv().PATH.split(path.delimiter) }
+  } finally {
+    if (saved === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = saved
+  }
+}
+
+async function runOrcaDiscoveryTests() {
+  console.log('\nRunning Orca CLI discovery tests...\n')
+
+  // A fake config home, so the assertions do not depend on Orca being installed.
+  const installed = fs.mkdtempSync(path.join(os.tmpdir(), 'orca-config-'))
+  const installedShim = path.join(installed, 'orca', 'linux-orca-cli-shim')
+  fs.mkdirSync(installedShim, { recursive: true })
+  try {
+    const { dirs } = await extendedPathWithConfigHome(installed)
+    assert(dirs.includes(installedShim), 'the extended PATH knows where the Orca CLI shim lives')
+    assert(shimOutranksUsrBin(dirs, installedShim), 'the Orca shim outranks /usr/bin/orca, the GNOME screen reader')
+  } finally {
+    fs.rmSync(installed, { recursive: true, force: true })
+  }
+
+  const missing = fs.mkdtempSync(path.join(os.tmpdir(), 'orca-config-'))
+  try {
+    const { dirs } = await extendedPathWithConfigHome(missing)
+    assert(!dirs.includes(path.join(missing, 'orca', 'linux-orca-cli-shim')), 'a missing Orca shim dir is not put on PATH')
+  } finally {
+    fs.rmSync(missing, { recursive: true, force: true })
+  }
+
+  // And the shim this machine really has, if it has one.
+  const realShim = orcaShimDir()
+  if (fs.existsSync(realShim)) {
+    assert(shimOutranksUsrBin(getExtendedPathEnv().PATH.split(path.delimiter), realShim), 'the installed Orca shim also outranks /usr/bin')
+  }
+}
+
+function pidIsAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// A status CLI that ignores SIGTERM must not stall the snapshot: execFile's
+// timeout has to kill it outright, not ask it to stop and then wait for it.
+function slowStatusCli(dir) {
+  const cli = path.join(dir, 'orca')
+  const pidFile = path.join(dir, 'orca.pid')
+  fs.writeFileSync(cli, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\ntrap '' TERM\nexec sleep 30\n`)
+  fs.chmodSync(cli, 0o755)
+  const runner = path.join(dir, 'collect.mjs')
+  fs.writeFileSync(
+    runner,
+    `import { collectLiveState } from ${JSON.stringify(catalogPath)}\nconst state = await collectLiveState()\nconsole.log(JSON.stringify(state.sources))\n`
+  )
+  // HOME and XDG_CONFIG_HOME point at the temp dir so the real Orca shim is not
+  // put ahead of the fake one: this test is about the timeout, not discovery.
+  return {
+    runner,
+    pidFile,
+    env: {
+      ...process.env,
+      HOME: dir,
+      XDG_CONFIG_HOME: path.join(dir, 'config'),
+      PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+    },
+  }
+}
+
+async function runStatusCommandTimeoutTests() {
+  console.log('\nRunning status command timeout tests...\n')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orca-slow-cli-'))
+  try {
+    const { runner, pidFile, env } = slowStatusCli(dir)
+    const started = Date.now()
+    let stdout = ''
+    let error = ''
+    try {
+      stdout = execFileSync(process.execPath, [runner], { encoding: 'utf8', timeout: 20000, env })
+    } catch (err) {
+      error = err.message.split('\n')[0]
+    }
+    const elapsed = Date.now() - started
+    assert(
+      !error && elapsed < 15000,
+      `a status CLI that ignores SIGTERM does not stall the snapshot (${error || `${elapsed}ms`})`
+    )
+    let sources = null
+    try {
+      sources = JSON.parse(stdout.trim().split('\n').pop())
+    } catch {}
+    assert(sources?.orca?.available === false, 'an unresponsive status CLI is reported as unavailable, not as empty')
+    const childPid = Number((fs.existsSync(pidFile) ? fs.readFileSync(pidFile, 'utf8') : '').trim())
+    assert(childPid > 0 && !pidIsAlive(childPid), 'the hung status CLI is killed outright, not asked to stop')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 async function main() {
   runIntegrationTests()
   await runUnitTests()
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
   await runDashboardUnitTests()
+  await runOrcaDiscoveryTests()
+  await runStatusCommandTimeoutTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {

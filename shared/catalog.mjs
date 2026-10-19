@@ -16,7 +16,7 @@ function execCommand(cmd, args, timeoutMs = 3000) {
     execFile(
       cmd,
       args,
-      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_COMMAND_OUTPUT_BYTES, env: execEnv },
+      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_COMMAND_OUTPUT_BYTES, env: execEnv, killSignal: 'SIGKILL' },
       (err, stdout) => {
         if (err) return resolve({ ok: false, error: err.message, data: null })
         try {

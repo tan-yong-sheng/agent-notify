@@ -1,6 +1,7 @@
 // ─── .env file parser ────────────────────────────────────────────────────────
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 function stripQuotes(value) {
@@ -32,7 +33,18 @@ export function loadEnv(filePath) {
   return env
 }
 
-const DEFAULT_EXTRA_DIRS = ['/home/linuxbrew/.linuxbrew/bin', '/usr/local/bin', '/opt/homebrew/bin']
+const configHome = () => process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config')
+
+// Orca installs its CLI shim in its config dir, not in /usr/bin, and a service does
+// not inherit the PATH an Orca pane injects. Without this entry `orca` resolves to
+// GNOME's screen reader, which shares the name and rejects `worktree ps --json`,
+// so Orca agents disappear from the dashboard exactly when it runs as a service.
+const DEFAULT_EXTRA_DIRS = [
+  '/home/linuxbrew/.linuxbrew/bin',
+  '/usr/local/bin',
+  '/opt/homebrew/bin',
+  path.join(configHome(), 'orca', 'linux-orca-cli-shim'),
+]
 
 // Builds process.env with common binary directories prepended to PATH if they exist.
 export function getExtendedPathEnv(extraDirs) {

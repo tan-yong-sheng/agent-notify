@@ -206,4 +206,20 @@ export const MUTATIONS = [
     replace: "  return { ...getExtendedPathEnv(), GIT_TERMINAL_PROMPT: '0' }",
     expectTest: 'nonInteractiveGitEnv clears GIT_ASKPASS',
   },
+  {
+    id: 'orca-shim-dropped-from-path',
+    file: 'shared/env.mjs',
+    description: 'the extended PATH forgets where the Orca CLI shim lives',
+    find: "  path.join(configHome(), 'orca', 'linux-orca-cli-shim'),\n",
+    replace: '',
+    expectTest: 'the extended PATH knows where the Orca CLI shim lives',
+  },
+  {
+    id: 'status-cli-timeout-asks-nicely',
+    file: 'shared/catalog.mjs',
+    description: 'a status CLI that ignores SIGTERM stalls the whole snapshot',
+    find: "env: execEnv, killSignal: 'SIGKILL' }",
+    replace: 'env: execEnv }',
+    expectTest: 'a status CLI that ignores SIGTERM does not stall the snapshot',
+  },
 ]
