@@ -1823,6 +1823,14 @@ function runMutationProtectionTests() {
   assert(isProtectedFile(repoRoot, './.agents/skills/verify/scripts/lib.mjs') === true, 'a protected file is protected however it is spelled')
   assert(isProtectedFile(repoRoot, 'test_cases.test.js') === true, 'the suite the driver reads is protected')
   assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts-evil/x.mjs') === false, 'a directory that only shares a prefix is not protected')
+  // The case of the spelling must not decide the answer: a catalogue entry
+  // that spells a protected file in a different case reaches the very same
+  // file on a case-insensitive filesystem, and the guard has to hold on
+  // every filesystem rather than only where the filesystem itself folds case.
+  assert(isProtectedFile(repoRoot, 'TEST_CASES.TEST.JS') === true, 'the suite is protected however its case is spelled')
+  assert(isProtectedFile(repoRoot, '.AGENTS/SKILLS/VERIFY/SCRIPTS/RESTORE.MJS') === true, 'the recovery module is protected however its case is spelled')
+  assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts/LEFTOVER.MJS') === true, 'the read-only half of the recovery is protected too')
+  assert(isProtectedFile(repoRoot, 'Shared/Service.mjs') === false, 'the application code is not protected however its case is spelled')
 
   const reachable = MUTATIONS.filter((m) => isProtectedFile(repoRoot, m.file))
   assert(reachable.length === 0, 'no catalogue entry reaches the recovery path or the suite')
@@ -1840,6 +1848,8 @@ function runMutationProtectionTests() {
     fs.writeFileSync(path.join(dir, 'test_cases.test.js'), 'the suite\n')
     fs.symlinkSync(path.join('..', 'test_cases.test.js'), path.join(dir, 'shared', 'suite.mjs'))
     assert(isProtectedFile(dir, 'shared/suite.mjs') === true, 'a symlink to the suite is protected')
+    fs.symlinkSync(path.join('..', '.agents', 'skills', 'verify', 'scripts', 'RESTORE.MJS'), path.join(dir, 'shared', 'shouty.mjs'))
+    assert(isProtectedFile(dir, 'shared/shouty.mjs') === true, 'a symlink to the recovery is protected however its case is spelled')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

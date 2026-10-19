@@ -32,25 +32,55 @@ const SCRIPTS_REL = path.join('.agents', 'skills', 'verify', 'scripts')
 const SUITE_REL = 'test_cases.test.js'
 
 // The real path of a file, with symlinks resolved. A path that does not exist
-// on disk keeps its resolved path, because there is nothing on disk to
-// canonicalise.
+// on disk keeps the canonical form of the directory that holds it, so a
+// differently cased spelling of a file is still compared against the same
+// directory the protected files live in. A symlink is followed even when its
+// target is missing, because a link to a protected file reaches it just as
+// well as the file itself does.
 function canonicalPath(repoRoot, target) {
-  const abs = path.resolve(repoRoot, target)
-  try {
-    return fs.realpathSync(abs)
-  } catch {
-    return abs
+  return resolvePath(path.resolve(repoRoot, target), [], 0)
+}
+
+function resolvePath(abs, tail, depth) {
+  const parts = [...tail]
+  let current = abs
+  for (;;) {
+    let link = null
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) link = fs.readlinkSync(current)
+    } catch {}
+    if (link !== null) {
+      // A link that points at itself must not spin forever.
+      if (depth > 8) return abs
+      return resolvePath(path.resolve(path.dirname(current), link), parts, depth + 1)
+    }
+    try {
+      const real = fs.realpathSync(current)
+      return parts.length ? path.join(real, ...parts) : real
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return abs
+      parts.unshift(path.basename(current))
+      current = parent
+    }
   }
 }
 
-// Two paths name the same file when they are the same string.
+// Two paths name the same file when they are the same string or the same
+// string in a different case. The case-insensitive half is deliberate: a
+// catalogue entry that spells a protected file with a different case reaches
+// the very same file on a case-insensitive filesystem, and the guard must not
+// depend on which filesystem the operator happens to run on. Comparing the
+// case-folded paths refuses that spelling everywhere, which is the safe side
+// to err on: a file the driver refuses to mutate is never a wrong refusal
+// that costs the operator anything.
 function samePath(a, b) {
-  return a === b
+  return a === b || a.toLowerCase() === b.toLowerCase()
 }
 
-// Whether a path lies inside a directory.
+// Whether a path lies inside a directory, compared the same way.
 function isUnder(child, parent) {
-  return child.startsWith(parent + path.sep)
+  return child.toLowerCase().startsWith(parent.toLowerCase() + path.sep.toLowerCase())
 }
 
 // The files the mutation catalogue must not target. The suite is protected for
