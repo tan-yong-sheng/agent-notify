@@ -146,7 +146,7 @@ export function isDirty(dir = REPO_ROOT, { trackedOnly = false } = {}) {
   try {
     const args = ['status', '--porcelain']
     if (trackedOnly) args.push('--untracked-files=no')
-    return execFileSync('git', args, { cwd: dir }).toString().trim() !== ''
+    return execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() !== ''
   } catch {
     return null
   }
