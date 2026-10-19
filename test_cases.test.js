@@ -40,9 +40,9 @@ import {
   nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
-import { findLeftoverMutations, findRevertedFixes, isProtectedFile } from './.agents/skills/verify/scripts/leftover.mjs'
+import { findLeftoverMutations, findRevertedFixes } from './.agents/skills/verify/scripts/leftover.mjs'
 import { restoreLeftoverMutations } from './.agents/skills/verify/scripts/restore.mjs'
-import { isDirty } from './.agents/skills/verify/scripts/lib.mjs'
+import { isDirty, isProtectedFile } from './.agents/skills/verify/scripts/lib.mjs'
 import { MUTATIONS } from './.agents/skills/verify/scripts/mutations.mjs'
 import {
   normalizeAgentStatus,
@@ -1874,6 +1874,12 @@ async function runMutationRestoreCommandTests() {
   const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
   const source = committedFile(repoRoot, 'shared/service.mjs')
   const shippedRestore = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/restore.mjs'), 'utf8')
+  const shippedLeftover = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/leftover.mjs'), 'utf8')
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-marker-'))
+  const marker = path.join(markerDir, 'loaded')
+  // A copy of the deciding half that writes a file the moment it is
+  // evaluated, so a test can see when it was loaded.
+  const markOnLoad = (text) => `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(marker)}, 'loaded')\n${text}`
 
   const runIn = (root, args) => {
     try {
@@ -1949,6 +1955,36 @@ async function runMutationRestoreCommandTests() {
     assert(brokenRecovery.out.includes('SyntaxError') === false, 'the driver does not evaluate the recovery before the guard has passed')
     assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the recovery cannot be loaded')
     fs.writeFileSync(path.join(scripts, 'restore.mjs'), shippedRestore)
+
+    // The deciding half of the recovery is loaded under the same guard as the
+    // writing half. A copy that marks the moment it is evaluated proves the
+    // ordering from both sides: the marker is there once the guard has passed,
+    // and it is absent when the guard refused.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), markOnLoad(shippedLeftover))
+    execSync('git add .agents/skills/verify/scripts/leftover.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m marker', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    const guarded = run(['--restore'])
+    assert(guarded.code === 0, 'the driver runs when the guard has passed')
+    assert(fs.existsSync(marker), 'the deciding half of the recovery is loaded once the guard has passed')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the deciding half of the recovery finds the leftover')
+    fs.rmSync(marker, { force: true })
+
+    // The same copy with an uncommitted change on top: the guard refuses, and
+    // the deciding half is never evaluated, so it never gets to say which of
+    // the operator's files would be overwritten.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), `${markOnLoad(shippedLeftover)}\n// the operator is editing the recovery\n`)
+    const refusedLoad = run(['--restore'])
+    assert(refusedLoad.code === 2, 'the driver exits 2 when the recovery path is not the shipped one')
+    assert(refusedLoad.out.includes('the verification scripts have uncommitted changes'), 'the driver says why it skipped the recovery')
+    assert(fs.existsSync(marker) === false, 'the deciding half of the recovery is not evaluated before the guard has passed')
+
+    // A deciding half that does not even parse must not kill the driver: it
+    // is never reached, because the guard refuses it first.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), 'export const broken = (\n')
+    const brokenLeftover = run(['--restore'])
+    assert(brokenLeftover.code === 2, 'the driver exits 2 rather than dying on a deciding half it must not run')
+    assert(brokenLeftover.out.includes('SyntaxError') === false, 'the driver does not evaluate the deciding half before the guard has passed')
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), shippedLeftover)
 
     // A git failure is an unknown state, not a clean one: the driver refuses
     // rather than guessing whether the recovery path is the shipped one.

@@ -19,9 +19,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
+import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences, readCommittedFile, isProtectedFile } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
-import { readCommittedFile, findRevertedFixes, isProtectedFile } from './leftover.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -225,8 +224,16 @@ for (const signal of INTERRUPTS) {
 // Say what the recovery found, in facts rather than guesses about who owns the
 // changes. A leftover that the operator has since edited no longer matches
 // byte for byte, so it is named as a reverted fix instead of being claimed.
+//
+// The naming lives in the recovery path, so it is only available when the
+// guard let that path load. When the guard refused, the driver says so rather
+// than naming files from code it did not trust.
 function reportUnrecovered() {
-  const reverted = findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS, cache: committedCache })
+  if (!leftoverModule) {
+    console.error('           the recovery path was not loaded, so the files that look reverted are not named')
+    return
+  }
+  const reverted = leftoverModule.findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS, cache: committedCache })
   if (!reverted.length) {
     console.error('           no file matches a leftover of a killed mutation run exactly')
     return
@@ -259,14 +266,20 @@ function reportUnrecovered() {
 // A git failure is not a clean tree, so the driver refuses rather than
 // guessing.
 //
-// Only once the guard has passed is the writing half of the recovery loaded,
-// and it is loaded with a dynamic import: a static import would evaluate the
-// operator's uncommitted restore.mjs before the guard had a say, so the
-// recovery would run code it just refused to trust. The read-only half lives
-// in leftover.mjs and is loaded with the driver, because it cannot write.
+// Only once the guard has passed is the recovery path loaded, and it is
+// loaded with a dynamic import: a static import would evaluate the operator's
+// uncommitted leftover.mjs or restore.mjs before the guard had a say, so the
+// recovery would run code it just refused to trust. Both halves are behind
+// the guard, not just the writing one, because the reading half decides which
+// of the operator's files the recovery would overwrite.
+//
+// The driver's own plumbing — the guard itself included — is loaded with the
+// driver, because a guard that lived inside the code it guards could be
+// edited away by the very operator it is meant to hold back.
 const committedCache = new Map()
 let recovered = { restored: [], skipped: [] }
 let recoverySkipped = false
+let leftoverModule = null
 const scriptsPath = path.relative(REPO_ROOT, path.join(SKILL_ROOT, 'scripts'))
 const scriptsState = isDirty(REPO_ROOT, { trackedOnly: true, paths: [scriptsPath] })
 if (scriptsState === true) {
@@ -279,6 +292,7 @@ if (scriptsState === true) {
 } else {
   let restoreLeftoverMutations
   try {
+    leftoverModule = await import('./leftover.mjs')
     ;({ restoreLeftoverMutations } = await import('./restore.mjs'))
   } catch (err) {
     console.error(`refusing to run: could not load the leftover recovery (${err.message})`)

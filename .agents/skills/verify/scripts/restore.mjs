@@ -10,7 +10,9 @@
 // it dynamically, and only after it has asked git whether the recovery path
 // still holds the committed code: an operator's uncommitted version of this
 // file is their code, not the shipped recovery, and must not be run against
-// their other work. The read-only half of the recovery lives in leftover.mjs.
+// their other work. The deciding half of the recovery lives in leftover.mjs
+// and is loaded under the same guard, because it decides which of the
+// operator's files would be overwritten.
 //
 // The leftover is recognisable exactly: the working file holds byte-for-byte
 // what one catalogue mutation produces from the committed file. A file that
@@ -25,7 +27,8 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { findLeftoverMutations, readCommittedFile, readWorkingFile, expectedBytes } from './leftover.mjs'
+import { findLeftoverMutations, expectedBytes } from './leftover.mjs'
+import { readCommittedFile, readWorkingFile } from './lib.mjs'
 
 // Put the committed bytes back for every leftover found, and report the files
 // that were restored so the operator can see what changed.

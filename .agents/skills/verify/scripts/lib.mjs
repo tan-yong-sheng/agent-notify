@@ -143,18 +143,131 @@ export function gitHead(dir = REPO_ROOT) {
 }
 
 // Whether the worktree has changes, and whether any of them are in the given
-// paths. The answer is tri-state: true, false, or null when git could not be
-// read. An unknown state is not a clean one, so the caller must not act on
-// it as if the tree were untouched.
+// paths. The paths are resolved against `dir`, which is the directory the git
+// command runs in, so a caller passes the path the way git sees it from there.
+// The answer is tri-state: true, false, or null when git could not be read.
+// An unknown state is not a clean one, so the caller must not act on it as if
+// the tree were untouched.
 export function isDirty(dir = REPO_ROOT, { trackedOnly = false, paths = [] } = {}) {
   try {
     const args = ['status', '--porcelain']
     if (trackedOnly) args.push('--untracked-files=no')
-    if (paths.length) args.push('--', ...paths)
+    // An absolute pathspec means the same file whatever directory git is run
+    // in, so a caller cannot pass a path that git reads as somewhere else.
+    if (paths.length) args.push('--', ...paths.map((p) => path.resolve(dir, p)))
     return execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() !== ''
   } catch {
     return null
   }
+}
+
+// The committed content of a file as bytes, or null when there is none: the
+// file is untracked, or the repository has no commit yet.
+//
+// A `cache` map of file to content keeps a run from asking git for the same
+// file once per catalogue entry.
+export function readCommittedFile(repoRoot, file, cache) {
+  if (cache) {
+    if (cache.has(file)) return cache.get(file)
+    const content = readCommittedFileUncached(repoRoot, file)
+    cache.set(file, content)
+    return content
+  }
+  return readCommittedFileUncached(repoRoot, file)
+}
+
+// The bytes the working file holds right now, or null when it cannot be read.
+export function readWorkingFile(repoRoot, file) {
+  try {
+    return fs.readFileSync(path.join(repoRoot, file))
+  } catch {
+    return null
+  }
+}
+
+function readCommittedFileUncached(repoRoot, file) {
+  try {
+    return execFileSync('git', ['show', `HEAD:${file}`], {
+      cwd: repoRoot,
+          stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return null
+  }
+}
+
+// The directory holding the verification scripts, and the suite the mutation
+// driver reads to decide whether a mutation was caught.
+const SCRIPTS_REL = path.join('.agents', 'skills', 'verify', 'scripts')
+const SUITE_REL = 'test_cases.test.js'
+
+// The real path of a file, with symlinks resolved. A path that does not exist
+// on disk keeps the canonical form of the directory that holds it, so a
+// differently cased spelling of a file is still compared against the same
+// directory the protected files live in. A symlink is followed even when its
+// target is missing, because a link to a protected file reaches it just as
+// well as the file itself does.
+function canonicalPath(repoRoot, target) {
+  return resolvePath(path.resolve(repoRoot, target), [], 0)
+}
+
+function resolvePath(abs, tail, depth) {
+  const parts = [...tail]
+  let current = abs
+  for (;;) {
+    let link = null
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) link = fs.readlinkSync(current)
+    } catch {}
+    if (link !== null) {
+      // A link that points at itself must not spin forever.
+      if (depth > 8) return abs
+      return resolvePath(path.resolve(path.dirname(current), link), parts, depth + 1)
+    }
+    try {
+      const real = fs.realpathSync(current)
+      return parts.length ? path.join(real, ...parts) : real
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return abs
+      parts.unshift(path.basename(current))
+      current = parent
+    }
+  }
+}
+
+// Two paths name the same file when they are the same string or the same
+// string in a different case. The case-insensitive half is deliberate: a
+// catalogue entry that spells a protected file with a different case reaches
+// the very same file on a case-insensitive filesystem, and the guard must not
+// depend on which filesystem the operator happens to run on. Comparing the
+// case-folded paths refuses that spelling everywhere, which is the safe side
+// to err on: a file the driver refuses to mutate is never a wrong refusal
+// that costs the operator anything.
+function samePath(a, b) {
+  return a === b || a.toLowerCase() === b.toLowerCase()
+}
+
+// Whether a path lies inside a directory, compared the same way.
+function isUnder(child, parent) {
+  return child.toLowerCase().startsWith(parent.toLowerCase() + path.sep.toLowerCase())
+}
+
+// The files the mutation catalogue must not target. The suite is protected for
+// the same reason as the scripts: the driver reads it to decide whether a
+// mutation was caught, so an entry that deleted an assertion would unmake the
+// proof.
+//
+// The comparison is on the canonical path, so a symlink to a protected file is
+// the protected file, and it folds case, so a differently cased spelling is
+// refused on every filesystem rather than only where the filesystem itself
+// folds case.
+export function isProtectedFile(repoRoot, file) {
+  const scripts = canonicalPath(repoRoot, SCRIPTS_REL)
+  const suite = canonicalPath(repoRoot, SUITE_REL)
+  const target = canonicalPath(repoRoot, file)
+  if (samePath(target, suite) || samePath(target, scripts)) return true
+  return isUnder(target, scripts)
 }
 
 // One report per driver: every check prints the same way, evidence is written

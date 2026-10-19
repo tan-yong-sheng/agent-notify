@@ -9,131 +9,21 @@
 // what one catalogue mutation produces from the committed file. A file that
 // differs in any other way is not a leftover.
 //
-// This module only reads. It decides nothing and writes nothing, so the
-// driver may load it before it has judged the worktree. The half that writes
-// lives in restore.mjs, and the driver loads that only after it has proved,
-// from git, that the recovery path is the committed code and not the
-// operator's uncommitted version of it.
+// This module is the decision half of the recovery: it decides which working
+// files the recovery would overwrite, so it sits on the recovery path and the
+// driver loads it only after git has confirmed that the recovery path still
+// holds the committed code. A static import would evaluate an operator's
+// uncommitted version of this file before the guard had a say, and that
+// version would then decide which of their files to overwrite. The writing
+// half lives in restore.mjs, and the driver loads that under the same guard.
 //
 // The mutation catalogue must not target this directory. A killed run that
 // left these files mutated would leave the recovery unable to recognise a
 // leftover, and an inverted comparison here would make the recovery overwrite
-// the operator's own work. The rule and the code it protects both live under
-// the scripts directory, so the catalogue cannot reach either.
+// the operator's own work. The rule lives in lib.mjs, under the same
+// directory, so the catalogue cannot reach the rule or the code it protects.
 
-import fs from 'node:fs'
-import path from 'node:path'
-import { execFileSync } from 'node:child_process'
-import { countOccurrences } from './lib.mjs'
-
-// The directory holding the verification scripts, and the suite the driver
-// reads to decide whether a mutation was caught.
-const SCRIPTS_REL = path.join('.agents', 'skills', 'verify', 'scripts')
-const SUITE_REL = 'test_cases.test.js'
-
-// The real path of a file, with symlinks resolved. A path that does not exist
-// on disk keeps the canonical form of the directory that holds it, so a
-// differently cased spelling of a file is still compared against the same
-// directory the protected files live in. A symlink is followed even when its
-// target is missing, because a link to a protected file reaches it just as
-// well as the file itself does.
-function canonicalPath(repoRoot, target) {
-  return resolvePath(path.resolve(repoRoot, target), [], 0)
-}
-
-function resolvePath(abs, tail, depth) {
-  const parts = [...tail]
-  let current = abs
-  for (;;) {
-    let link = null
-    try {
-      if (fs.lstatSync(current).isSymbolicLink()) link = fs.readlinkSync(current)
-    } catch {}
-    if (link !== null) {
-      // A link that points at itself must not spin forever.
-      if (depth > 8) return abs
-      return resolvePath(path.resolve(path.dirname(current), link), parts, depth + 1)
-    }
-    try {
-      const real = fs.realpathSync(current)
-      return parts.length ? path.join(real, ...parts) : real
-    } catch {
-      const parent = path.dirname(current)
-      if (parent === current) return abs
-      parts.unshift(path.basename(current))
-      current = parent
-    }
-  }
-}
-
-// Two paths name the same file when they are the same string or the same
-// string in a different case. The case-insensitive half is deliberate: a
-// catalogue entry that spells a protected file with a different case reaches
-// the very same file on a case-insensitive filesystem, and the guard must not
-// depend on which filesystem the operator happens to run on. Comparing the
-// case-folded paths refuses that spelling everywhere, which is the safe side
-// to err on: a file the driver refuses to mutate is never a wrong refusal
-// that costs the operator anything.
-function samePath(a, b) {
-  return a === b || a.toLowerCase() === b.toLowerCase()
-}
-
-// Whether a path lies inside a directory, compared the same way.
-function isUnder(child, parent) {
-  return child.toLowerCase().startsWith(parent.toLowerCase() + path.sep.toLowerCase())
-}
-
-// The files the mutation catalogue must not target. The suite is protected for
-// the same reason as the scripts: the driver reads it to decide whether a
-// mutation was caught, so an entry that deleted an assertion would unmake the
-// proof.
-//
-// The comparison is on the canonical path, so a symlink to a protected file is
-// the protected file, and it folds case, so a differently cased spelling is
-// refused on every filesystem rather than only where the filesystem itself
-// folds case.
-export function isProtectedFile(repoRoot, file) {
-  const scripts = canonicalPath(repoRoot, SCRIPTS_REL)
-  const suite = canonicalPath(repoRoot, SUITE_REL)
-  const target = canonicalPath(repoRoot, file)
-  if (samePath(target, suite) || samePath(target, scripts)) return true
-  return isUnder(target, scripts)
-}
-
-// The committed content of a file as bytes, or null when there is none: the
-// file is untracked, or the repository has no commit yet.
-//
-// A `cache` map of file to content keeps a run from asking git for the same
-// file once per catalogue entry.
-export function readCommittedFile(repoRoot, file, cache) {
-  if (cache) {
-    if (cache.has(file)) return cache.get(file)
-    const content = readCommittedFileUncached(repoRoot, file)
-    cache.set(file, content)
-    return content
-  }
-  return readCommittedFileUncached(repoRoot, file)
-}
-
-function readCommittedFileUncached(repoRoot, file) {
-  try {
-    return execFileSync('git', ['show', `HEAD:${file}`], {
-      cwd: repoRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-  } catch {
-    return null
-  }
-}
-
-// The bytes the working file holds right now, or null when it cannot be read.
-export function readWorkingFile(repoRoot, file) {
-  try {
-    return fs.readFileSync(path.join(repoRoot, file))
-  } catch {
-    return null
-  }
-}
+import { countOccurrences, isProtectedFile, readCommittedFile, readWorkingFile } from './lib.mjs'
 
 // The bytes a mutation leaves behind: the committed content with the
 // mutation's find replaced by its replacement, exactly as the driver writes
