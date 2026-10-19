@@ -16,3 +16,6 @@ coverage-v8/
 
 # Verification run output (regenerate with .agents/skills/verify)
 .agents/skills/verify/artifacts/
+
+# A leftover of an interrupted restore, swept away by the next run
+*.restore-tmp

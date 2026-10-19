@@ -40,7 +40,7 @@ import {
   nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
-import { findLeftoverMutations, restoreLeftoverMutations } from './.agents/skills/verify/scripts/restore.mjs'
+import { findLeftoverMutations, restoreLeftoverMutations, findRevertedFixes, isProtectedFile } from './.agents/skills/verify/scripts/restore.mjs'
 import { MUTATIONS } from './.agents/skills/verify/scripts/mutations.mjs'
 import {
   normalizeAgentStatus,
@@ -1727,9 +1727,39 @@ async function runMutationRestoreTests() {
     assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'a leftover the operator edited is not a leftover any more')
     assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'a leftover the operator edited is not restored over their work')
     assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === edited, "the operator's edit in the leftover file survives")
+
+    // The same file is named as a reverted fix, so the driver can tell the
+    // operator which file to look at instead of leaving them to guess.
+    const reverted = findRevertedFixes({ repoRoot: dir, mutations })
+    assert(reverted.length === 1, 'a leftover with an edit on top is named as a reverted fix')
+    assert(reverted[0]?.file === entry.file, 'the reverted fix names the file it is in')
+    assert(reverted[0]?.id === entry.id, 'the reverted fix names the fix that is missing')
+
+    // A driver that lost the lock must not write: the lock is re-checked
+    // before every write, and a takeover means another driver owns the tree.
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const stopped = restoreLeftoverMutations({ repoRoot: dir, mutations, beforeWrite: () => false })
+    assert(stopped.length === 0, 'a driver that lost the lock restores nothing')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the lock is lost')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+}
+
+// The catalogue must not reach the recovery path. A killed run that left the
+// recovery mutated would leave it unable to recognise a leftover, and an
+// inverted comparison there would overwrite the operator's own work.
+function runMutationProtectionTests() {
+  console.log('\nRunning mutation catalogue protection tests...\n')
+
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  assert(isProtectedFile(repoRoot, 'shared/service.mjs') === false, 'the application code is not protected')
+  assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts/restore.mjs') === true, 'the recovery module is protected')
+  assert(isProtectedFile(repoRoot, './.agents/skills/verify/scripts/lib.mjs') === true, 'a protected file is protected however it is spelled')
+  assert(isProtectedFile(repoRoot, 'test_cases.test.js') === true, 'the suite the driver reads is protected')
+
+  const reachable = MUTATIONS.filter((m) => isProtectedFile(repoRoot, m.file))
+  assert(reachable.length === 0, 'no catalogue entry reaches the recovery path or the suite')
 }
 
 async function main() {
@@ -1743,6 +1773,7 @@ async function main() {
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
   await runMutationRestoreTests()
+  runMutationProtectionTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {
