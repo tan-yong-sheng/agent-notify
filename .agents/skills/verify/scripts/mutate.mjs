@@ -611,6 +611,16 @@ try {
       report.check(mutation.id, false, `cannot run: ${state.reason}`)
       continue
     }
+    // The driver writes the mutation into a tracked file, and it writes it
+    // there and nowhere else. A file the operator replaced with a link, or a
+    // directory above it replaced with one, would take the mutation
+    // somewhere the operator never asked for. The cleanliness check cannot
+    // be trusted to catch that: it asks git, and git honours the index's
+    // assume-unchanged bit.
+    if (!writeTargetIsSafe(state.target)) {
+      report.check(mutation.id, false, `cannot run: ${path.relative(REPO_ROOT, state.target)} is not a plain file inside the repository`)
+      continue
+    }
     if (!touched.has(state.target)) touched.set(state.target, state.source)
     const started = Date.now()
     let output = ''

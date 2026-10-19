@@ -2263,9 +2263,13 @@ async function runMutationRestoreCommandTests() {
     const linked = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-linked-'))
     const victimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-victim-'))
     try {
-      makeRepo(linked)
+      const linkedScripts = makeRepo(linked)
       const victim = path.join(victimDir, 'victim.txt')
-      fs.writeFileSync(victim, "the operator's own file\n")
+      // The link points at a copy of the file, so a write through it would
+      // show up, and the copy still holds the anchor, so the next mutation
+      // really does try to write there.
+      const victimBytes = `${source}\n// the operator's own file\n`
+      fs.writeFileSync(victim, victimBytes)
       // The suite the driver runs is replaced by one that swaps the mutated
       // file for a link, so the driver's own undo is the write under test.
       const mutated = path.join(linked, 'shared/service.mjs')
@@ -2277,11 +2281,33 @@ async function runMutationRestoreCommandTests() {
         `// ${entry.expectTest}`,
         '',
       ].join('\n'))
+      // Two mutations on the same file: the first one is undone through the
+      // link, and the second one finds the link where the file was.
+      fs.writeFileSync(path.join(linkedScripts, 'mutations.mjs'), `export const MUTATIONS = [
+  {
+    id: 'first-of-two',
+    file: 'shared/service.mjs',
+    description: 'the first of two mutations',
+    find: ${JSON.stringify(entry.find)},
+    replace: ${JSON.stringify(entry.replace)},
+    expectTest: ${JSON.stringify(entry.expectTest)},
+  },
+  {
+    id: 'second-of-two',
+    file: 'shared/service.mjs',
+    description: 'the second of two mutations',
+    find: ${JSON.stringify(entry.find)},
+    replace: ${JSON.stringify(entry.replace)},
+    expectTest: ${JSON.stringify(entry.expectTest)},
+  },
+]
+`)
       execSync('git add .', { cwd: linked, stdio: 'ignore', env: gitEnv })
       execSync('git commit -m linked', { cwd: linked, stdio: 'ignore', env: gitEnv })
-      const linkedRun = runIn(linked, ['--only', entry.id])
-      assert(fs.readFileSync(victim, 'utf8') === "the operator's own file\n", 'the driver does not write the file it mutated through a link')
+      const linkedRun = runIn(linked, [])
+      assert(fs.readFileSync(victim, 'utf8') === victimBytes, 'the driver does not write the file it mutated through a link')
       assert(linkedRun.out.includes('the path is not a plain file inside the repository'), 'the driver says it refused to write through a link')
+      assert(linkedRun.out.includes('cannot run: shared/service.mjs is not a plain file inside the repository'), 'the driver refuses to mutate a file that is a link')
     } finally {
       fs.rmSync(linked, { recursive: true, force: true })
       fs.rmSync(victimDir, { recursive: true, force: true })
