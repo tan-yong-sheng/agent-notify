@@ -6,10 +6,11 @@
 //
 // Also provides git-based update checks and one-command upgrades.
 
-import { execSync, execFileSync, execFile, spawn } from 'node:child_process'
+import { execSync, execFileSync, execFile, spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import readline from 'node:readline'
 import { getExtendedPathEnv } from './env.mjs'
 import { resolveDashboardPort } from './config.mjs'
 
@@ -402,7 +403,90 @@ const PLATFORM_SERVICES = {
   },
 }
 
-export function handleServiceCommand(argv, { port } = {}) {
+// ─── Tailscale serve integration ─────────────────────────────────────────────
+
+// Resolves the path of the tailscale CLI, or null if it is not on the extended PATH.
+export function resolveTailscaleBin() {
+  const env = getExtendedPathEnv()
+  for (const dir of (env.PATH || '').split(path.delimiter)) {
+    const candidate = path.join(dir, 'tailscale')
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate
+    } catch {}
+  }
+  return null
+}
+
+// Asks the user a y/N question synchronously on the controlling terminal.
+// Returns false immediately when stdin is not a TTY (non-interactive installs).
+function askYesNo(question) {
+  if (!process.stdin.isTTY) return Promise.resolve(false)
+  try {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    return new Promise((resolve) => {
+      rl.question(question, (answer) => {
+        rl.close()
+        resolve(answer.trim().toLowerCase() === 'y')
+      })
+    })
+  } catch {
+    return Promise.resolve(false)
+  }
+}
+
+// Enables `tailscale serve --bg <port>` so remote tailnet devices can reach the
+// dashboard. Returns the Tailscale HTTPS URL on success, or null on failure.
+export function enableTailscaleServe(tailscaleBin, port) {
+  try {
+    const result = spawnSync(tailscaleBin, ['serve', '--bg', String(port)], {
+      encoding: 'utf8',
+      env: getExtendedPathEnv(),
+    })
+    if (result.status !== 0) {
+      const detail = (result.stderr || result.stdout || '').trim().split('\n')[0]
+      console.warn(`\n⚠️  Tailscale serve failed: ${detail}\n   You can enable it manually: tailscale serve --bg ${port}\n`)
+      return null
+    }
+    // Build the URL from the node's MagicDNS name (always stable; serve status
+    // output format varies across versions and is empty until the serve is live).
+    const statusResult = spawnSync(tailscaleBin, ['status', '--self', '--json'], {
+      encoding: 'utf8',
+      env: getExtendedPathEnv(),
+    })
+    try {
+      const data = JSON.parse(statusResult.stdout || '{}')
+      const dnsName = (data?.Self?.DNSName || '').replace(/\.+$/, '')
+      return dnsName ? `https://${dnsName}` : null
+    } catch {
+      return null
+    }
+  } catch {
+    return null
+  }
+}
+
+// ─── Service command handler ──────────────────────────────────────────────────
+
+// Offers to expose the dashboard via Tailscale after a successful install.
+// Skipped when --no-tailscale is passed or tailscale is not on PATH.
+async function offerTailscaleServe(argv, port) {
+  if (argv.includes('--no-tailscale')) return
+  const tailscaleBin = resolveTailscaleBin()
+  if (!tailscaleBin) return
+  const yes = await askYesNo('Expose dashboard on your Tailscale network? [y/N]: ')
+  if (!yes) {
+    console.log(`   Tip: enable Tailscale access later with: tailscale serve --bg ${port}\n`)
+    return
+  }
+  const tsUrl = enableTailscaleServe(tailscaleBin, port)
+  if (tsUrl) {
+    console.log(`\n📡 Tailscale access enabled!`)
+    console.log(`   Remote URL: ${tsUrl}`)
+    console.log(`   To disable later: tailscale serve reset\n`)
+  }
+}
+
+export async function handleServiceCommand(argv, { port } = {}) {
   const serviceIndex = argv.indexOf('--service')
   if (serviceIndex === -1) return false
 
@@ -436,7 +520,10 @@ export function handleServiceCommand(argv, { port } = {}) {
     // should read as an error rather than a stack trace.
     console.error(`\n❌ Service ${action} failed: ${err.message}\n`)
     process.exitCode = 1
+    return true
   }
+
+  if (action === 'install') await offerTailscaleServe(argv, dashboardPort)
   return true
 }
 

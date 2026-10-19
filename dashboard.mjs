@@ -741,8 +741,8 @@ server.on('error', (err) => {
   process.exit(1)
 })
 
-export function handleCliCommands(argv = process.argv) {
-  if (handleServiceCommand(argv, { port: PORT })) return true
+export async function handleCliCommands(argv = process.argv) {
+  if (await handleServiceCommand(argv, { port: PORT })) return true
   if (handleUpdateCommand(argv)) return true
   return false
 }
@@ -762,15 +762,16 @@ export function isDirectInvocation(argv = process.argv, moduleUrl = import.meta.
 }
 
 if (isDirectInvocation(process.argv)) {
-  const handled = handleCliCommands(process.argv)
-  if (!handled) {
-    server.listen(PORT, '127.0.0.1', () => {
-      console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
-      console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
-      console.log(`   Press Ctrl+C to stop.\n`)
-      // Warms the 1h cache off the request path; the probe runs in a child
-      // process, so the first /api/update does not block agent polling.
-      checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV).catch(() => {})
-    })
-  }
+  handleCliCommands(process.argv).then((handled) => {
+    if (!handled) {
+      server.listen(PORT, '127.0.0.1', () => {
+        console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
+        console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
+        console.log(`   Press Ctrl+C to stop.\n`)
+        // Warms the 1h cache off the request path; the probe runs in a child
+        // process, so the first /api/update does not block agent polling.
+        checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV).catch(() => {})
+      })
+    }
+  })
 }

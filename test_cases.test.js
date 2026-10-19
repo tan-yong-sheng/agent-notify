@@ -60,6 +60,8 @@ import {
   fetchUpdateStatus,
   checkUpdateStatusAsync,
   nonInteractiveGitEnv,
+  resolveTailscaleBin,
+  enableTailscaleServe,
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
@@ -1101,6 +1103,48 @@ async function runDashboardUnitTests() {
     )
   }
   fs.rmSync(tmpRepoDir, { recursive: true, force: true })
+
+  // ── Tailscale serve helpers ──────────────────────────────────────────────
+  // resolveTailscaleBin finds a real binary when it is on PATH and returns null
+  // when it is absent. Verified with a fake directory to stay offline.
+  const tsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-ts-'))
+  const tsBinDir = path.join(tsHome, 'bin')
+  fs.mkdirSync(tsBinDir, { recursive: true })
+  const fakeTailscale = path.join(tsBinDir, 'tailscale')
+  fs.writeFileSync(fakeTailscale, '#!/bin/sh\necho ok\n', { mode: 0o755 })
+  const savedPathForTs = process.env.PATH
+  process.env.PATH = `${tsBinDir}${path.delimiter}${savedPathForTs}`
+  assert(resolveTailscaleBin() === fakeTailscale, 'resolveTailscaleBin finds a tailscale binary on PATH')
+  process.env.PATH = '/nonexistent-ts-dir'
+  assert(resolveTailscaleBin() === null, 'resolveTailscaleBin returns null when tailscale is absent')
+  process.env.PATH = savedPathForTs
+
+  // enableTailscaleServe runs the binary and captures the URL from `serve status`.
+  // A fake tailscale that prints a URL to status is enough to prove the happy path;
+  // a fake that exits 1 proves the graceful failure path.
+  const tsLog = path.join(tsHome, 'ts.log')
+  fs.writeFileSync(
+    fakeTailscale,
+    [
+      '#!/bin/sh',
+      `printf '%s\n' "$*" >> ${JSON.stringify(tsLog)}`,
+      '[ "$1" = status ] && printf \'{"Self":{"DNSName":"myhost.example.ts.net."}}\'  && exit 0',
+      'exit 0',
+      '',
+    ].join('\n'),
+    { mode: 0o755 }
+  )
+  const tsUrl = enableTailscaleServe(fakeTailscale, 4006)
+  const tsCalls = fs.readFileSync(tsLog, 'utf8')
+  assert(tsCalls.includes('serve --bg 4006'), 'enableTailscaleServe calls tailscale serve --bg <port>')
+  assert(tsCalls.includes('status --self --json'), 'enableTailscaleServe queries tailscale status --self --json for the hostname')
+  assert(tsUrl === 'https://myhost.example.ts.net', 'enableTailscaleServe returns the HTTPS URL (trailing dot stripped)')
+
+  fs.writeFileSync(fakeTailscale, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  const tsUrlFail = enableTailscaleServe(fakeTailscale, 4006)
+  assert(tsUrlFail === null, 'enableTailscaleServe returns null when tailscale exits non-zero')
+
+  fs.rmSync(tsHome, { recursive: true, force: true })
 
   // This check runs inside the HTTP server: git must never sit on a credential
   // prompt there. Proven against real git rather than asserted: without the
