@@ -41,6 +41,7 @@ import {
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
 import { findLeftoverMutations, restoreLeftoverMutations } from './.agents/skills/verify/scripts/restore.mjs'
+import { MUTATIONS } from './.agents/skills/verify/scripts/mutations.mjs'
 import {
   normalizeAgentStatus,
   parseHerdrAgent,
@@ -1682,32 +1683,50 @@ async function runMutationRestoreTests() {
     GIT_COMMITTER_NAME: 'test',
     GIT_COMMITTER_EMAIL: 'test@example.com',
   }
-  const committed = 'const answer = 42\n'
-  const mutations = [{ id: 'sample-mutation', file: 'sample.txt', find: 'const answer = 42', replace: 'const answer = 0' }]
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  // A real catalogue entry against a real shipped file: the recovery has to
+  // reproduce the bytes the driver would have written, and that is only
+  // meaningful with the catalogue's own find/replace and the shipped source.
+  const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
+  const source = fs.readFileSync(path.join(repoRoot, 'shared/service.mjs'), 'utf8')
+  const mutations = [entry]
 
   try {
     execSync('git init', { cwd: dir, stdio: 'ignore' })
-    fs.writeFileSync(path.join(dir, 'sample.txt'), committed)
-    execSync('git add sample.txt', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    fs.mkdirSync(path.join(dir, 'shared'))
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), source)
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'operator notes\n')
+    execSync('git add shared/service.mjs notes.txt', { cwd: dir, stdio: 'ignore', env: gitEnv })
     execSync('git commit -m init', { cwd: dir, stdio: 'ignore', env: gitEnv })
 
-    // The operator's own edit is not a leftover and must never be overwritten.
-    fs.writeFileSync(path.join(dir, 'sample.txt'), 'const answer = 43\n')
+    const leftover = source.replace(entry.find, entry.replace)
+    assert(leftover !== source, 'the catalogue entry still applies to the shipped file')
+
+    // The operator's own edit is not a leftover and must never be written to.
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'operator notes, in progress\n')
     assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'an unrelated edit is not mistaken for a leftover mutation')
     assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'an unrelated edit is not restored')
-    assert(fs.readFileSync(path.join(dir, 'sample.txt'), 'utf8') === 'const answer = 43\n', 'an unrelated edit is left alone')
+    assert(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8') === 'operator notes, in progress\n', 'an unrelated edit is left alone')
 
     // A run that was killed outright leaves the mutation applied.
-    fs.writeFileSync(path.join(dir, 'sample.txt'), 'const answer = 0\n')
-    const leftovers = findLeftoverMutations({ repoRoot: dir, mutations })
-    assert(leftovers.length === 1, 'a killed run leaves a recognisable leftover')
-    assert(leftovers[0].id === 'sample-mutation', 'the leftover names the mutation that was applied')
-    assert(leftovers[0].file === 'sample.txt', 'the leftover names the file it was applied to')
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const found = findLeftoverMutations({ repoRoot: dir, mutations })
+    assert(found.length === 1, 'a killed run leaves a recognisable leftover')
+    assert(found[0]?.id === entry.id, 'the leftover names the mutation that was applied')
+    assert(found[0]?.file === entry.file, 'the leftover names the file it was applied to')
 
     const restored = restoreLeftoverMutations({ repoRoot: dir, mutations })
     assert(restored.length === 1, 'the leftover is restored')
-    assert(fs.readFileSync(path.join(dir, 'sample.txt'), 'utf8') === committed, 'the committed content is put back')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the committed content is put back')
     assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'restoring twice changes nothing')
+
+    // A leftover the operator then edited no longer matches, so the recovery
+    // must leave it alone rather than undo the operator's work along with it.
+    const edited = `${leftover}\n// operator work in progress\n`
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), edited)
+    assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'a leftover the operator edited is not a leftover any more')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'a leftover the operator edited is not restored over their work')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === edited, "the operator's edit in the leftover file survives")
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

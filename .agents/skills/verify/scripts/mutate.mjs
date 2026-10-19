@@ -21,7 +21,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
-import { restoreLeftoverMutations } from './restore.mjs'
+import { restoreLeftoverMutations, readCommittedFile } from './restore.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -31,12 +31,36 @@ const runtime = flagValue(flags, 'runtime', 'node')
 const testFile = path.join(REPO_ROOT, 'test_cases.test.js')
 const testSource = fs.readFileSync(testFile, 'utf8')
 
+// The driver's own recovery path must not be mutated. A killed run that left
+// these files changed would leave the recovery unable to recognise a leftover,
+// and an inverted comparison in the recovery would overwrite the operator's own
+// work. The catalogue targets shipped fixes in the application, not the
+// tooling that verifies it, so the driver refuses such an entry outright.
+const PROTECTED_FILES = new Set([
+  '.agents/skills/verify/scripts/mutate.mjs',
+  '.agents/skills/verify/scripts/restore.mjs',
+])
+
+// An anchor that is gone from the worktree but still in HEAD is what a killed
+// run leaves behind. An anchor that is gone from both was reverted in a commit,
+// and no amount of restoring brings it back.
+function missingAnchorReason(mutation) {
+  const committed = readCommittedFile(REPO_ROOT, mutation.file)
+  if (committed !== null && countOccurrences(committed.toString('utf8'), mutation.find) === 0) {
+    return 'anchor not found in the worktree or in HEAD — this fix looks reverted in a commit; check git log for this file'
+  }
+  return 'anchor not found in the worktree — a killed mutation run may have replaced it; run with --restore'
+}
+
 function inspect(mutation) {
   const target = path.join(REPO_ROOT, mutation.file)
+  if (PROTECTED_FILES.has(mutation.file)) {
+    return { usable: false, reason: "this file carries the driver's own recovery path and must not be mutated" }
+  }
   if (!fs.existsSync(target)) return { usable: false, reason: `missing file ${mutation.file}` }
   const source = fs.readFileSync(target, 'utf8')
   const anchors = countOccurrences(source, mutation.find)
-  if (anchors === 0) return { usable: false, reason: 'anchor not found' }
+  if (anchors === 0) return { usable: false, reason: missingAnchorReason(mutation) }
   if (anchors > 1) return { usable: false, reason: `anchor appears ${anchors} times` }
   if (!testSource.includes(mutation.expectTest)) {
     return { usable: false, reason: `no test labelled "${mutation.expectTest}"` }
@@ -94,6 +118,10 @@ function readLockHolder(file = lockFile) {
   }
 }
 
+// The files this driver has mutated, with the content to put back. Declared
+// before the lock so the exit and signal handlers can reach it.
+const touched = new Map()
+
 // This driver edits tracked files in place, so two runs in one checkout race:
 // each restores the other's mutation and the evidence file is written twice.
 const lockFile = path.join(ARTIFACTS, '.mutate.lock')
@@ -139,9 +167,40 @@ if (readLockHolder()?.pid !== process.pid) {
   process.exit(2)
 }
 const releaseLock = () => {
+  // Only the holder may remove the lock: a driver that lost it to a takeover
+  // must not delete the new owner's.
+  if (readLockHolder()?.pid !== process.pid) return
   try {
     fs.rmSync(lockFile, { force: true })
   } catch {}
+}
+
+// The `finally` at the end of the run covers ordinary failures. A signal
+// arriving while the test child runs would skip it, so restore from the
+// in-memory copy on the way out. These handlers are registered before the
+// leftover recovery, so an interrupt during the recovery still releases the
+// lock and the tree is left as it was found.
+let restored = false
+function restoreOnce() {
+  if (restored) return
+  restored = true
+  for (const [file, source] of touched) {
+    try {
+      fs.writeFileSync(file, source)
+    } catch (err) {
+      console.error(`could not restore ${file}: ${err.message}`)
+    }
+  }
+  releaseLock()
+}
+process.on('exit', restoreOnce)
+const INTERRUPTS = new Set(['SIGINT', 'SIGTERM', 'SIGHUP'])
+for (const signal of INTERRUPTS) {
+  process.on(signal, () => {
+    restoreOnce()
+    console.error(`\n${signal}: restored ${touched.size} tracked file(s) before exiting`)
+    process.exit(signal === 'SIGINT' ? 130 : 143)
+  })
 }
 
 // A run that was killed outright never reached its restore step, so it left one
@@ -150,9 +209,16 @@ const releaseLock = () => {
 // catalogue mutation produces from the committed file — so it is undone here,
 // under the lock, before the tree is judged. The whole catalogue is searched,
 // not just the selected mutations, because the leftover may be any of them.
+//
+// The lock is re-checked before every write: a driver that lost the lock to a
+// takeover must not rewrite the file the new owner is mutating.
 let recovered = []
 try {
-  recovered = restoreLeftoverMutations({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+  recovered = restoreLeftoverMutations({
+    repoRoot: REPO_ROOT,
+    mutations: MUTATIONS,
+    beforeWrite: () => readLockHolder()?.pid === process.pid,
+  })
 } catch (err) {
   console.error(`refusing to run: could not undo the leftover of a killed run (${err.message})`)
   releaseLock()
@@ -161,16 +227,35 @@ try {
 for (const file of recovered) {
   console.log(`restored ${file} — a killed mutation run had left it mutated`)
 }
+if (readLockHolder()?.pid !== process.pid) {
+  console.error('refusing to run: the mutation lock was taken over while the leftover was being recovered')
+  releaseLock()
+  process.exit(2)
+}
 
 if (restoreOnly) {
   const dirty = isDirty(REPO_ROOT, { trackedOnly: true })
+  if (dirty === null) {
+    console.error('refusing to run: could not read the worktree state from git')
+    releaseLock()
+    process.exit(2)
+  }
   console.log(dirty ? 'the worktree still has uncommitted changes' : 'the worktree is clean')
   releaseLock()
   process.exit(dirty ? 1 : 0)
 }
 
-if (isDirty(REPO_ROOT, { trackedOnly: true })) {
+const dirty = isDirty(REPO_ROOT, { trackedOnly: true })
+if (dirty === null) {
+  console.error('refusing to run: could not read the worktree state from git')
+  releaseLock()
+  process.exit(2)
+}
+if (dirty) {
   console.error('refusing to run: tracked files have uncommitted changes, so a broken mutation could not be told apart from your work')
+  if (!recovered.length) {
+    console.error('           no leftover of a killed mutation run was found, so these changes are yours: commit them, or undo them, and run again')
+  }
   releaseLock()
   process.exit(2)
 }
@@ -203,7 +288,6 @@ function writeMutationLog(id, output) {
 }
 
 const report = makeReport('mutate')
-const touched = new Map()
 let noticedByAbort = 0
 let interrupted = null
 let completed = 0
@@ -218,28 +302,8 @@ function restoreAll() {
 
 // The `finally` below covers ordinary failures. A signal arriving while the test
 // child runs would skip it, so restore from the in-memory copy on the way out.
-let restored = false
-function restoreOnce() {
-  if (restored) return
-  restored = true
-  for (const [file, source] of touched) {
-    try {
-      fs.writeFileSync(file, source)
-    } catch (err) {
-      console.error(`could not restore ${file}: ${err.message}`)
-    }
-  }
-  releaseLock()
-}
-process.on('exit', restoreOnce)
-const INTERRUPTS = new Set(['SIGINT', 'SIGTERM', 'SIGHUP'])
-for (const signal of INTERRUPTS) {
-  process.on(signal, () => {
-    restoreOnce()
-    console.error(`\n${signal}: restored ${touched.size} tracked file(s) before exiting`)
-    process.exit(signal === 'SIGINT' ? 130 : 143)
-  })
-}
+// The handlers are registered above, next to the lock, so they are in place
+// before the leftover recovery runs.
 
 try {
   for (const mutation of selected) {
