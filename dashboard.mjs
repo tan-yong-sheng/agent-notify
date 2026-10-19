@@ -450,6 +450,10 @@ export function renderDashboardHtml() {
 
   <script>
     let allAgents = [];
+    // agentOrder tracks first-seen insertion order by id so that rows keep
+    // their position across polls even when the server returns them in a
+    // different order.
+    let agentOrder = [];
     let currentFilter = 'all';
     let searchQuery = '';
 
@@ -489,7 +493,14 @@ export function renderDashboardHtml() {
       try {
         const res = await fetch('/api/agents');
         const data = await res.json();
-        allAgents = data.agents || [];
+        const incoming = data.agents || [];
+        // Preserve first-seen order: append ids not yet tracked, then update
+        // allAgents so renderRows can look each agent up by position.
+        const knownIds = new Set(agentOrder);
+        for (const a of incoming) {
+          if (!knownIds.has(a.id)) agentOrder.push(a.id);
+        }
+        allAgents = incoming;
         updateStats(data);
         renderRows();
       } catch (err) {
@@ -534,7 +545,11 @@ export function renderDashboardHtml() {
 
     function renderRows() {
       const tbody = document.getElementById('agent-table-body');
-      let filtered = allAgents;
+      // Sort by first-seen position before filtering so the visible order is
+      // stable across polls regardless of the server's payload order.
+      const byId = new Map(allAgents.map(a => [a.id, a]));
+      const ordered = agentOrder.map(id => byId.get(id)).filter(Boolean);
+      let filtered = ordered;
 
       if (currentFilter === 'working') {
         filtered = filtered.filter(a => a.status === 'working');
