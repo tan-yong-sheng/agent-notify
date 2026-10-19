@@ -19,8 +19,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences, readCommittedFile, isProtectedFile } from './lib.mjs'
-import { MUTATIONS } from './mutations.mjs'
+import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -70,13 +69,41 @@ function inspect(mutation) {
   return { usable: true, target, source }
 }
 
-const selected = MUTATIONS.filter((m) => !only || m.id === only)
-if (!selected.length) {
-  console.error(only ? `no mutation with id "${only}"` : 'no mutations defined')
-  process.exit(2)
+// The catalogue, the reader and the writer are the modules the recovery and
+// the run depend on. The driver loads them with a dynamic import, and only
+// once the gate has passed, so that an operator's uncommitted version of any
+// of them is never evaluated. A static import would evaluate it while the
+// driver starts, before the gate had a say, and that version would then decide
+// which of the operator's files the recovery overwrites.
+//
+// The preflight is the one path that loads them without the gate: it changes
+// nothing, it only reports what the catalogue would do.
+let MUTATIONS = null
+let countOccurrences = null
+let readCommittedFile = null
+let restoreLeftoverMutations = null
+let leftoverModule = null
+
+async function loadCatalogueModules() {
+  const [catalogue, leftover] = await Promise.all([import('./mutations.mjs'), import('./leftover.mjs')])
+  MUTATIONS = catalogue.MUTATIONS
+  countOccurrences = leftover.countOccurrences
+  readCommittedFile = leftover.readCommittedFile
+  leftoverModule = leftover
 }
 
 if (preflight) {
+  try {
+    await loadCatalogueModules()
+  } catch (err) {
+    console.error(`refusing to run: could not load the catalogue (${err.message})`)
+    process.exit(2)
+  }
+  const selected = MUTATIONS.filter((m) => !only || m.id === only)
+  if (!selected.length) {
+    console.error(only ? `no mutation with id "${only}"` : 'no mutations defined')
+    process.exit(2)
+  }
   let bad = 0
   for (const mutation of selected) {
     const state = inspect(mutation)
@@ -165,7 +192,7 @@ for (let attempt = 0; ; attempt++) {
   }
 }
 if (readLockHolder()?.pid !== process.pid) {
-  console.error('refusing to run: the mutation lock was not ours after it was taken; another driver started at the same time')
+  console.error(`refusing to run: the mutation lock was not ours after it was taken (${lockProblem() ?? 'the lock names another driver'})`)
   process.exit(2)
 }
 let lockReleased = false
@@ -180,9 +207,31 @@ const releaseLock = () => {
   } catch {}
 }
 
-// Whether this driver still owns the lock. A driver that has already
-// released it is done, so its own exit handler is not a takeover.
-const lockIsOurs = () => lockReleased || readLockHolder()?.pid === process.pid
+// Whether this driver still holds the lock, and what happened to it if not.
+// The lock file can be gone (somebody removed it) or unreadable (a
+// half-written file), and neither of those is another driver taking over.
+function lockState() {
+  if (!fs.existsSync(lockFile)) return 'gone'
+  const holder = readLockHolder()
+  if (holder === null) return 'unreadable'
+  return holder.pid === process.pid ? 'ours' : 'other'
+}
+
+// What stopped this driver from holding the lock, in words the operator can
+// act on. A takeover, a deleted lock file and an unreadable one are three
+// different problems, and saying "another driver took over" when there is no
+// other driver sends the operator looking in the wrong place.
+function lockProblem() {
+  const state = lockState()
+  if (state === 'other') return 'another mutation driver took the lock over'
+  if (state === 'gone') return 'the mutation lock file is gone'
+  if (state === 'unreadable') return 'the mutation lock file cannot be read'
+  return null
+}
+
+// Whether this driver may still write. A driver that has already released
+// its own lock is done, so its own exit handler is not a takeover.
+const lockIsOurs = () => lockReleased || lockState() === 'ours'
 
 // The `finally` at the end of the run covers ordinary failures. A signal
 // arriving while the test child runs would skip it, so restore from the
@@ -198,7 +247,7 @@ function restoreOnce() {
   if (restored) return
   restored = true
   if (!lockIsOurs()) {
-    console.error('not restoring the files this driver touched: the mutation lock was taken over')
+    console.error(`not restoring the files this driver touched: ${lockProblem()}`)
     releaseLock()
     return
   }
@@ -229,7 +278,7 @@ for (const signal of INTERRUPTS) {
 // guard let that path load. When the guard refused, the driver says so rather
 // than naming files from code it did not trust.
 function reportUnrecovered() {
-  if (!leftoverModule) {
+  if (!leftoverModule || !MUTATIONS) {
     console.error('           the recovery path was not loaded, so the files that look reverted are not named')
     return
   }
@@ -254,52 +303,53 @@ function reportUnrecovered() {
 // takeover must not rewrite the file the new owner is mutating.
 //
 // The recovery runs code from the worktree. If the operator has uncommitted
-// edits to the scripts that carry it, that code is theirs and not the shipped
+// edits to the modules that carry it, that code is theirs and not the shipped
 // one, so the recovery is skipped rather than run against their other work.
 //
-// The guard is asked of git directly, in the driver's own plumbing, and not of
-// the recovery path: a guard that lived inside the code it guards could be
-// edited away by the very operator it is meant to hold back. Only tracked
-// modifications count, because a stray untracked file in the directory does
-// not change the code the recovery runs.
+// The gate asks git about those modules and about nothing else, and it asks
+// git itself: the decision procedure lives here, in the driver, and not in
+// the code it gates. A gate whose own implementation sat inside the gated set
+// could be edited to lie, and the recovery would then run the operator's
+// version of itself.
 //
-// A git failure is not a clean tree, so the driver refuses rather than
-// guessing.
+// The gate covers exactly the modules the recovery evaluates: the two halves
+// of the recovery, the reader they fetch the committed and the working bytes
+// with, and the catalogue the recovery searches. Every one of them is loaded
+// with a dynamic import, after the gate has passed, so listing a module here
+// is not just a promise but the whole truth about it. A change to a script the
+// recovery never loads says nothing about whether the recovery is the shipped
+// one, so it does not stop the recovery.
 //
-// Only once the guard has passed is the recovery path loaded, and it is
-// loaded with a dynamic import: a static import would evaluate the operator's
-// uncommitted leftover.mjs or restore.mjs before the guard had a say, so the
-// recovery would run code it just refused to trust. Both halves are behind
-// the guard, not just the writing one, because the reading half decides which
-// of the operator's files the recovery would overwrite.
+// Only tracked modifications count, because a stray untracked file in the
+// directory does not change the code the recovery runs.
 //
-// The driver's own plumbing — the guard itself included — is loaded with the
-// driver, because a guard that lived inside the code it guards could be
-// edited away by the very operator it is meant to hold back.
+// The answer is tri-state, and only a clean tree lets the recovery run: an
+// unknown answer is not a clean one, and neither is an answer the driver does
+// not understand.
 //
-// The gate covers the whole scripts directory, so an uncommitted change to
-// any part of the recovery — the plumbing the writer reads the committed
-// content with included — skips the recovery rather than running the
-// operator's version of it. What the gate cannot cover is itself and the
-// driver that asks it; those are the operator's own code, and the gate is
-// asked of git there on purpose.
+// Only once the gate has passed is the recovery path loaded. Both halves are
+// behind the gate, not just the writing one, because the reading half decides
+// which of the operator's files the recovery would overwrite.
+const RECOVERY_MODULES = ['leftover.mjs', 'restore.mjs', 'mutations.mjs']
+function recoveryPathState() {
+  try {
+    const paths = RECOVERY_MODULES.map((name) => path.join(SKILL_ROOT, 'scripts', name))
+    const out = execFileSync('git', ['status', '--porcelain', '--untracked-files=no', '--', ...paths], {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).toString()
+    return out.trim() === '' ? false : true
+  } catch {
+    return null
+  }
+}
 const committedCache = new Map()
 let recovered = { restored: [], skipped: [] }
 let recoverySkipped = false
-let leftoverModule = null
-const scriptsPath = path.relative(REPO_ROOT, path.join(SKILL_ROOT, 'scripts'))
-const scriptsState = isDirty(REPO_ROOT, { trackedOnly: true, paths: [scriptsPath] })
-if (scriptsState === true) {
-  recoverySkipped = true
-  console.error('skipping the leftover recovery: the verification scripts have uncommitted changes, so the recovery is not the shipped one')
-} else if (scriptsState === null) {
-  console.error('refusing to run: could not read the worktree state from git, so the leftover recovery cannot be trusted')
-  releaseLock()
-  process.exit(2)
-} else {
-  let restoreLeftoverMutations
+const recoveryState = recoveryPathState()
+if (recoveryState === false) {
   try {
-    leftoverModule = await import('./leftover.mjs')
+    await loadCatalogueModules()
     ;({ restoreLeftoverMutations } = await import('./restore.mjs'))
   } catch (err) {
     console.error(`refusing to run: could not load the leftover recovery (${err.message})`)
@@ -318,15 +368,22 @@ if (scriptsState === true) {
     releaseLock()
     process.exit(2)
   }
+} else if (recoveryState === true) {
+  recoverySkipped = true
+  console.error('skipping the leftover recovery: the recovery path has uncommitted changes, so the recovery is not the shipped one')
+} else {
+  console.error('refusing to run: could not read the worktree state from git, so the leftover recovery cannot be trusted')
+  releaseLock()
+  process.exit(2)
 }
 for (const file of recovered.restored) {
-  console.log(`restored ${file} — a killed mutation run had left it mutated`)
+  console.log(`restored ${file} — its bytes were exactly what one catalogue mutation produces`)
 }
-for (const file of recovered.skipped) {
-  console.error(`left ${file} alone: it changed while the leftover was being recovered`)
+for (const { file, reason } of recovered.skipped) {
+  console.error(`left ${file} alone: ${reason}`)
 }
-if (readLockHolder()?.pid !== process.pid) {
-  console.error('refusing to run: the mutation lock was taken over while the leftover was being recovered')
+if (lockProblem()) {
+  console.error(`refusing to run: ${lockProblem()} while the leftover was being recovered`)
   releaseLock()
   process.exit(2)
 }
@@ -344,12 +401,12 @@ if (restoreOnly) {
     process.exit(2)
   }
   if (dirty) {
-    console.error('the worktree still has uncommitted changes')
+    console.error('the tracked files still have uncommitted changes')
     reportUnrecovered()
     releaseLock()
     process.exit(1)
   }
-  console.log('the worktree is clean')
+  console.log('no tracked file has uncommitted changes')
   releaseLock()
   process.exit(0)
 }
@@ -363,6 +420,14 @@ if (dirty === null) {
 if (dirty) {
   console.error('refusing to run: tracked files have uncommitted changes, so a broken mutation could not be told apart from your work')
   reportUnrecovered()
+  releaseLock()
+  process.exit(2)
+}
+
+// The tree is clean, so the gate passed and the catalogue is loaded.
+const selected = MUTATIONS.filter((m) => !only || m.id === only)
+if (!selected.length) {
+  console.error(only ? `no mutation with id "${only}"` : 'no mutations defined')
   releaseLock()
   process.exit(2)
 }
@@ -397,6 +462,7 @@ function writeMutationLog(id, output) {
 const report = makeReport('mutate')
 let noticedByAbort = 0
 let interrupted = null
+let lockLost = false
 let completed = 0
 const abortedIds = []
 
@@ -404,7 +470,8 @@ function restoreAll() {
   // A driver that has lost the lock does not write: the driver that took the
   // lock over may be mutating the file this one would write.
   if (!lockIsOurs()) {
-    console.error('not restoring the files this driver touched: the mutation lock was taken over')
+    lockLost = true
+    restored = true
     return
   }
   for (const [file, source] of touched) {
@@ -421,8 +488,9 @@ function restoreAll() {
 
 try {
   for (const mutation of selected) {
-    if (readLockHolder()?.pid !== process.pid) {
-      interrupted = 'another mutation driver took the lock over'
+    const problem = lockProblem()
+    if (problem) {
+      interrupted = problem
       break
     }
     const state = inspect(mutation)
@@ -444,7 +512,12 @@ try {
       // counting the half-run mutation as a failure and sweeping the rest.
       if (err.signal && INTERRUPTS.has(err.signal)) interrupted = `${err.signal} while running ${mutation.id}`
     } finally {
-      fs.writeFileSync(state.target, state.source)
+      // A driver that has lost the lock does not write, not even to undo its
+      // own mutation: the driver that holds the lock now may be mutating the
+      // very file this one would write, and overwriting it would corrupt
+      // that run's evidence.
+      if (lockIsOurs()) fs.writeFileSync(state.target, state.source)
+      else lockLost = true
     }
     if (interrupted) break
     completed++
@@ -464,8 +537,11 @@ try {
 }
 
 if (interrupted) {
+  const outcome = lockLost
+    ? 'the lock was lost, so the files this driver touched were left as they are and the lock was not released'
+    : 'every touched file is restored and the lock is released'
   console.error(
-    `\nstopped by ${interrupted} after ${completed} of ${selected.length} mutation(s). Every touched file is restored and the lock is released; nothing was recorded, so the evidence file still describes the last complete run.`
+    `\nstopped by ${interrupted} after ${completed} of ${selected.length} mutation(s). ${outcome}; nothing was recorded, so the evidence file still describes the last complete run.`
   )
   process.exit(130)
 }
@@ -476,9 +552,9 @@ if (noticedByAbort) {
 }
 
 const after = isDirty(REPO_ROOT, { trackedOnly: true })
-if (after === null) report.check('the worktree is clean after the run', false, 'could not read the worktree state from git')
-else if (after) report.check('the worktree is clean after the run', false, 'mutation driver left changes behind')
-else report.check('the worktree is clean after the run', true)
+if (after === null) report.check('the tracked files are clean after the run', false, 'could not read the worktree state from git')
+else if (after) report.check('the tracked files are clean after the run', false, 'mutation driver left changes behind')
+else report.check('the tracked files are clean after the run', true)
 report.check('the run matches the checked-out revision', true, gitHead())
 // A `--only` run must not overwrite the full catalogue's evidence with three
 // checks, so a focused run gets its own file next to it.

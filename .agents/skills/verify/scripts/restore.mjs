@@ -14,11 +14,6 @@
 // and is loaded under the same guard, because it decides which of the
 // operator's files would be overwritten.
 //
-// The leftover is recognisable exactly: the working file holds byte-for-byte
-// what one catalogue mutation produces from the committed file. A file that
-// differs in any other way is not a leftover, so it is never written to.
-// Restoring therefore undoes the driver's own edit and touches nothing else.
-//
 // The mutation catalogue must not target this directory. A killed run that
 // left this file mutated would leave the recovery unable to recognise a
 // leftover, and an inverted comparison here would overwrite the operator's own
@@ -27,24 +22,28 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { findLeftoverMutations, expectedBytes } from './leftover.mjs'
-import { readCommittedFile, readWorkingFile } from './lib.mjs'
+import { findLeftoverMutations, expectedBytes, readCommittedFile, readWorkingFile } from './leftover.mjs'
 
 // Put the committed bytes back for every leftover found, and report the files
 // that were restored so the operator can see what changed.
 //
 // The write goes through a temporary file and a rename, so an interrupt
 // cannot leave a half-written file behind: the target is either the leftover
-// or the committed content. A symlink is written through instead, the way the
-// driver's own restore writes, so the recovery does not replace a link with a
-// regular file. The working file's mode is kept, so a mode the operator set
-// survives; for a file nobody touched that is the committed mode, and
-// restoring the content then leaves the tree clean.
+// or the committed content. The working file's mode is kept, so a mode the
+// operator set survives; for a file nobody touched that is the committed mode,
+// and restoring the content then leaves the tree clean.
 //
 // The file is re-read and re-matched twice: once before the temporary file is
 // written, and once more immediately before the rename. The decision to write
 // was taken earlier, and an operator save that lands in between must not be
 // overwritten. The window that is left is the rename syscall itself.
+//
+// A symlink is not written through. The link may point outside the
+// repository, and the recovery would put the committed content somewhere the
+// operator never asked for. A tracked path that is a symlink holds the link
+// text in git, so it cannot be a leftover in the first place; the case that
+// matters is an operator who replaced a tracked file with a link, and that
+// file is theirs to put back.
 //
 // `beforeWrite` is called before each write, and again just before the
 // rename. Returning anything falsy stops the recovery, so a driver that has
@@ -57,42 +56,42 @@ export function restoreLeftoverMutations({ repoRoot, mutations, beforeWrite, cac
     const committed = readCommittedFile(repoRoot, leftover.file)
     const expected = committed === null ? null : expectedBytes(committed, leftover.mutation)
     if (expected === null) {
-      skipped.push(leftover.file)
+      skipped.push({ file: leftover.file, reason: 'the committed content no longer produces this leftover' })
       continue
     }
     const working = readWorkingFile(repoRoot, leftover.file)
     if (working === null || !working.equals(expected)) {
-      skipped.push(leftover.file)
+      skipped.push({ file: leftover.file, reason: 'the file changed while the leftover was being recovered' })
       continue
     }
     const target = path.join(repoRoot, leftover.file)
+    try {
+      if (fs.lstatSync(target).isSymbolicLink()) {
+        skipped.push({ file: leftover.file, reason: 'the file is a symlink, so the recovery does not write through it' })
+        continue
+      }
+    } catch {}
     let mode = 0o644
     try {
       mode = fs.statSync(target).mode & 0o777
     } catch {}
+    const temp = `${target}.restore-tmp`
     try {
-      if (fs.lstatSync(target).isSymbolicLink()) {
-        fs.writeFileSync(target, committed)
-      } else {
-        const temp = `${target}.restore-tmp`
-        try {
-          fs.writeFileSync(temp, committed, { mode })
-          fs.chmodSync(temp, mode)
-          const latest = readWorkingFile(repoRoot, leftover.file)
-          if (latest === null || !latest.equals(expected)) {
-            skipped.push(leftover.file)
-            continue
-          }
-          if (beforeWrite && !beforeWrite(leftover)) break
-          fs.renameSync(temp, target)
-        } finally {
-          try {
-            fs.rmSync(temp, { force: true })
-          } catch {}
-        }
+      fs.writeFileSync(temp, committed, { mode })
+      fs.chmodSync(temp, mode)
+      if (beforeWrite && !beforeWrite(leftover)) break
+      const latest = readWorkingFile(repoRoot, leftover.file)
+      if (latest === null || !latest.equals(expected)) {
+        skipped.push({ file: leftover.file, reason: 'the file changed between the check and the write' })
+        continue
       }
+      fs.renameSync(temp, target)
     } catch (err) {
       throw new Error(`could not restore ${leftover.file}: ${err.message}`)
+    } finally {
+      try {
+        fs.rmSync(temp, { force: true })
+      } catch {}
     }
     if (fs.readFileSync(target).equals(committed) === false) {
       throw new Error(`could not restore ${leftover.file}`)

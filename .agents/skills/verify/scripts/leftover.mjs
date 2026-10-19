@@ -22,8 +22,73 @@
 // leftover, and an inverted comparison here would make the recovery overwrite
 // the operator's own work. The rule lives in lib.mjs, under the same
 // directory, so the catalogue cannot reach the rule or the code it protects.
+//
+// The recovery does not check that rule itself: the gate makes sure the
+// catalogue it searches is the shipped one, and the shipped catalogue holds no
+// entry that reaches the recovery path, because the driver refuses such an
+// entry. The recovery therefore cannot be pointed at these files.
+//
+// Everything the recovery needs lives in this module and in the module that
+// writes: the reader that fetches the committed and the working bytes, the
+// counter that checks an anchor is unique, and the two halves of the recovery
+// itself. The driver loads all of it with a dynamic import and only after its
+// gate has passed, so an operator's uncommitted version of any of it is never
+// evaluated. A shared helper in a module the driver loads up front would break
+// that: the driver would have evaluated the operator's version of the reader
+// before the gate had a say.
 
-import { countOccurrences, isProtectedFile, readCommittedFile, readWorkingFile } from './lib.mjs'
+import fs from 'node:fs'
+import path from 'node:path'
+import { execFileSync } from 'node:child_process'
+
+// How many times a piece of text appears in another. An anchor that is not
+// unique cannot be applied unambiguously, so the driver would have refused the
+// mutation and the recovery cannot recognise it as a leftover either.
+export function countOccurrences(haystack, needle) {
+  if (!needle) return 0
+  let count = 0
+  let index = haystack.indexOf(needle)
+  while (index !== -1) {
+    count++
+    index = haystack.indexOf(needle, index + needle.length)
+  }
+  return count
+}
+
+// The committed content of a file as bytes, or null when there is none: the
+// file is untracked, or the repository has no commit yet.
+//
+// A `cache` map of file to content keeps a run from asking git for the same
+// file once per catalogue entry.
+export function readCommittedFile(repoRoot, file, cache) {
+  if (cache) {
+    if (cache.has(file)) return cache.get(file)
+    const content = readCommittedFileUncached(repoRoot, file)
+    cache.set(file, content)
+    return content
+  }
+  return readCommittedFileUncached(repoRoot, file)
+}
+
+// The bytes the working file holds right now, or null when it cannot be read.
+export function readWorkingFile(repoRoot, file) {
+  try {
+    return fs.readFileSync(path.join(repoRoot, file))
+  } catch {
+    return null
+  }
+}
+
+function readCommittedFileUncached(repoRoot, file) {
+  try {
+    return execFileSync('git', ['show', `HEAD:${file}`], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch {
+    return null
+  }
+}
 
 // The bytes a mutation leaves behind: the committed content with the
 // mutation's find replaced by its replacement, exactly as the driver writes
@@ -43,10 +108,6 @@ export function expectedBytes(committed, mutation) {
 export function findLeftoverMutations({ repoRoot, mutations, cache }) {
   const leftovers = []
   for (const mutation of mutations) {
-    // A protected file is never a leftover to undo, even if the catalogue
-    // somehow held one: this module is the last line of defence for the
-    // rule that keeps the catalogue off the recovery path.
-    if (isProtectedFile(repoRoot, mutation.file)) continue
     const committed = readCommittedFile(repoRoot, mutation.file, cache)
     if (committed === null) continue
     const expected = expectedBytes(committed, mutation)

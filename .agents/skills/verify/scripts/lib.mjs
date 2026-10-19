@@ -1,5 +1,10 @@
 // Shared helpers for the verification drivers. Kept in one place so every driver
 // reports, waits, and cleans up the same way.
+//
+// This file is the drivers' own plumbing. The leftover recovery does not use
+// it: the recovery reads the committed and the working bytes with the reader
+// in leftover.mjs, so that everything the recovery depends on is loaded
+// together, behind the driver's gate, and never before it.
 
 import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -34,17 +39,6 @@ export function parseArgs(argv) {
 
 export function flagValue(flags, key, fallback) {
   return flags[key] && flags[key] !== true ? String(flags[key]) : fallback
-}
-
-export function countOccurrences(haystack, needle) {
-  if (!needle) return 0
-  let count = 0
-  let index = haystack.indexOf(needle)
-  while (index !== -1) {
-    count++
-    index = haystack.indexOf(needle, index + needle.length)
-  }
-  return count
 }
 
 export function tryJson(text) {
@@ -142,55 +136,19 @@ export function gitHead(dir = REPO_ROOT) {
   }
 }
 
-// Whether the worktree has changes, and whether any of them are in the given
-// paths. The paths are resolved against `dir`, which is the directory the git
-// command runs in, so a caller passes the path the way git sees it from there.
-// The answer is tri-state: true, false, or null when git could not be read.
-// An unknown state is not a clean one, so the caller must not act on it as if
-// the tree were untouched.
-export function isDirty(dir = REPO_ROOT, { trackedOnly = false, paths = [] } = {}) {
+// Whether the worktree has changes. The answer is tri-state: true, false, or
+// null when git could not be read. An unknown state is not a clean one, so
+// the caller must not act on it as if the tree were untouched.
+//
+// This helper is not the guard the driver uses before it runs the leftover
+// recovery: a guard that lived in a file the operator can edit could be
+// edited to lie. The driver asks git itself, about the modules the recovery
+// evaluates.
+export function isDirty(dir = REPO_ROOT, { trackedOnly = false } = {}) {
   try {
     const args = ['status', '--porcelain']
     if (trackedOnly) args.push('--untracked-files=no')
-    // An absolute pathspec means the same file whatever directory git is run
-    // in, so a caller cannot pass a path that git reads as somewhere else.
-    if (paths.length) args.push('--', ...paths.map((p) => path.resolve(dir, p)))
     return execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() !== ''
-  } catch {
-    return null
-  }
-}
-
-// The committed content of a file as bytes, or null when there is none: the
-// file is untracked, or the repository has no commit yet.
-//
-// A `cache` map of file to content keeps a run from asking git for the same
-// file once per catalogue entry.
-export function readCommittedFile(repoRoot, file, cache) {
-  if (cache) {
-    if (cache.has(file)) return cache.get(file)
-    const content = readCommittedFileUncached(repoRoot, file)
-    cache.set(file, content)
-    return content
-  }
-  return readCommittedFileUncached(repoRoot, file)
-}
-
-// The bytes the working file holds right now, or null when it cannot be read.
-export function readWorkingFile(repoRoot, file) {
-  try {
-    return fs.readFileSync(path.join(repoRoot, file))
-  } catch {
-    return null
-  }
-}
-
-function readCommittedFileUncached(repoRoot, file) {
-  try {
-    return execFileSync('git', ['show', `HEAD:${file}`], {
-      cwd: repoRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
   } catch {
     return null
   }
