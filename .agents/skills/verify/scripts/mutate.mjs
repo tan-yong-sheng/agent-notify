@@ -21,7 +21,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
-import { restoreLeftoverMutations, readCommittedFile } from './restore.mjs'
+import { restoreLeftoverMutations, readCommittedFile, findRevertedFixes, isProtectedFile, scriptsDir } from './restore.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -32,32 +32,26 @@ const testFile = path.join(REPO_ROOT, 'test_cases.test.js')
 const testSource = fs.readFileSync(testFile, 'utf8')
 
 // The catalogue targets shipped fixes in the application, never the tooling
-// that verifies it. A killed run that left these files changed would leave the
-// recovery unable to recognise a leftover, and an inverted comparison in the
-// recovery would overwrite the operator's own work. The check is on the
-// resolved path, so no spelling of the same file slips past it.
-const SCRIPTS_DIR = path.resolve(REPO_ROOT, '.agents/skills/verify/scripts')
-
-function isProtectedFile(file) {
-  const target = path.resolve(REPO_ROOT, file)
-  return target === SCRIPTS_DIR || target.startsWith(SCRIPTS_DIR + path.sep)
-}
-
+// that verifies it: the recovery and the rule that protects it live under the
+// scripts directory, so the catalogue cannot reach either. The driver refuses
+// such an entry, and `--preflight` reports it as SKIP, so the invariant is
+// structural rather than a convention somebody has to remember.
+//
 // An anchor that is gone from the worktree but still in HEAD is what a killed
-// run leaves behind. An anchor that is gone from both was reverted in a commit,
-// and no amount of restoring brings it back.
+// run leaves behind. An anchor that is gone from both was reverted in a
+// commit, and no amount of restoring brings it back.
 function missingAnchorReason(mutation) {
   const committed = readCommittedFile(REPO_ROOT, mutation.file)
   if (committed !== null && countOccurrences(committed.toString('utf8'), mutation.find) === 0) {
-    return 'anchor not found in the worktree or in HEAD — this fix looks reverted in a commit; check git log for this file'
+    return 'anchor not found in the worktree or in HEAD — this fix looks reverted in a commit, or moved to another file; check git log for this file'
   }
   return 'anchor not found in the worktree — a killed mutation run may have replaced it; run with --restore'
 }
 
 function inspect(mutation) {
   const target = path.join(REPO_ROOT, mutation.file)
-  if (isProtectedFile(mutation.file)) {
-    return { usable: false, reason: "this file carries the driver's own recovery path and must not be mutated" }
+  if (isProtectedFile(REPO_ROOT, mutation.file)) {
+    return { usable: false, reason: "this file carries the driver's own recovery path or the suite it reads, and must not be mutated" }
   }
   if (!fs.existsSync(target)) return { usable: false, reason: `missing file ${mutation.file}` }
   const source = fs.readFileSync(target, 'utf8')
@@ -205,6 +199,35 @@ for (const signal of INTERRUPTS) {
   })
 }
 
+// The recovery runs code from the worktree. If the operator has uncommitted
+// edits to the scripts that carry it, that code is theirs and not the shipped
+// one, so the recovery is skipped rather than run against their other work.
+function scriptsAreDirty() {
+  try {
+    const out = execFileSync('git', ['status', '--porcelain', '--', path.relative(REPO_ROOT, scriptsDir(REPO_ROOT))], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+    }).trim()
+    return out !== ''
+  } catch {
+    return false
+  }
+}
+
+// Say what the recovery found, in facts rather than guesses about who owns the
+// changes. A leftover that the operator has since edited no longer matches
+// byte for byte, so it is named as a reverted fix instead of being claimed.
+function reportUnrecovered() {
+  const reverted = findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+  if (!reverted.length) {
+    console.error('           no file matches a leftover of a killed mutation run exactly')
+    return
+  }
+  console.error('           these files look like a shipped fix reverted in the working tree, which is what a leftover of a killed run looks like once it has been edited:')
+  for (const file of reverted) console.error(`             ${file.file} (${file.id})`)
+  console.error('           undo them by hand; --restore only handles a file that matches a leftover exactly')
+}
+
 // A run that was killed outright never reached its restore step, so it left one
 // mutation applied and every later run refused to start on the tree it dirtied
 // itself. The leftover is recognisable exactly — the file holds what one
@@ -215,16 +238,20 @@ for (const signal of INTERRUPTS) {
 // The lock is re-checked before every write: a driver that lost the lock to a
 // takeover must not rewrite the file the new owner is mutating.
 let recovered = []
-try {
-  recovered = restoreLeftoverMutations({
-    repoRoot: REPO_ROOT,
-    mutations: MUTATIONS,
-    beforeWrite: () => readLockHolder()?.pid === process.pid,
-  })
-} catch (err) {
-  console.error(`refusing to run: could not undo the leftover of a killed run (${err.message})`)
-  releaseLock()
-  process.exit(2)
+if (scriptsAreDirty()) {
+  console.error('skipping the leftover recovery: the verification scripts have uncommitted changes, so the recovery is not the shipped one')
+} else {
+  try {
+    recovered = restoreLeftoverMutations({
+      repoRoot: REPO_ROOT,
+      mutations: MUTATIONS,
+      beforeWrite: () => readLockHolder()?.pid === process.pid,
+    })
+  } catch (err) {
+    console.error(`refusing to run: could not undo the leftover of a killed run (${err.message})`)
+    releaseLock()
+    process.exit(2)
+  }
 }
 for (const file of recovered) {
   console.log(`restored ${file} — a killed mutation run had left it mutated`)
@@ -242,9 +269,15 @@ if (restoreOnly) {
     releaseLock()
     process.exit(2)
   }
-  console.log(dirty ? 'the worktree still has uncommitted changes' : 'the worktree is clean')
+  if (dirty) {
+    console.error('the worktree still has uncommitted changes')
+    reportUnrecovered()
+    releaseLock()
+    process.exit(1)
+  }
+  console.log('the worktree is clean')
   releaseLock()
-  process.exit(dirty ? 1 : 0)
+  process.exit(0)
 }
 
 const dirty = isDirty(REPO_ROOT, { trackedOnly: true })
@@ -255,9 +288,7 @@ if (dirty === null) {
 }
 if (dirty) {
   console.error('refusing to run: tracked files have uncommitted changes, so a broken mutation could not be told apart from your work')
-  if (!recovered.length) {
-    console.error('           no leftover of a killed mutation run was found, so these changes are yours: commit them, or undo them, and run again')
-  }
+  reportUnrecovered()
   releaseLock()
   process.exit(2)
 }
@@ -363,11 +394,10 @@ if (noticedByAbort) {
   console.log('      Their named test never reported, so they are not proof that it bites. The captured output is in artifacts/mutations/<id>.log.')
 }
 
-if (isDirty(REPO_ROOT, { trackedOnly: true })) {
-  report.check('the worktree is clean after the run', false, 'mutation driver left changes behind')
-} else {
-  report.check('the worktree is clean after the run', true)
-}
+const after = isDirty(REPO_ROOT, { trackedOnly: true })
+if (after === null) report.check('the worktree is clean after the run', false, 'could not read the worktree state from git')
+else if (after) report.check('the worktree is clean after the run', false, 'mutation driver left changes behind')
+else report.check('the worktree is clean after the run', true)
 report.check('the run matches the checked-out revision', true, gitHead())
 // A `--only` run must not overwrite the full catalogue's evidence with three
 // checks, so a focused run gets its own file next to it.
