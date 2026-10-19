@@ -49,7 +49,12 @@ if (shapeOk) {
 
 const head = gitHead(REPO_ROOT)
 check('checkout revision', true, `${head}${isDirty(REPO_ROOT) ? ' (dirty worktree)' : ''}`)
-if (expectSha && head !== expectSha) check(`checkout matches --expect-sha ${expectSha}`, false, `found ${head}`)
+// gitHead() reports the short sha, so accept either spelling: a full 40-character
+// --expect-sha must match a short HEAD as a prefix, and the other way round.
+if (expectSha) {
+  const matches = head.startsWith(expectSha) || expectSha.startsWith(head)
+  check(`checkout matches --expect-sha ${expectSha}`, matches, `found ${head}`)
+}
 
 console.log(lines.join('\n'))
 console.log(healthy ? '\ninstance looks drivable' : '\ninstance is not drivable')

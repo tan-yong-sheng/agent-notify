@@ -25,7 +25,8 @@ The dashboard can install itself as a background service that starts on login, s
 
 Preconditions:
 
-- `--service status` is read-only and safe to run at any time. Everything else in this feature changes the user's machine and their login session: **get explicit approval before running install, restart, or uninstall, and uninstall afterwards.**
+- `--service status` is read-only and safe to run at any time. Everything else in this feature changes the user's machine and their login session: **get explicit approval before running install, restart, or uninstall.**
+- Cleanup is conditional: uninstall only a service this run installed. If the service already existed, record its definition and its enabled/disabled state before touching it, and restore that definition and state instead of uninstalling — otherwise the verification run deletes the operator's own setup.
 - There is no user `systemd` and no `launchd` in a sandboxed Linux container, so the real install paths cannot be driven here. What this environment can prove is the definition the installer writes and the status read-out.
 - `--service status` is read-only and safe anywhere. Installing changes the operator's machine and their login session, and `launchd` and the Windows Startup folder need their own OS, so the install paths are proven by the unit tests and by reading the written definition — not by running them here.
 

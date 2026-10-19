@@ -116,14 +116,55 @@ function writeState(state) {
 // once Chrome exits the number can be reused by an unrelated process, and this
 // driver must never signal one.
 const PROC_AVAILABLE = fs.existsSync('/proc/self/cmdline')
+// true: provably this session's Chrome. false: provably something else, or gone.
+// 'unknown': this platform cannot show the command line, so the caller must not
+// signal the pid — refusing to guess is the only safe answer to a recycled pid.
 function pidIsOurChrome(pid, userDataDir) {
-  if (!PROC_AVAILABLE) return true
+  if (!pid) return false
+  if (!PROC_AVAILABLE) return 'unknown'
   try {
     return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(userDataDir)
-  } catch {
-    return false
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ESRCH') return false
+    return 'unknown'
   }
 }
+
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err.code === 'EPERM'
+  }
+}
+
+const portOf = (state) => {
+  if (Number.isInteger(state.port)) return state.port
+  const match = /:(\d+)\//.exec(String(state.ws || ''))
+  return match ? Number(match[1]) : null
+}
+
+// The devtools endpoint is the browser's own identity: the socket path carries a
+// random token, so an answer from it proves this session's browser is still up
+// without trusting a pid at all.
+async function endpointGone(port, deadline) {
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/json/version`)
+    } catch {
+      return true
+    }
+    await sleep(100)
+  }
+  return false
+}
+
+// With its sandbox off, Chrome runs a page with this user's own permissions. A
+// sandbox refusal must not turn into an unsandboxed browser pointed at someone
+// else's site, so that combination is limited to this machine's fixture servers.
+const LOCAL_URL = /^(about:blank$|data:text\/html[,;]|https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?([/?#]|$))/
+const isLocalUrl = (url) => LOCAL_URL.test(String(url))
 
 // A Chrome that cannot start because its own sandbox is unavailable is the one
 // case worth retrying with the sandbox off. Any other startup failure is a real
@@ -282,21 +323,36 @@ async function launch() {
   const url = flags.url && flags.url !== true ? String(flags.url) : 'about:blank'
 
   let attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: [] })
+  // A browser that started but cannot be used must not be left behind: its
+  // process and its profile dir would outlive the driver, and drive-ui.mjs only
+  // calls close after a launch that succeeded.
+  const abort = (message) => {
+    try {
+      attempt?.child.kill('SIGKILL')
+    } catch {}
+    fs.rmSync(statePath, { force: true })
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {}
+    throw new Error(message)
+  }
   let sandbox = 'on'
   if (!attempt.info) {
     const log = attempt.log
-    attempt.child.kill('SIGKILL')
     if (!SANDBOX_REFUSAL.test(log)) {
-      throw new Error(
+      abort(
         `Chrome did not expose a debugger on port ${port}, and the failure is not a sandbox refusal, so it is not retried with the sandbox off\n${tailOf(log)}`
       )
     }
+    attempt.child.kill('SIGKILL')
     attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: ['--no-sandbox', '--disable-setuid-sandbox'] })
     sandbox = 'off'
   }
-  if (!attempt.info) {
-    attempt.child.kill('SIGKILL')
-    throw new Error(`Chrome did not expose a debugger on port ${port}\n${tailOf(attempt.log)}`)
+  if (!attempt.info) abort(`Chrome did not expose a debugger on port ${port}\n${tailOf(attempt.log)}`)
+  if (sandbox === 'off' && !isLocalUrl(url)) {
+    abort(
+      `Chrome only started without its sandbox, and this driver will not point an unsandboxed browser at ${url}: only about:blank, data: and http(s) on 127.0.0.1, localhost or [::1] are allowed. Pass a local URL, or fix the sandbox refusal (see SKILL.md).`
+    )
   }
   writeState({ pid: attempt.child.pid, port, ws: attempt.info.webSocketDebuggerUrl, userDataDir, chrome, sandbox, targetId: null })
   // The browser outlives this command; drop the pipes and the child handle so
@@ -304,12 +360,21 @@ async function launch() {
   attempt.child.stdout?.destroy()
   attempt.child.stderr?.destroy()
   attempt.child.unref()
-  await open(url)
+  try {
+    await open(url)
+  } catch (err) {
+    abort(`Chrome started on port ${port} but the first navigation to ${url} failed: ${err.message}`)
+  }
   console.log(`launched ${path.basename(chrome)} pid ${attempt.child.pid} on port ${port} (browser sandbox ${sandbox})`)
 }
 
 async function open(url) {
   const state = readState()
+  if (state.sandbox === 'off' && !isLocalUrl(url)) {
+    throw new Error(
+      `this browser session runs without its sandbox, so it is limited to local URLs; refusing to open ${url}. Finish with "close" and relaunch once the sandbox works.`
+    )
+  }
   const cdp = await Cdp.connect(state.ws)
   try {
     const { targetId } = await cdp.send('Target.createTarget', { url })
@@ -433,33 +498,43 @@ async function screenshot() {
 
 async function close() {
   const state = readState()
+  const port = portOf(state)
   const cdp = await Cdp.connect(state.ws).catch(() => null)
   if (cdp) {
     if (state.targetId) await cdp.send('Target.closeTarget', { targetId: state.targetId }).catch(() => {})
+    // Ask the browser to exit over its own debugger connection. This needs no pid,
+    // so a recycled pid cannot make the driver signal an unrelated process.
+    await cdp.send('Browser.close').catch(() => {})
     cdp.close()
   }
-  const ours = pidIsOurChrome(state.pid, state.userDataDir)
-  if (!ours) console.log(`pid ${state.pid} is no longer this session's Chrome (it exited and the pid was reused); not signalling it`)
-  if (ours) {
-    try {
-      process.kill(state.pid, 'SIGTERM')
-    } catch {}
-    // Wait for the process to go before touching its profile: Chrome keeps writing
-    // into the user-data dir while it shuts down.
-    const deadline = Date.now() + 5000
-    while (Date.now() < deadline) {
-      try {
-        process.kill(state.pid, 0)
-        await sleep(100)
-      } catch {
-        break
+  let stopped = port ? await endpointGone(port, Date.now() + 5000) : false
+  if (!stopped) {
+    const ours = pidIsOurChrome(state.pid, state.userDataDir)
+    if (ours === true) {
+      for (const signal of ['SIGTERM', 'SIGKILL']) {
+        try {
+          process.kill(state.pid, signal)
+        } catch {}
+        if (port ? await endpointGone(port, Date.now() + 4000) : !pidAlive(state.pid)) {
+          stopped = true
+          break
+        }
       }
+    } else if (ours === 'unknown') {
+      console.log(
+        `pid ${state.pid}: this platform does not expose the command line, so the driver cannot prove the pid is still its browser and will not signal it. Stop it yourself, then remove ${state.userDataDir}.`
+      )
+    } else {
+      console.log(`pid ${state.pid} is no longer this session's Chrome (it exited and the pid was reused); not signalling it`)
     }
-    try {
-      process.kill(state.pid, 'SIGKILL')
-    } catch {}
   }
   fs.rmSync(statePath, { force: true })
+  if (!stopped) {
+    // The profile is only safe to delete once its Chrome is gone: Chrome keeps
+    // writing into it while it shuts down. Keeping it is the recoverable choice.
+    console.log(`closed the session; the browser on port ${port} did not stop, so its profile dir is kept at ${state.userDataDir}`)
+    return
+  }
   try {
     fs.rmSync(state.userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
     console.log(`closed pid ${state.pid}`)

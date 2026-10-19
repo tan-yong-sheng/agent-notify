@@ -94,6 +94,16 @@ function mutationDriverIsAlive(pid) {
   }
 }
 
+// The lock is a plain file: whoever creates it with O_EXCL owns it. Reading it is
+// allowed to fail — a half-written or half-deleted file means "no usable holder".
+function readLockHolder(file = lockFile) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
 // This driver edits tracked files in place, so two runs in one checkout race:
 // each restores the other's mutation and the evidence file is written twice.
 const lockFile = path.join(ARTIFACTS, '.mutate.lock')
@@ -107,16 +117,36 @@ for (let attempt = 0; ; attempt++) {
       console.error(`refusing to run: cannot take the mutation lock at ${lockFile} (${err.code || err.message})`)
       process.exit(2)
     }
-    let holder = null
-    try {
-      holder = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
-    } catch {}
+    const holder = readLockHolder()
     if (mutationDriverIsAlive(holder?.pid)) {
       console.error(`refusing to run: another mutation driver (pid ${holder.pid}, started ${holder.at}) is working in this checkout`)
       process.exit(2)
     }
-    fs.rmSync(lockFile, { force: true })
+    // Taking over a stale lock is itself a race: two starts can both decide the
+    // holder is dead. Rename instead of deleting, because a rename moves exactly
+    // one file atomically; then check that what moved is the lock that was judged
+    // stale. A driver that moved a fresh lock puts it back and refuses, so it can
+    // never delete a live holder's lock.
+    const stale = `${lockFile}.stale-${process.pid}`
+    try {
+      fs.renameSync(lockFile, stale)
+    } catch {
+      continue
+    }
+    const moved = readLockHolder(stale)
+    if (moved?.pid !== holder?.pid || moved?.at !== holder?.at) {
+      try {
+        fs.renameSync(stale, lockFile)
+      } catch {}
+      console.error(`refusing to run: the mutation lock changed while it was being taken over (holder pid ${moved?.pid ?? 'unknown'})`)
+      process.exit(2)
+    }
+    fs.rmSync(stale, { force: true })
   }
+}
+if (readLockHolder()?.pid !== process.pid) {
+  console.error('refusing to run: the mutation lock was not ours after it was taken; another driver started at the same time')
+  process.exit(2)
 }
 const releaseLock = () => {
   try {
@@ -154,6 +184,8 @@ function writeMutationLog(id, output) {
 const report = makeReport('mutate')
 const touched = new Map()
 let noticedByAbort = 0
+let interrupted = null
+let completed = 0
 const abortedIds = []
 
 function restoreAll() {
@@ -179,7 +211,8 @@ function restoreOnce() {
   releaseLock()
 }
 process.on('exit', restoreOnce)
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+const INTERRUPTS = new Set(['SIGINT', 'SIGTERM', 'SIGHUP'])
+for (const signal of INTERRUPTS) {
   process.on(signal, () => {
     restoreOnce()
     console.error(`\n${signal}: restored ${touched.size} tracked file(s) before exiting`)
@@ -189,6 +222,10 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 
 try {
   for (const mutation of selected) {
+    if (readLockHolder()?.pid !== process.pid) {
+      interrupted = 'another mutation driver took the lock over'
+      break
+    }
     const state = inspect(mutation)
     if (!state.usable) {
       report.check(mutation.id, false, `cannot run: ${state.reason}`)
@@ -202,9 +239,16 @@ try {
       output = execFileSync(runtime, ['test_cases.test.js'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 900000, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (err) {
       output = `${err.stdout || ''}${err.stderr || ''}`
+      // Ctrl+C reaches this process only after the synchronous child has died, so
+      // an interrupt surfaces here as a killed child, not through the handler
+      // below. Record it, stop, and report the run as interrupted instead of
+      // counting the half-run mutation as a failure and sweeping the rest.
+      if (err.signal && INTERRUPTS.has(err.signal)) interrupted = `${err.signal} while running ${mutation.id}`
     } finally {
       fs.writeFileSync(state.target, state.source)
     }
+    if (interrupted) break
+    completed++
     const reported = /Results:/.test(output)
     const verdict = classify(mutation, output)
     if (verdict.abort) {
@@ -218,6 +262,13 @@ try {
 } finally {
   restoreAll()
   releaseLock()
+}
+
+if (interrupted) {
+  console.error(
+    `\nstopped by ${interrupted} after ${completed} of ${selected.length} mutation(s). Every touched file is restored and the lock is released; nothing was recorded, so the evidence file still describes the last complete run.`
+  )
+  process.exit(130)
 }
 
 if (noticedByAbort) {
