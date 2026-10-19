@@ -20,11 +20,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
+import { parseArgs, flagValue, makeReport, restoreOutcomeMessage, REPO_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
-const preflight = flags.preflight === true
-const restoreOnly = flags.restore === true
+// A flag that is present is a flag, whatever follows it: `--restore` must
+// not turn into a full mutation sweep because a file name came after it.
+const preflight = Object.hasOwn(flags, 'preflight')
+const restoreOnly = Object.hasOwn(flags, 'restore')
 const only = flagValue(flags, 'only', '')
 const runtime = flagValue(flags, 'runtime', 'node')
 const testFile = path.join(REPO_ROOT, 'test_cases.test.js')
@@ -243,42 +245,66 @@ const lockIsOurs = () => lockReleased || lockState() === 'ours'
 // A driver that has lost the lock does not write: another driver has taken
 // the lock over and may be mutating the very file this one would write, so
 // writing would corrupt that run's evidence.
-let restored = false
+// What the driver did about the files it touched. The message on the way out
+// has to say what happened, not what the driver hoped happened: a restore
+// that happened, a restore that was refused because the lock was lost, and a
+// restore whose writes failed are three different problems, and the operator
+// has to be able to tell them apart.
+let restoreOutcome = null
+
+// The driver puts back the files it mutated, and it puts them where they
+// were. A file the operator replaced with a link, or a directory above it
+// replaced with one, would put the content somewhere the operator never
+// asked for, so a link is refused here for the same reason the recovery
+// refuses one. The recovery keeps its own copy of this rule: it may not
+// depend on a module the guard has not cleared.
+function writeTargetIsSafe(target) {
+  try {
+    if (fs.lstatSync(target).isSymbolicLink()) return false
+    const dir = fs.realpathSync(path.dirname(target))
+    const root = fs.realpathSync(REPO_ROOT)
+    return dir === root || dir.startsWith(root + path.sep)
+  } catch {
+    return false
+  }
+}
+
 function restoreOnce() {
-  if (restored) return 0
-  restored = true
+  if (restoreOutcome) return restoreOutcome
   if (!lockIsOurs()) {
-    console.error(`not restoring the files this driver touched: ${lockProblem()}`)
+    const problem = lockProblem()
+    console.error(`not restoring the files this driver touched: ${problem}`)
+    restoreOutcome = { restored: 0, touched: touched.size, lostLock: problem, failed: false }
     releaseLock()
-    return 0
+    return restoreOutcome
   }
   let count = 0
+  let failed = false
   for (const [file, source] of touched) {
+    if (!writeTargetIsSafe(file)) {
+      failed = true
+      console.error(`could not restore ${file}: the path is not a plain file inside the repository`)
+      continue
+    }
     try {
       fs.writeFileSync(file, source)
       count++
     } catch (err) {
+      failed = true
       console.error(`could not restore ${file}: ${err.message}`)
     }
   }
   releaseLock()
-  return count
+  restoreOutcome = { restored: count, touched: touched.size, lostLock: null, failed }
+  return restoreOutcome
 }
 
-// What the driver did on its way out, in words that do not claim a restore
-// that did not happen: a driver that lost the lock leaves the files it
-// touched alone, and the message says so instead of counting them.
-function restoreSummary(count) {
-  if (count > 0) return `restored ${count} tracked file(s) before exiting`
-  if (touched.size === 0) return 'there was nothing to restore'
-  return 'left the files this driver touched alone, because this driver no longer holds the lock'
-}
 process.on('exit', () => { restoreOnce() })
 const INTERRUPTS = new Set(['SIGINT', 'SIGTERM', 'SIGHUP'])
 for (const signal of INTERRUPTS) {
   process.on(signal, () => {
-    const count = restoreOnce()
-    console.error(`\n${signal}: ${restoreSummary(count)}`)
+    const outcome = restoreOnce()
+    console.error(`\n${signal}: ${restoreOutcomeMessage(outcome)}`)
     process.exit(signal === 'SIGINT' ? 130 : 143)
   })
 }
@@ -295,7 +321,7 @@ function reportUnrecovered() {
     console.error('           the recovery path was not loaded, so the files that look reverted are not named')
     return
   }
-  const reverted = leftoverModule.findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS, cache: committedCache })
+  const reverted = leftoverModule.findRevertedFixes({ repoRoot: gitRoot, mutations: MUTATIONS, cache: committedCache })
   if (!reverted.length) {
     console.error('           no file matches a leftover of a killed mutation run exactly')
     return
@@ -344,37 +370,68 @@ function reportUnrecovered() {
 // behind the gate, not just the writing one, because the reading half decides
 // which of the operator's files the recovery would overwrite.
 //
-// The gate asks git about the content of the modules, not about their
-// timestamps. `git status` answers from the index's stat cache, so a module
-// the operator marked assume-unchanged or skip-worktree is reported as clean
-// while its bytes differ from the committed ones, and the recovery would then
-// run the operator's version of itself. Hashing the file reads the bytes that
-// are on disk; comparing that hash with the blob at HEAD answers the question
-// the gate actually asks: is this the shipped file?
+// The repository root, as git sees it. The recovery searches and writes this
+// tree, so the root comes from git and not from a module the operator could
+// edit: an uncommitted `lib.mjs` must not be able to point the recovery at
+// another directory while the gate answers "clean".
+const GATE_SCRIPTS_DIR = fs.realpathSync(path.dirname(fileURLToPath(import.meta.url)))
+function repositoryRoot() {
+  const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: GATE_SCRIPTS_DIR,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).toString().trim()
+  return fs.realpathSync(root)
+}
+
+let gitRoot = null
+try {
+  gitRoot = repositoryRoot()
+} catch {
+  gitRoot = null
+}
+
+// The gate compares the content of the modules with the content in the
+// commit. It does not ask git whether the file is modified: `git status`
+// answers from the index's stat cache, so a module the operator marked
+// assume-unchanged or skip-worktree is reported as clean while its bytes
+// differ from the committed ones, and the recovery would then run the
+// operator's version of itself.
 //
-// The paths come from the driver's own location, and the root comes from git,
-// so nothing an operator can edit in another module can point the gate at
-// the wrong files.
-const GATE_SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url))
+// The comparison is between the bytes on disk and the bytes in the commit.
+// A checkout that rewrites line endings holds different bytes for the same
+// code, so a difference that is only the line endings is the same file; any
+// other difference is a different file and stops the recovery. The gate does
+// not ask git what the filters would do to the file, so no filter
+// configuration can hide an edit from it.
+//
+// The paths come from the driver's own location, and the root comes from
+// git, so nothing an operator can edit in another module can point the gate
+// at the wrong files.
 const RECOVERY_MODULES = ['leftover.mjs', 'restore.mjs', 'mutations.mjs']
+
+// Two files that differ only in the line endings a checkout rewrites hold
+// the same code.
+function sameCode(working, committed) {
+  if (working.equals(committed)) return true
+  return withoutCarriageReturns(working).equals(withoutCarriageReturns(committed))
+}
+
+function withoutCarriageReturns(buffer) {
+  return Buffer.from(buffer.toString('binary').split('\r\n').join('\n'), 'binary')
+}
+
 function recoveryPathState() {
   try {
-    const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: GATE_SCRIPTS_DIR,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).toString().trim()
-    const scriptsDir = path.relative(root, GATE_SCRIPTS_DIR).split(path.sep).join('/')
+    if (!gitRoot) return null
+    const scriptsDir = path.relative(gitRoot, GATE_SCRIPTS_DIR).split(path.sep).join('/')
     const differs = RECOVERY_MODULES.some((name) => {
       const rel = `${scriptsDir}/${name}`
-      const working = execFileSync('git', ['hash-object', `--path=${rel}`, path.join(GATE_SCRIPTS_DIR, name)], {
-        cwd: root,
+      const working = fs.readFileSync(path.join(GATE_SCRIPTS_DIR, name))
+      const committed = execFileSync('git', ['cat-file', 'blob', `HEAD:${rel}`], {
+        cwd: gitRoot,
         stdio: ['ignore', 'pipe', 'pipe'],
-      }).toString().trim()
-      const committed = execFileSync('git', ['rev-parse', `HEAD:${rel}`], {
-        cwd: root,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }).toString().trim()
-      return working !== committed
+      })
+      return !sameCode(working, committed)
     })
     return differs
   } catch {
@@ -396,7 +453,7 @@ if (recoveryState === false) {
   }
   try {
     recovered = restoreLeftoverMutations({
-      repoRoot: REPO_ROOT,
+      repoRoot: gitRoot,
       mutations: MUTATIONS,
       cache: committedCache,
       beforeWrite: () => lockIsOurs(),
@@ -514,14 +571,27 @@ function restoreAll() {
   // lock over may be mutating the file this one would write.
   if (!lockIsOurs()) {
     lockLost = true
-    restored = true
+    restoreOutcome = { restored: 0, touched: touched.size, lostLock: lockProblem(), failed: false }
     return
   }
+  let count = 0
+  let failed = false
   for (const [file, source] of touched) {
-    fs.writeFileSync(file, source)
-    if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
+    if (!writeTargetIsSafe(file)) {
+      failed = true
+      report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'the path is not a plain file inside the repository')
+      continue
+    }
+    try {
+      fs.writeFileSync(file, source)
+      count++
+      if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
+    } catch (err) {
+      failed = true
+      report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, `could not restore the file: ${err.message}`)
+    }
   }
-  restored = true
+  restoreOutcome = { restored: count, touched: touched.size, lostLock: null, failed }
 }
 
 // The `finally` below covers ordinary failures. A signal arriving while the test
@@ -559,8 +629,9 @@ try {
       // own mutation: the driver that holds the lock now may be mutating the
       // very file this one would write, and overwriting it would corrupt
       // that run's evidence.
-      if (lockIsOurs()) fs.writeFileSync(state.target, state.source)
-      else lockLost = true
+      if (!lockIsOurs()) lockLost = true
+      else if (writeTargetIsSafe(state.target)) fs.writeFileSync(state.target, state.source)
+      else report.check(`restored ${path.relative(REPO_ROOT, state.target)}`, false, 'the path is not a plain file inside the repository')
     }
     if (interrupted) break
     completed++

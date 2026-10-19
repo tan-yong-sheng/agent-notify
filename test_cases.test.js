@@ -1705,7 +1705,7 @@ function committedFile(root, file) {
 async function runMutationRestoreTests() {
   console.log('\nRunning mutation driver restore tests...\n')
 
-  const { findLeftoverMutations, findRevertedFixes, restoreLeftoverMutations, isDirty } = await recoveryModules()
+  const { findLeftoverMutations, findRevertedFixes, restoreLeftoverMutations, isDirty, restoreOutcomeMessage } = await recoveryModules()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-restore-'))
   const gitEnv = {
     ...process.env,
@@ -1722,6 +1722,16 @@ async function runMutationRestoreTests() {
   const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
   const source = committedFile(repoRoot, 'shared/service.mjs')
   const mutations = [entry]
+
+  // The message the driver leaves on the way out has to say what happened to
+  // the files it touched. A restore whose writes failed is not a lost lock,
+  // and a driver that says otherwise sends the operator looking at a lock it
+  // still holds.
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: null, failed: true }) === 'the files this driver touched could not be restored', 'a failed write is reported as a failed write')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: null, failed: true }).includes('lock') === false, 'a failed write is not blamed on the lock')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: 'another mutation driver took the lock over', failed: false }).includes('another mutation driver took the lock over'), 'a lost lock is reported as a lost lock')
+  assert(restoreOutcomeMessage({ restored: 2, touched: 2, lostLock: null, failed: false }) === 'restored 2 tracked file(s) before exiting', 'a restore that happened is reported as a restore')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 0, lostLock: null, failed: false }) === 'there was nothing to restore', 'a driver that touched nothing says so')
 
   try {
     execSync('git init', { cwd: dir, stdio: 'ignore' })
@@ -1901,7 +1911,6 @@ async function runMutationRestoreCommandTests() {
     GIT_COMMITTER_EMAIL: 'test@example.com',
   }
   const repoRoot = path.dirname(fileURLToPath(import.meta.url))
-  const scripts = path.join(dir, '.agents/skills/verify/scripts')
   const MUTATIONS = await loadCatalogue()
   const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
   const source = committedFile(repoRoot, 'shared/service.mjs')
@@ -1913,30 +1922,40 @@ async function runMutationRestoreCommandTests() {
   // evaluated, so a test can see when it was loaded.
   const markOnLoad = (text) => `import { writeFileSync as __mark } from 'node:fs'\n__mark(${JSON.stringify(marker)}, 'loaded')\n${text}`
 
+  // A driver run that is meant to be short gets a short leash: a run that
+  // turns into a mutation sweep would take minutes, and the test that runs it
+  // has to fail rather than wait.
   const runIn = (root, args) => {
     try {
-      return { code: 0, out: execFileSync(process.execPath, [path.join(root, '.agents/skills/verify/scripts/mutate.mjs'), ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv }) }
+      return { code: 0, out: execFileSync(process.execPath, [path.join(root, '.agents/skills/verify/scripts/mutate.mjs'), ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, timeout: 60000 }) }
     } catch (err) {
       return { code: err.status ?? 1, out: `${err.stdout || ''}${err.stderr || ''}` }
     }
   }
   const run = (args) => runIn(dir, args)
 
-  try {
-    fs.mkdirSync(scripts, { recursive: true })
-    fs.mkdirSync(path.join(dir, 'shared'))
-    // The driver reads its own scripts and the suite it drives, so the copy
-    // has to carry them: the driver's repository root is derived from where
-    // it sits.
+  // A throwaway copy of the driver and the suite, in a repository of its own.
+  // The driver finds its repository root from where it sits, so a copy has to
+  // carry the scripts, the suite and a file the catalogue can mutate.
+  const makeRepo = (root, { git = true } = {}) => {
+    const rootScripts = path.join(root, '.agents/skills/verify/scripts')
+    fs.mkdirSync(rootScripts, { recursive: true })
+    fs.mkdirSync(path.join(root, 'shared'), { recursive: true })
     for (const name of ['mutate.mjs', 'restore.mjs', 'leftover.mjs', 'lib.mjs', 'mutations.mjs']) {
-      fs.copyFileSync(path.join(repoRoot, '.agents/skills/verify/scripts', name), path.join(scripts, name))
+      fs.copyFileSync(path.join(repoRoot, '.agents/skills/verify/scripts', name), path.join(rootScripts, name))
     }
-    fs.copyFileSync(path.join(repoRoot, 'test_cases.test.js'), path.join(dir, 'test_cases.test.js'))
-    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), source)
-    execSync('git init', { cwd: dir, stdio: 'ignore', env: gitEnv })
-    execSync('git add .', { cwd: dir, stdio: 'ignore', env: gitEnv })
-    execSync('git commit -m init', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    fs.copyFileSync(path.join(repoRoot, 'test_cases.test.js'), path.join(root, 'test_cases.test.js'))
+    fs.writeFileSync(path.join(root, 'shared/service.mjs'), source)
+    if (git) {
+      execSync('git init', { cwd: root, stdio: 'ignore', env: gitEnv })
+      execSync('git add .', { cwd: root, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m init', { cwd: root, stdio: 'ignore', env: gitEnv })
+    }
+    return rootScripts
+  }
 
+  try {
+    const scripts = makeRepo(dir)
     const leftover = source.replace(entry.find, entry.replace)
     assert(leftover !== source, 'the catalogue entry still applies to the shipped file')
 
@@ -2134,13 +2153,7 @@ async function runMutationRestoreCommandTests() {
     // rather than guessing whether the recovery path is the shipped one.
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-nogit-'))
     try {
-      const outsideScripts = path.join(outside, '.agents/skills/verify/scripts')
-      fs.mkdirSync(outsideScripts, { recursive: true })
-      fs.mkdirSync(path.join(outside, 'shared'))
-      for (const name of ['mutate.mjs', 'restore.mjs', 'leftover.mjs', 'lib.mjs', 'mutations.mjs']) {
-        fs.copyFileSync(path.join(repoRoot, '.agents/skills/verify/scripts', name), path.join(outsideScripts, name))
-      }
-      fs.copyFileSync(path.join(repoRoot, 'test_cases.test.js'), path.join(outside, 'test_cases.test.js'))
+      makeRepo(outside, { git: false })
       fs.writeFileSync(path.join(outside, 'shared/service.mjs'), leftover)
       const noGit = runIn(outside, ['--restore'])
       assert(noGit.code === 2, 'the driver exits 2 when it cannot read the worktree state from git')
@@ -2175,8 +2188,178 @@ async function runMutationRestoreCommandTests() {
     } finally {
       fs.rmSync(outsideDir, { recursive: true, force: true })
     }
+    // The block above put a link where the shared directory was, so it has to
+    // be a directory again before anything else reads a file in it.
+    fs.unlinkSync(path.join(dir, 'shared'))
+    fs.mkdirSync(path.join(dir, 'shared'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), source)
+
+    // A flag that is present is a flag. `--restore` with a file name after it
+    // is still a restore, and must not turn into a mutation sweep.
+    // The unrelated edit of doctor.mjs above is still in the tree, so it is
+    // put back: the runs below are about the flags, not about a dirty tree.
+    fs.writeFileSync(path.join(scripts, 'doctor.mjs'), '// a script the recovery never loads\n')
+    fs.rmSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json'), { force: true })
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const restoreWithFile = run(['--restore', 'shared/service.mjs'])
+    assert(restoreWithFile.code === 0, 'the driver exits 0 when --restore is given a file name')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover is undone when --restore is given a file name')
+    assert(fs.existsSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json')) === false, 'a restore with a file name after it does not run a mutation sweep')
+
+    // The same for the other boolean flag.
+    const preflightWithFile = run(['--preflight', 'shared/service.mjs'])
+    assert(preflightWithFile.out.includes('mutations are runnable'), '--preflight with a file name after it is still a preflight')
+    assert(fs.existsSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json')) === false, 'a preflight with a file name after it does not run a mutation sweep')
+
+    // A clean filter can hide an edit from git. The filter runs before git
+    // compares anything, so a file whose edit the filter removes looks
+    // unmodified to `git status` and to any hash git computes. The gate
+    // compares the bytes on disk with the bytes in the commit, so it sees
+    // the edit the filter hides.
+    const filtered = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-filter-'))
+    try {
+      const filteredScripts = makeRepo(filtered)
+      fs.writeFileSync(path.join(filtered, '.gitattributes'), '*.mjs filter=hide-edit\n')
+      execSync('git config filter.hide-edit.clean "grep -v HIDDEN_EDIT"', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      const shippedRestoreInFiltered = fs.readFileSync(path.join(filteredScripts, 'restore.mjs'), 'utf8')
+      fs.writeFileSync(path.join(filteredScripts, 'restore.mjs'), `${shippedRestoreInFiltered}\n// HIDDEN_EDIT\n`)
+      execSync('git add .', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m filtered', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      fs.writeFileSync(path.join(filtered, 'shared/service.mjs'), leftover)
+      const filteredRun = runIn(filtered, ['--restore'])
+      assert(filteredRun.code === 2, 'the driver exits 2 when a clean filter hides an edit of the recovery path')
+      assert(filteredRun.out.includes('the recovery path has uncommitted changes'), 'the gate sees the edit that the clean filter hides')
+      assert(fs.readFileSync(path.join(filtered, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when a clean filter hides the edit')
+    } finally {
+      fs.rmSync(filtered, { recursive: true, force: true })
+    }
+
+    // A checkout that rewrites line endings holds different bytes for the
+    // same code. The gate compares the code, so such a checkout is not an
+    // edited recovery path.
+    const eol = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-eol-'))
+    try {
+      const eolScripts = makeRepo(eol)
+      execSync('git config core.autocrlf true', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      const shippedRestoreInEol = fs.readFileSync(path.join(eolScripts, 'restore.mjs'), 'utf8')
+      fs.writeFileSync(path.join(eolScripts, 'restore.mjs'), shippedRestoreInEol.split('\n').join('\r\n'))
+      execSync('git add .', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      // The line endings are the only change, so the blob does not move and
+      // there is nothing to commit. The commit is empty on purpose: the
+      // point of the test is what the worktree holds, not what the commit
+      // holds.
+      execSync('git commit --allow-empty -m eol', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      fs.writeFileSync(path.join(eol, 'shared/service.mjs'), leftover)
+      const eolRun = runIn(eol, ['--restore'])
+      assert(eolRun.code === 0, 'the driver runs when the checkout only rewrites line endings')
+      assert(fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8') === source, 'the leftover is undone when the checkout only rewrites line endings')
+    } finally {
+      fs.rmSync(eol, { recursive: true, force: true })
+    }
+
+    // The driver puts back the files it mutated, and it puts them where
+    // they were. A file the operator replaced with a link while the run was
+    // going must not receive the content the driver was going to write.
+    const linked = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-linked-'))
+    const victimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-victim-'))
+    try {
+      makeRepo(linked)
+      const victim = path.join(victimDir, 'victim.txt')
+      fs.writeFileSync(victim, "the operator's own file\n")
+      // The suite the driver runs is replaced by one that swaps the mutated
+      // file for a link, so the driver's own undo is the write under test.
+      const mutated = path.join(linked, 'shared/service.mjs')
+      fs.writeFileSync(path.join(linked, 'test_cases.test.js'), [
+        `import { unlinkSync, symlinkSync } from 'node:fs'`,
+        `unlinkSync(${JSON.stringify(mutated)})`,
+        `symlinkSync(${JSON.stringify(victim)}, ${JSON.stringify(mutated)})`,
+        `console.log('Results: 1/1 passed')`,
+        `// ${entry.expectTest}`,
+        '',
+      ].join('\n'))
+      execSync('git add .', { cwd: linked, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m linked', { cwd: linked, stdio: 'ignore', env: gitEnv })
+      const linkedRun = runIn(linked, ['--only', entry.id])
+      assert(fs.readFileSync(victim, 'utf8') === "the operator's own file\n", 'the driver does not write the file it mutated through a link')
+      assert(linkedRun.out.includes('the path is not a plain file inside the repository'), 'the driver says it refused to write through a link')
+    } finally {
+      fs.rmSync(linked, { recursive: true, force: true })
+      fs.rmSync(victimDir, { recursive: true, force: true })
+    }
+
+    // The recovery searches the tree git says the driver is in, not the tree
+    // an edited helper points at. The helper is not behind the gate, so it
+    // must not be able to send the recovery somewhere else.
+    const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-decoy-'))
+    try {
+      makeRepo(decoy)
+      fs.writeFileSync(path.join(decoy, 'shared/service.mjs'), leftover)
+      const shippedLibInDir = fs.readFileSync(path.join(scripts, 'lib.mjs'), 'utf8')
+      fs.writeFileSync(path.join(scripts, 'lib.mjs'), shippedLibInDir.replace(
+        "export const REPO_ROOT = path.resolve(SKILL_ROOT, '..', '..', '..')",
+        `export const REPO_ROOT = ${JSON.stringify(decoy)}`,
+      ))
+      fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+      const redirected = run(['--restore'])
+      assert(redirected.out.includes('restored shared/service.mjs'), 'the recovery undoes the leftover in the tree git says the driver is in')
+      assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover in the tree git says the driver is in is undone')
+      assert(fs.readFileSync(path.join(decoy, 'shared/service.mjs'), 'utf8') === leftover, 'the recovery leaves the tree an edited helper points at alone')
+      fs.writeFileSync(path.join(scripts, 'lib.mjs'), shippedLibInDir)
+    } finally {
+      fs.rmSync(decoy, { recursive: true, force: true })
+    }
+
+    // A broken recovery module must fail the recovery tests, not take the
+    // whole suite down with it: the suite is what decides whether a mutation
+    // was caught, so it has to be able to report a broken recovery rather
+    // than vanish. A suite whose catalogue does not parse still prints its
+    // results. The nested suite is told not to run this test again, or the
+    // two suites would nest forever.
+    if (!process.env.AGENT_NOTIFY_NO_NESTED_SUITE) {
+      const nested = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-nested-'))
+      try {
+        const tracked = execSync('git ls-files', { cwd: repoRoot, encoding: 'utf8' }).split('\n').filter(Boolean)
+        for (const file of tracked) {
+          const target = path.join(nested, file)
+          fs.mkdirSync(path.dirname(target), { recursive: true })
+          fs.copyFileSync(path.join(repoRoot, file), target)
+        }
+        execSync('git init', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git add .', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git commit -m init', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        fs.writeFileSync(path.join(nested, '.agents/skills/verify/scripts/mutations.mjs'), 'export const MUTATIONS = [\n')
+        execSync('git add .', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git commit -m broken-catalogue', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        let nestedCode = 0
+        let nestedOut = ''
+        try {
+          nestedOut = execFileSync(process.execPath, ['test_cases.test.js'], { cwd: nested, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...gitEnv, AGENT_NOTIFY_NO_NESTED_SUITE: '1' } })
+        } catch (err) {
+          nestedCode = err.status ?? 1
+          nestedOut = `${err.stdout || ''}${err.stderr || ''}`
+        }
+        assert(nestedOut.includes('Results:'), 'the suite still reports its results when a recovery module cannot be loaded')
+        assert(nestedOut.includes('the mutation restore tests could not run'), 'the recovery test group is named when it cannot run')
+        assert(nestedCode === 1, 'the suite fails when a recovery module cannot be loaded')
+      } finally {
+        fs.rmSync(nested, { recursive: true, force: true })
+      }
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// A broken recovery module must fail the recovery tests, not take the whole
+// suite down with it: the suite is the thing that decides whether a mutation
+// was caught, and it has to be able to report a broken recovery rather than
+// vanish. So each recovery test runs behind a guard that turns a thrown
+// error into a failed test and lets the rest of the suite report.
+async function runRecoveryTest(name, fn) {
+  try {
+    await fn()
+  } catch (err) {
+    assert(false, `${name}: ${err && err.message ? err.message : err}`)
   }
 }
 
@@ -2190,9 +2373,9 @@ async function main() {
   await runTailscaleTests()
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
-  await runMutationRestoreTests()
-  await runMutationProtectionTests()
-  await runMutationRestoreCommandTests()
+  await runRecoveryTest('the mutation restore tests could not run', runMutationRestoreTests)
+  await runRecoveryTest('the mutation protection tests could not run', runMutationProtectionTests)
+  await runRecoveryTest('the mutation restore command tests could not run', runMutationRestoreCommandTests)
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {

@@ -228,6 +228,23 @@ export function isProtectedFile(repoRoot, file) {
   return isUnder(target, scripts)
 }
 
+// What the driver says on its way out, in words that do not claim a restore
+// that did not happen. The three cases are different problems and the
+// operator has to be able to tell them apart: a restore that happened, a
+// restore that was refused because the lock was lost, and a restore whose
+// writes failed. A driver that lost the lock says so, and a driver whose
+// writes failed says that instead of blaming a lock it still holds.
+export function restoreOutcomeMessage({ restored, touched, lostLock, failed }) {
+  if (lostLock) return `left the files this driver touched alone, because ${lostLock}`
+  if (touched === 0) return 'there was nothing to restore'
+  if (failed) {
+    return restored > 0
+      ? `restored ${restored} of the ${touched} tracked file(s) it touched, and the rest could not be restored`
+      : 'the files this driver touched could not be restored'
+  }
+  return `restored ${restored} tracked file(s) before exiting`
+}
+
 // One report per driver: every check prints the same way, evidence is written
 // once, and the exit code is the reason a run failed.
 export function makeReport(title) {
