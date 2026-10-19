@@ -169,14 +169,21 @@ if (readLockHolder()?.pid !== process.pid) {
   console.error('refusing to run: the mutation lock was not ours after it was taken; another driver started at the same time')
   process.exit(2)
 }
+let lockReleased = false
 const releaseLock = () => {
   // Only the holder may remove the lock: a driver that lost it to a takeover
   // must not delete the new owner's.
+  if (lockReleased) return
   if (readLockHolder()?.pid !== process.pid) return
   try {
     fs.rmSync(lockFile, { force: true })
+    lockReleased = true
   } catch {}
 }
+
+// Whether this driver still owns the lock. A driver that has already
+// released it is done, so its own exit handler is not a takeover.
+const lockIsOurs = () => lockReleased || readLockHolder()?.pid === process.pid
 
 // The `finally` at the end of the run covers ordinary failures. A signal
 // arriving while the test child runs would skip it, so restore from the
@@ -191,7 +198,7 @@ let restored = false
 function restoreOnce() {
   if (restored) return
   restored = true
-  if (readLockHolder()?.pid !== process.pid) {
+  if (!lockIsOurs()) {
     console.error('not restoring the files this driver touched: the mutation lock was taken over')
     releaseLock()
     return
@@ -261,7 +268,7 @@ if (scriptsState === true) {
       repoRoot: REPO_ROOT,
       mutations: MUTATIONS,
       cache: committedCache,
-      beforeWrite: () => readLockHolder()?.pid === process.pid,
+      beforeWrite: () => lockIsOurs(),
     })
   } catch (err) {
     console.error(`refusing to run: could not undo the leftover of a killed run (${err.message})`)
@@ -353,7 +360,7 @@ const abortedIds = []
 function restoreAll() {
   // A driver that has lost the lock does not write: the driver that took the
   // lock over may be mutating the file this one would write.
-  if (readLockHolder()?.pid !== process.pid) {
+  if (!lockIsOurs()) {
     console.error('not restoring the files this driver touched: the mutation lock was taken over')
     return
   }
@@ -361,6 +368,7 @@ function restoreAll() {
     fs.writeFileSync(file, source)
     if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
   }
+  restored = true
 }
 
 // The `finally` below covers ordinary failures. A signal arriving while the test
