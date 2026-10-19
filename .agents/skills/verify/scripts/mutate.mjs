@@ -150,7 +150,14 @@ const releaseLock = () => {
 // catalogue mutation produces from the committed file — so it is undone here,
 // under the lock, before the tree is judged. The whole catalogue is searched,
 // not just the selected mutations, because the leftover may be any of them.
-const recovered = restoreLeftoverMutations({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+let recovered = []
+try {
+  recovered = restoreLeftoverMutations({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+} catch (err) {
+  console.error(`refusing to run: could not undo the leftover of a killed run (${err.message})`)
+  releaseLock()
+  process.exit(2)
+}
 for (const file of recovered) {
   console.log(`restored ${file} — a killed mutation run had left it mutated`)
 }
