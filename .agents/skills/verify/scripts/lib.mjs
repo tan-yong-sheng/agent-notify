@@ -142,10 +142,15 @@ export function gitHead(dir = REPO_ROOT) {
   }
 }
 
-export function isDirty(dir = REPO_ROOT, { trackedOnly = false } = {}) {
+// Whether the worktree has changes, and whether any of them are in the given
+// paths. The answer is tri-state: true, false, or null when git could not be
+// read. An unknown state is not a clean one, so the caller must not act on
+// it as if the tree were untouched.
+export function isDirty(dir = REPO_ROOT, { trackedOnly = false, paths = [] } = {}) {
   try {
     const args = ['status', '--porcelain']
     if (trackedOnly) args.push('--untracked-files=no')
+    if (paths.length) args.push('--', ...paths)
     return execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim() !== ''
   } catch {
     return null

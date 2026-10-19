@@ -19,9 +19,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
+import { parseArgs, flagValue, makeReport, REPO_ROOT, SKILL_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
-import { restoreLeftoverMutations, readCommittedFile, findRevertedFixes, isProtectedFile, scriptsAreDirty } from './restore.mjs'
+import { readCommittedFile, findRevertedFixes, isProtectedFile } from './leftover.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
@@ -249,12 +249,26 @@ function reportUnrecovered() {
 // The recovery runs code from the worktree. If the operator has uncommitted
 // edits to the scripts that carry it, that code is theirs and not the shipped
 // one, so the recovery is skipped rather than run against their other work.
+//
+// The guard is asked of git directly, in the driver's own plumbing, and not of
+// the recovery path: a guard that lived inside the code it guards could be
+// edited away by the very operator it is meant to hold back. Only tracked
+// modifications count, because a stray untracked file in the directory does
+// not change the code the recovery runs.
+//
 // A git failure is not a clean tree, so the driver refuses rather than
 // guessing.
+//
+// Only once the guard has passed is the writing half of the recovery loaded,
+// and it is loaded with a dynamic import: a static import would evaluate the
+// operator's uncommitted restore.mjs before the guard had a say, so the
+// recovery would run code it just refused to trust. The read-only half lives
+// in leftover.mjs and is loaded with the driver, because it cannot write.
 const committedCache = new Map()
-let recovered = []
+let recovered = { restored: [], skipped: [] }
 let recoverySkipped = false
-const scriptsState = scriptsAreDirty(REPO_ROOT)
+const scriptsPath = path.relative(REPO_ROOT, path.join(SKILL_ROOT, 'scripts'))
+const scriptsState = isDirty(REPO_ROOT, { trackedOnly: true, paths: [scriptsPath] })
 if (scriptsState === true) {
   recoverySkipped = true
   console.error('skipping the leftover recovery: the verification scripts have uncommitted changes, so the recovery is not the shipped one')
@@ -263,6 +277,14 @@ if (scriptsState === true) {
   releaseLock()
   process.exit(2)
 } else {
+  let restoreLeftoverMutations
+  try {
+    ;({ restoreLeftoverMutations } = await import('./restore.mjs'))
+  } catch (err) {
+    console.error(`refusing to run: could not load the leftover recovery (${err.message})`)
+    releaseLock()
+    process.exit(2)
+  }
   try {
     recovered = restoreLeftoverMutations({
       repoRoot: REPO_ROOT,
