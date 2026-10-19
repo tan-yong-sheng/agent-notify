@@ -276,6 +276,13 @@ function reportUnrecovered() {
 // The driver's own plumbing — the guard itself included — is loaded with the
 // driver, because a guard that lived inside the code it guards could be
 // edited away by the very operator it is meant to hold back.
+//
+// The gate covers the whole scripts directory, so an uncommitted change to
+// any part of the recovery — the plumbing the writer reads the committed
+// content with included — skips the recovery rather than running the
+// operator's version of it. What the gate cannot cover is itself and the
+// driver that asks it; those are the operator's own code, and the gate is
+// asked of git there on purpose.
 const committedCache = new Map()
 let recovered = { restored: [], skipped: [] }
 let recoverySkipped = false

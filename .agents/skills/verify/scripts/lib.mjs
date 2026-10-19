@@ -189,7 +189,7 @@ function readCommittedFileUncached(repoRoot, file) {
   try {
     return execFileSync('git', ['show', `HEAD:${file}`], {
       cwd: repoRoot,
-          stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
   } catch {
     return null
