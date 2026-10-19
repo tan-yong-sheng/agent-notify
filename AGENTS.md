@@ -80,3 +80,21 @@ For non-skill agents, treat the task map below as the local onboarding source: r
 | understand a finding | `fallow explain <issue-type>` |
 | scope a monorepo | `--workspace <glob> / --changed-workspaces <ref>` (global flags, prefix any command) |
 <!-- fallow:setup-hooks:end -->
+
+## Worktrees
+
+Feature worktrees live in `.worktrees/<name>` (gitignored). The nono sandbox blocks creating them as sibling directories outside the repo.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub issues via the `gh` CLI (repo: `tan-yong-sheng/agent-notify`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles under their default names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`, created lazily. See `docs/agents/domain.md`.
