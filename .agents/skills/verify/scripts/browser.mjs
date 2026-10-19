@@ -321,36 +321,46 @@ async function launch() {
   const port = flags.port && flags.port !== true ? Number(flags.port) : await freePort()
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-chrome-'))
   const url = flags.url && flags.url !== true ? String(flags.url) : 'about:blank'
+  // Chrome is always started on about:blank and navigated afterwards, so the
+  // caller's URL cannot reach a browser before the sandbox check below runs: an
+  // argument would load the page first and ask about the sandbox second.
 
-  let attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: [] })
+  let attempt = await startChrome({ chrome, port, userDataDir, url: 'about:blank', extraArgs: [] })
   // A browser that started but cannot be used must not be left behind: its
   // process and its profile dir would outlive the driver, and drive-ui.mjs only
   // calls close after a launch that succeeded.
-  const abort = (message) => {
+  const abort = async (message) => {
     try {
       attempt?.child.kill('SIGKILL')
     } catch {}
     fs.rmSync(statePath, { force: true })
+    // Wait for the browser's helpers to go before deleting the profile they were
+    // writing into: removing it mid-write can fail on files that reappear, and the
+    // failure used to be dropped silently.
+    if (attempt?.info) await endpointGone(port, Date.now() + 3000)
+    else await sleep(150)
     try {
       fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
-    } catch {}
+    } catch {
+      console.log(`note: could not remove the disposable profile ${userDataDir}; deleting it by hand is safe`)
+    }
     throw new Error(message)
   }
   let sandbox = 'on'
   if (!attempt.info) {
     const log = attempt.log
     if (!SANDBOX_REFUSAL.test(log)) {
-      abort(
+      await abort(
         `Chrome did not expose a debugger on port ${port}, and the failure is not a sandbox refusal, so it is not retried with the sandbox off\n${tailOf(log)}`
       )
     }
     attempt.child.kill('SIGKILL')
-    attempt = await startChrome({ chrome, port, userDataDir, url, extraArgs: ['--no-sandbox', '--disable-setuid-sandbox'] })
+    attempt = await startChrome({ chrome, port, userDataDir, url: 'about:blank', extraArgs: ['--no-sandbox', '--disable-setuid-sandbox'] })
     sandbox = 'off'
   }
-  if (!attempt.info) abort(`Chrome did not expose a debugger on port ${port}\n${tailOf(attempt.log)}`)
+  if (!attempt.info) await abort(`Chrome did not expose a debugger on port ${port}\n${tailOf(attempt.log)}`)
   if (sandbox === 'off' && !isLocalUrl(url)) {
-    abort(
+    await abort(
       `Chrome only started without its sandbox, and this driver will not point an unsandboxed browser at ${url}: only about:blank, data: and http(s) on 127.0.0.1, localhost or [::1] are allowed. Pass a local URL, or fix the sandbox refusal (see SKILL.md).`
     )
   }
@@ -363,7 +373,7 @@ async function launch() {
   try {
     await open(url)
   } catch (err) {
-    abort(`Chrome started on port ${port} but the first navigation to ${url} failed: ${err.message}`)
+    await abort(`Chrome started on port ${port} but the first navigation to ${url} failed: ${err.message}`)
   }
   console.log(`launched ${path.basename(chrome)} pid ${attempt.child.pid} on port ${port} (browser sandbox ${sandbox})`)
 }
