@@ -45,6 +45,13 @@ function missingAnchorReason(mutation) {
   if (committed !== null && countOccurrences(committed.toString('utf8'), mutation.find) === 0) {
     return 'anchor not found in the worktree or in HEAD — this fix looks reverted in a commit, or moved to another file; check git log for this file'
   }
+  const source = fs.existsSync(path.join(REPO_ROOT, mutation.file)) ? fs.readFileSync(path.join(REPO_ROOT, mutation.file), 'utf8') : ''
+  // A checkout that rewrites line endings cannot match an LF anchor, and
+  // restoring cannot help either, so sending the operator to --restore would
+  // be a dead end.
+  if (source.includes('\r\n') && !committed?.toString('utf8').includes('\r\n')) {
+    return 'anchor not found in the worktree — this checkout rewrites line endings, so the anchor cannot match; the mutation needs a checkout that keeps LF'
+  }
   return 'anchor not found in the worktree — a killed mutation run may have replaced it; run with --restore'
 }
 
@@ -176,10 +183,19 @@ const releaseLock = () => {
 // in-memory copy on the way out. These handlers are registered before the
 // leftover recovery, so an interrupt during the recovery still releases the
 // lock and the tree is left as it was found.
+//
+// A driver that has lost the lock does not write: another driver has taken
+// the lock over and may be mutating the very file this one would write, so
+// writing would corrupt that run's evidence.
 let restored = false
 function restoreOnce() {
   if (restored) return
   restored = true
+  if (readLockHolder()?.pid !== process.pid) {
+    console.error('not restoring the files this driver touched: the mutation lock was taken over')
+    releaseLock()
+    return
+  }
   for (const [file, source] of touched) {
     try {
       fs.writeFileSync(file, source)
@@ -199,15 +215,11 @@ for (const signal of INTERRUPTS) {
   })
 }
 
-// The recovery runs code from the worktree. If the operator has uncommitted
-// edits to the scripts that carry it, that code is theirs and not the shipped
-// one, so the recovery is skipped rather than run against their other work.
-
 // Say what the recovery found, in facts rather than guesses about who owns the
 // changes. A leftover that the operator has since edited no longer matches
 // byte for byte, so it is named as a reverted fix instead of being claimed.
 function reportUnrecovered() {
-  const reverted = findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+  const reverted = findRevertedFixes({ repoRoot: REPO_ROOT, mutations: MUTATIONS, cache: committedCache })
   if (!reverted.length) {
     console.error('           no file matches a leftover of a killed mutation run exactly')
     return
@@ -226,14 +238,29 @@ function reportUnrecovered() {
 //
 // The lock is re-checked before every write: a driver that lost the lock to a
 // takeover must not rewrite the file the new owner is mutating.
+//
+// The recovery runs code from the worktree. If the operator has uncommitted
+// edits to the scripts that carry it, that code is theirs and not the shipped
+// one, so the recovery is skipped rather than run against their other work.
+// A git failure is not a clean tree, so the driver refuses rather than
+// guessing.
+const committedCache = new Map()
 let recovered = []
-if (scriptsAreDirty(REPO_ROOT)) {
+let recoverySkipped = false
+const scriptsState = scriptsAreDirty(REPO_ROOT)
+if (scriptsState === true) {
+  recoverySkipped = true
   console.error('skipping the leftover recovery: the verification scripts have uncommitted changes, so the recovery is not the shipped one')
+} else if (scriptsState === null) {
+  console.error('refusing to run: could not read the worktree state from git, so the leftover recovery cannot be trusted')
+  releaseLock()
+  process.exit(2)
 } else {
   try {
     recovered = restoreLeftoverMutations({
       repoRoot: REPO_ROOT,
       mutations: MUTATIONS,
+      cache: committedCache,
       beforeWrite: () => readLockHolder()?.pid === process.pid,
     })
   } catch (err) {
@@ -242,8 +269,11 @@ if (scriptsAreDirty(REPO_ROOT)) {
     process.exit(2)
   }
 }
-for (const file of recovered) {
+for (const file of recovered.restored) {
   console.log(`restored ${file} — a killed mutation run had left it mutated`)
+}
+for (const file of recovered.skipped) {
+  console.error(`left ${file} alone: it changed while the leftover was being recovered`)
 }
 if (readLockHolder()?.pid !== process.pid) {
   console.error('refusing to run: the mutation lock was taken over while the leftover was being recovered')
@@ -252,6 +282,11 @@ if (readLockHolder()?.pid !== process.pid) {
 }
 
 if (restoreOnly) {
+  if (recoverySkipped) {
+    console.error('the leftover recovery was skipped, so the worktree was not touched')
+    releaseLock()
+    process.exit(2)
+  }
   const dirty = isDirty(REPO_ROOT, { trackedOnly: true })
   if (dirty === null) {
     console.error('refusing to run: could not read the worktree state from git')
@@ -316,6 +351,12 @@ let completed = 0
 const abortedIds = []
 
 function restoreAll() {
+  // A driver that has lost the lock does not write: the driver that took the
+  // lock over may be mutating the file this one would write.
+  if (readLockHolder()?.pid !== process.pid) {
+    console.error('not restoring the files this driver touched: the mutation lock was taken over')
+    return
+  }
   for (const [file, source] of touched) {
     fs.writeFileSync(file, source)
     if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
