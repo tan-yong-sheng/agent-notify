@@ -36,6 +36,17 @@ export function flagValue(flags, key, fallback) {
   return flags[key] && flags[key] !== true ? String(flags[key]) : fallback
 }
 
+export function countOccurrences(haystack, needle) {
+  if (!needle) return 0
+  let count = 0
+  let index = haystack.indexOf(needle)
+  while (index !== -1) {
+    count++
+    index = haystack.indexOf(needle, index + needle.length)
+  }
+  return count
+}
+
 export function tryJson(text) {
   try {
     return JSON.parse(text)

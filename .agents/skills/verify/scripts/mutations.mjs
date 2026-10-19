@@ -222,4 +222,12 @@ export const MUTATIONS = [
     replace: 'env: execEnv }',
     expectTest: 'a status CLI that ignores SIGTERM does not stall the snapshot',
   },
+  {
+    id: 'mutation-leftover-not-recognised',
+    file: '.agents/skills/verify/scripts/restore.mjs',
+    description: "a killed run's leftover mutation is not recognised, so the worktree stays dirty",
+    find: '    if (working !== committed.replace(mutation.find, mutation.replace)) continue',
+    replace: '    if (working === committed.replace(mutation.find, mutation.replace)) continue',
+    expectTest: 'a killed run leaves a recognisable leftover',
+  },
 ]

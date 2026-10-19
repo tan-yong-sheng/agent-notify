@@ -40,6 +40,7 @@ import {
   nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
+import { findLeftoverMutations, restoreLeftoverMutations } from './.agents/skills/verify/scripts/restore.mjs'
 import {
   normalizeAgentStatus,
   parseHerdrAgent,
@@ -1666,6 +1667,52 @@ async function runStatusCommandTimeoutTests() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests: the mutation driver's recovery from a killed run
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runMutationRestoreTests() {
+  console.log('\nRunning mutation driver restore tests...\n')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-restore-'))
+  const gitEnv = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'test',
+    GIT_AUTHOR_EMAIL: 'test@example.com',
+    GIT_COMMITTER_NAME: 'test',
+    GIT_COMMITTER_EMAIL: 'test@example.com',
+  }
+  const committed = 'const answer = 42\n'
+  const mutations = [{ id: 'sample-mutation', file: 'sample.txt', find: 'const answer = 42', replace: 'const answer = 0' }]
+
+  try {
+    execSync('git init', { cwd: dir, stdio: 'ignore' })
+    fs.writeFileSync(path.join(dir, 'sample.txt'), committed)
+    execSync('git add sample.txt', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m init', { cwd: dir, stdio: 'ignore', env: gitEnv })
+
+    // The operator's own edit is not a leftover and must never be overwritten.
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'const answer = 43\n')
+    assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'an unrelated edit is not mistaken for a leftover mutation')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'an unrelated edit is not restored')
+    assert(fs.readFileSync(path.join(dir, 'sample.txt'), 'utf8') === 'const answer = 43\n', 'an unrelated edit is left alone')
+
+    // A run that was killed outright leaves the mutation applied.
+    fs.writeFileSync(path.join(dir, 'sample.txt'), 'const answer = 0\n')
+    const leftovers = findLeftoverMutations({ repoRoot: dir, mutations })
+    assert(leftovers.length === 1, 'a killed run leaves a recognisable leftover')
+    assert(leftovers[0].id === 'sample-mutation', 'the leftover names the mutation that was applied')
+    assert(leftovers[0].file === 'sample.txt', 'the leftover names the file it was applied to')
+
+    const restored = restoreLeftoverMutations({ repoRoot: dir, mutations })
+    assert(restored.length === 1, 'the leftover is restored')
+    assert(fs.readFileSync(path.join(dir, 'sample.txt'), 'utf8') === committed, 'the committed content is put back')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'restoring twice changes nothing')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 async function main() {
   runIntegrationTests()
   await runUnitTests()
@@ -1676,6 +1723,7 @@ async function main() {
   await runTailscaleTests()
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
+  await runMutationRestoreTests()
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {

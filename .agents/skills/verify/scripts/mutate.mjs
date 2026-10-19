@@ -5,36 +5,31 @@
 //
 // Usage:
 //   node .agents/skills/verify/scripts/mutate.mjs --preflight     check anchors, write nothing
+//   node .agents/skills/verify/scripts/mutate.mjs --restore        undo a killed run's leftover, change nothing else
 //   node .agents/skills/verify/scripts/mutate.mjs [--only <id>] [--runtime node|bun]
 //
 // The run refuses to start on a dirty worktree: it edits tracked files in place
 // and restores them from memory, so a clean tree is the recovery path. It also
-// restores on SIGINT/SIGTERM/SIGHUP and on exit; a `kill -9` is the one case that
-// cannot be covered, which is exactly what the dirty-tree refusal is for.
+// restores on SIGINT/SIGTERM/SIGHUP and on exit. A `kill -9` is the one case
+// those handlers cannot cover, so the next run looks for the leftover it left:
+// a file whose bytes are exactly what one catalogue mutation produces from the
+// committed file. That leftover is undone before the tree is judged; any other
+// dirty file still stops the run.
 
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty } from './lib.mjs'
+import { parseArgs, flagValue, makeReport, REPO_ROOT, ARTIFACTS, gitHead, isDirty, countOccurrences } from './lib.mjs'
 import { MUTATIONS } from './mutations.mjs'
+import { restoreLeftoverMutations } from './restore.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 const preflight = flags.preflight === true
+const restoreOnly = flags.restore === true
 const only = flagValue(flags, 'only', '')
 const runtime = flagValue(flags, 'runtime', 'node')
 const testFile = path.join(REPO_ROOT, 'test_cases.test.js')
 const testSource = fs.readFileSync(testFile, 'utf8')
-
-function countOccurrences(haystack, needle) {
-  if (!needle) return 0
-  let count = 0
-  let index = haystack.indexOf(needle)
-  while (index !== -1) {
-    count++
-    index = haystack.indexOf(needle, index + needle.length)
-  }
-  return count
-}
 
 function inspect(mutation) {
   const target = path.join(REPO_ROOT, mutation.file)
@@ -67,11 +62,6 @@ if (preflight) {
   }
   console.log(`\n${selected.length - bad}/${selected.length} mutations are runnable`)
   process.exit(bad ? 1 : 0)
-}
-
-if (isDirty(REPO_ROOT, { trackedOnly: true })) {
-  console.error('refusing to run: tracked files have uncommitted changes, so a broken mutation could not be told apart from your work')
-  process.exit(2)
 }
 
 // A lock left by a dead run must not block every later run, and a recycled pid
@@ -152,6 +142,30 @@ const releaseLock = () => {
   try {
     fs.rmSync(lockFile, { force: true })
   } catch {}
+}
+
+// A run that was killed outright never reached its restore step, so it left one
+// mutation applied and every later run refused to start on the tree it dirtied
+// itself. The leftover is recognisable exactly — the file holds what one
+// catalogue mutation produces from the committed file — so it is undone here,
+// under the lock, before the tree is judged. The whole catalogue is searched,
+// not just the selected mutations, because the leftover may be any of them.
+const recovered = restoreLeftoverMutations({ repoRoot: REPO_ROOT, mutations: MUTATIONS })
+for (const file of recovered) {
+  console.log(`restored ${file} — a killed mutation run had left it mutated`)
+}
+
+if (restoreOnly) {
+  const dirty = isDirty(REPO_ROOT, { trackedOnly: true })
+  console.log(dirty ? 'the worktree still has uncommitted changes' : 'the worktree is clean')
+  releaseLock()
+  process.exit(dirty ? 1 : 0)
+}
+
+if (isDirty(REPO_ROOT, { trackedOnly: true })) {
+  console.error('refusing to run: tracked files have uncommitted changes, so a broken mutation could not be told apart from your work')
+  releaseLock()
+  process.exit(2)
 }
 
 function classify(mutation, output) {
