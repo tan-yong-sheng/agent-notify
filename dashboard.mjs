@@ -96,6 +96,28 @@ export function nextAgentOrder(knownIds, incomingIds) {
   return kept
 }
 
+// The last part of a directory, for a narrow screen where the whole absolute
+// path does not fit. The directory is what says which project a row belongs to,
+// so it is never dropped: an absolute path on a phone is cut to its last two
+// parts, which is what fits. A `home` prefix is folded to `~` when the caller
+// knows it, because it is the same on every row and says nothing about the
+// project — the caller passes it, this does not read the environment, so the
+// same function runs in the page and in the tests.
+export function shortPath(cwd, home = '', parts = 2) {
+  const text = typeof cwd === 'string' ? cwd.trim() : ''
+  if (!text) return ''
+  let trimmed = text.replace(/[\\/]+$/, '')
+  if (home && (trimmed === home || trimmed.startsWith(home + '/') || trimmed.startsWith(home + '\\'))) {
+    trimmed = '~' + trimmed.slice(home.length)
+  }
+  const segments = trimmed.split(/[\\/]/).filter(Boolean)
+  // A root path has no segments to shorten, and returning '' for it would hide
+  // the directory the row belongs to, which is the one thing this must not do.
+  if (segments.length === 0) return trimmed || '/'
+  if (segments.length <= parts) return trimmed
+  return '…/' + segments.slice(-parts).join('/')
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -253,6 +275,8 @@ export function renderDashboardHtml() {
       background: rgba(110, 118, 129, 0.25);
       text-decoration: underline;
     }
+    /* The short form is for a narrow screen; the full path is shown at width. */
+    .path-short { display: none; }
 
     /* Controls Bar: Search & Filter Tabs */
     .controls-bar {
@@ -462,9 +486,22 @@ export function renderDashboardHtml() {
 
       /* line 2: where it is and which branch. The path chip is dropped here and
          kept in the modal, because it was the single tallest cell on the card. */
-      tbody td:nth-child(4) { order: 4; flex: 1 1 auto; font-size: 12px; min-width: 0; }
+      /* The name and the directory share one line: the directory is what
+         identifies the project, and the name alone repeats the agent. */
+      tbody td:nth-child(4) { order: 4; flex: 1 1 auto; font-size: 12px; min-width: 0; display: flex; align-items: center; gap: 6px; }
+      tbody td:nth-child(4) > div {
+        margin-bottom: 0;
+        font-weight: 500;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       tbody td:nth-child(5) { order: 5; flex: 0 0 auto; font-size: 11px; }
-      tbody td:nth-child(4) .path-chip { display: none; }
+      /* The directory stays: it is what tells one row's project from another.
+         The full path is what does not fit, so the short form replaces it. */
+      tbody td:nth-child(4) .path-full { display: none; }
+      tbody td:nth-child(4) .path-short { display: inline-block; max-width: 100%; }
       tbody td:nth-child(4) > div { margin-bottom: 0; font-weight: 500; }
 
       /* line 3: what it is doing, truncated to one line */
@@ -594,6 +631,9 @@ export function renderDashboardHtml() {
     // An agent that has gone must not stay in the order, or a long-lived page
     // keeps sorting rows for agents that no longer exist.
     const nextAgentOrder = ${nextAgentOrder.toString()};
+    // The workspace path is the field that says which project a row belongs to,
+    // so it is never hidden; on a narrow screen it is cut to its last parts.
+    const shortPath = ${shortPath.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
     // A two-line row instead of three, for comparing density on a real phone.
@@ -723,7 +763,8 @@ export function renderDashboardHtml() {
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
               <div style="font-weight:600; margin-bottom:2px;">\${escapeHTML(a.displayName)}</div>
-              <span class="path-chip" data-copy-path="\${escapeHTML(a.cwd)}" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
+              <span class="path-chip path-full" data-copy-path="\${escapeHTML(a.cwd)}" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
+              <span class="path-chip path-short" data-copy-path="\${escapeHTML(a.cwd)}" title="\${escapeHTML(a.cwd)}">\${escapeHTML(shortPath(a.cwd, '', 2))}</span>
             </td>
             <td>\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
             <td style="max-width:340px;">

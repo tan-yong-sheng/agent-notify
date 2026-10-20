@@ -38,6 +38,7 @@ import {
   renderDashboardHtml,
   updateBannerLabel,
   nextAgentOrder,
+  shortPath,
 } from './dashboard.mjs'
 import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
@@ -756,6 +757,39 @@ async function assertUpdateFailureAndBanner() {
   assert(
     dashboardHtml.includes('agentOrder = nextAgentOrder(agentOrder,'),
     'the page rebuilds the order through it on every poll'
+  )
+
+  // A narrow screen shows the workspace directory shortened, because it is the
+  // field that says which project a row belongs to and it has to survive at
+  // every width. What it must never do is come back empty.
+  assert(shortPath('/home/me/Documents/Coding/agent-notify', '/home/me') === '…/Coding/agent-notify', 'shortPath keeps the last two segments')
+  assert(shortPath('/home/me/.pi/agent/extensions', '/home/me') === '…/agent/extensions', 'shortPath keeps the last two segments of a dotted path')
+  assert(shortPath('/home/me/Documents/Coding/agent-notify', '/home/me', 3) === '…/Documents/Coding/agent-notify', 'shortPath keeps three segments when asked')
+  assert(shortPath('/opt/work', '/home/me') === '/opt/work', 'shortPath leaves a short absolute path alone')
+  assert(shortPath('/home/me', '/home/me') === '~', 'shortPath folds the home directory')
+  assert(shortPath('/home/me/Documents', '/home/me') === '~/Documents', 'shortPath folds the home prefix')
+  assert(shortPath('/home/me/project/', '/home/me', 2) === '~/project', 'shortPath ignores a trailing slash')
+  assert(shortPath('C:\\\\Users\\\\me\\\\proj', '', 2) === '…/me/proj', 'shortPath handles Windows separators')
+
+  // The cases where a shortened path must not become nothing: a root, an empty
+  // value and a missing one. An empty string for a real directory is the one
+  // outcome that loses the information this exists to keep.
+  assert(shortPath('/', '/home/me') === '/', 'shortPath keeps a root path')
+  assert(shortPath('/', '', 1) === '/', 'shortPath keeps a root path at any width')
+  assert(shortPath('') === '', 'shortPath returns empty for an empty path')
+  assert(shortPath(undefined) === '', 'shortPath does not throw on a missing path')
+  assert(shortPath(null) === '', 'shortPath does not throw on a null path')
+  for (const real of ['/', '/opt/work', '/home/me', '/home/me/Documents']) {
+    assert(shortPath(real, '/home/me', 1) !== '', `shortPath never empties the directory ${real}`)
+  }
+
+  // The page renders both spellings and lets the width decide, so neither the
+  // full path nor the short one can disappear from the markup.
+  assert(dashboardHtml.includes('path-full'), 'the page renders the full path')
+  assert(dashboardHtml.includes('path-short'), 'the page renders the shortened path')
+  assert(
+    dashboardHtml.includes("shortPath(a.cwd, '', 2)"),
+    'the page shortens through the tested function'
   )
 }
 
