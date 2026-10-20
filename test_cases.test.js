@@ -2027,6 +2027,19 @@ async function runMutationRestoreCommandTests() {
     assert(clean.code === 0, 'the driver exits 0 when the worktree is clean')
     assert(clean.out.includes('no tracked file has uncommitted changes'), 'the driver says the tracked files are clean')
 
+    // The check is about tracked files because the driver only ever writes a
+    // tracked one: an untracked file is not the driver's and is not a leftover
+    // either, so it must not turn a successful restore into a refusal. This is
+    // the half the contract in SKILL.md used to leave out.
+    fs.writeFileSync(path.join(dir, 'operator-notes.txt'), 'not ours\n')
+    const withUntracked = run(['--restore'])
+    assert(withUntracked.code === 0, 'the driver exits 0 when only an untracked file is present')
+    assert(
+      withUntracked.out.includes('no tracked file has uncommitted changes'),
+      'the driver says the tracked files are clean even with an untracked file present'
+    )
+    fs.rmSync(path.join(dir, 'operator-notes.txt'))
+
     // A leftover of a killed run: the driver undoes it and exits 0.
     fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
     const undone = run(['--restore'])

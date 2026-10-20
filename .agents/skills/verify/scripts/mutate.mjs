@@ -616,6 +616,17 @@ try {
       report.check(mutation.id, false, `cannot run: ${state.reason}`)
       continue
     }
+    // The check at the top of the loop is not enough on its own: inspect()
+    // reads and anchors the file, and a takeover that lands in that window
+    // would let this driver write a mutation it no longer holds the lock for.
+    // It would then decline to undo it, because it no longer holds the lock,
+    // and leave its mutation in the new owner's worktree. Ask again now that
+    // that work is done and only the write and the child remain.
+    const lostDuringInspect = lockProblem()
+    if (lostDuringInspect) {
+      interrupted = lostDuringInspect
+      break
+    }
     // The driver writes the mutation into a tracked file, and it writes it
     // there and nowhere else. A file the operator replaced with a link, or a
     // directory above it replaced with one, would take the mutation
