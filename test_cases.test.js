@@ -2280,23 +2280,23 @@ async function runMutationRestoreCommandTests() {
       // point of the test is what the worktree holds, not what the commit
       // holds.
       execSync('git commit --allow-empty -m eol', { cwd: eol, stdio: 'ignore', env: gitEnv })
-      fs.writeFileSync(path.join(eol, 'shared/service.mjs'), leftover)
-      const eolRun = runIn(eol, ['--restore'])
-      assert(eolRun.code === 0, 'the driver runs when the checkout only rewrites line endings')
 
-      // The other half of a checkout that rewrites line endings: the bytes it
-      // puts in the worktree are not the bytes the mutation was written
-      // against. A mutation whose anchor spans lines can never match a file
-      // the checkout wrote with CRLF, so the run has to say so instead of
-      // blaming a killed run. Let git write those bytes itself, so the tree
-      // stays clean while the anchor misses.
+      // The recovery path here is CRLF on disk and LF in the commit, which is
+      // what the gate has to fold: a gate that called the difference an edit
+      // would refuse with exit 2 and never reach the recovery at all.
+      assert(execSync('git status --porcelain --untracked-files=no', { cwd: eol, encoding: 'utf8', env: gitEnv }).trim() === '', 'the rewritten line endings are the checkout\'s, not an edit')
+
+      // The bytes the checkout puts in the worktree are not the bytes the
+      // mutation was written against. A mutation whose anchor spans lines can
+      // never match a file the checkout wrote with CRLF, so the run has to say
+      // so instead of blaming a killed run. Let git write those bytes itself,
+      // so the tree stays clean while the anchor misses.
       const multiLineAnchor = MUTATIONS.find((m) => m.file === 'shared/service.mjs' && m.find.includes('\n'))
       assert(multiLineAnchor, 'the catalogue has a mutation whose anchor spans lines')
       fs.rmSync(path.join(eol, 'shared/service.mjs'))
       execSync('git checkout -- shared/service.mjs', { cwd: eol, stdio: 'ignore', env: gitEnv })
       const eolBytes = fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8')
       assert(eolBytes.includes('\r\n'), 'the checkout writes the line endings it was configured to write')
-      assert(execSync('git status --porcelain --untracked-files=no', { cwd: eol, encoding: 'utf8', env: gitEnv }).trim() === '', 'the rewritten line endings are the checkout\'s, not an edit')
 
       const anchorMiss = runIn(eol, ['--only', multiLineAnchor.id])
       assert(anchorMiss.code === 1, 'the run fails when a mutation anchor cannot match')
@@ -2305,14 +2305,18 @@ async function runMutationRestoreCommandTests() {
       assert(anchorMiss.out.includes(multiLineAnchor.id), 'the run names the mutation it could not run')
       assert(fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8') === eolBytes, 'the file is left alone when its anchor cannot match')
 
-      // The bytes here are the leftover a killed run leaves, written the way
-      // this checkout writes bytes. The recovery matches bytes exactly, so it
-      // cannot recognise this one, and the refusal has to name the file it
-      // could not undo rather than leave the operator to guess.
-      const crlfLeftover = leftover.split('\n').join('\r\n')
+      // A killed run on this checkout leaves a leftover in the checkout's own
+      // bytes: the CRLF file with the mutation applied. The recovery matches
+      // bytes against the committed blob, so this one cannot match, and the
+      // run has to name the file instead of undoing it. The exit code is the
+      // point: 1 means the run got past the gate and into the recovery, while
+      // a gate that mistook the CRLF recovery path for an edit would refuse
+      // with 2 and never reach it.
+      const crlfSource = source.split('\n').join('\r\n')
+      const crlfLeftover = crlfSource.replace(entry.find, entry.replace)
       fs.writeFileSync(path.join(eol, 'shared/service.mjs'), crlfLeftover)
       const crlfRestore = runIn(eol, ['--restore'])
-      assert(crlfRestore.code === 1, 'the restore fails when it cannot match the leftover')
+      assert(crlfRestore.code === 1, 'the driver reaches the recovery on a checkout that rewrites line endings')
       assert(crlfRestore.out.includes('the tracked files still have uncommitted changes'), 'the restore says the tree is still dirty')
       assert(crlfRestore.out.includes(`${entry.file} (${entry.id})`), 'the restore names the file the leftover was found in')
       assert(crlfRestore.out.includes('check them by hand'), 'the restore sends the operator to check the file by hand')
