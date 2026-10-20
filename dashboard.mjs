@@ -62,6 +62,27 @@ export function updateBannerLabel(data) {
   return data.stale ? label + ' (last known, the update check could not run)' : label
 }
 
+// The order the rows are drawn in. Exported and embedded into the page for the
+// same reason as the banner label: the browser runs the code the tests exercise.
+//
+// A known id keeps the position it was first seen at, and an id that is no
+// longer in the snapshot is dropped, so a long-lived page does not keep ordering
+// rows for agents that are gone. An agent that has never been seen is appended
+// in the order the server sent it, so it appears at the bottom instead of moving
+// the rows above it.
+export function nextAgentOrder(knownIds, incomingIds) {
+  const live = new Set(incomingIds)
+  const kept = knownIds.filter((id) => live.has(id))
+  const placed = new Set(kept)
+  for (const id of incomingIds) {
+    if (!placed.has(id)) {
+      placed.add(id)
+      kept.push(id)
+    }
+  }
+  return kept
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -454,6 +475,9 @@ export function renderDashboardHtml() {
     // their position across polls even when the server returns them in a
     // different order.
     let agentOrder = [];
+    // An agent that has gone must not stay in the order, or a long-lived page
+    // keeps sorting rows for agents that no longer exist.
+    const nextAgentOrder = ${nextAgentOrder.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
 
@@ -494,12 +518,9 @@ export function renderDashboardHtml() {
         const res = await fetch('/api/agents');
         const data = await res.json();
         const incoming = data.agents || [];
-        // Preserve first-seen order: append ids not yet tracked, then update
-        // allAgents so renderRows can look each agent up by position.
-        const knownIds = new Set(agentOrder);
-        for (const a of incoming) {
-          if (!knownIds.has(a.id)) agentOrder.push(a.id);
-        }
+        // Keep the order of the agents that are still here, drop the ones that
+        // are gone, and put a new agent at the bottom.
+        agentOrder = nextAgentOrder(agentOrder, incoming.map((a) => a.id));
         allAgents = incoming;
         updateStats(data);
         renderRows();
