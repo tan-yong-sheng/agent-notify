@@ -165,10 +165,19 @@ const SUITE_REL = 'test_cases.test.js'
 // directory the protected files live in. A symlink is followed even when its
 // target is missing, because a link to a protected file reaches it just as
 // well as the file itself does.
+// A chain deeper than this is not a link an operator meant to write; it is a
+// cycle or a machine-generated nest. The bound exists to stop the walk, not to
+// limit how many links a real path may hold.
+const MAX_SYMLINK_DEPTH = 32
+
 function canonicalPath(repoRoot, target) {
   return resolvePath(path.resolve(repoRoot, target), [], 0)
 }
 
+// The real path of a link chain, or null when the chain cannot be followed to
+// the end. Returning the unresolved path instead would hand back a string that
+// names nothing comparable, and a protected file reached through a long chain
+// would then compare unequal to the protected path it really is.
 function resolvePath(abs, tail, depth) {
   const parts = [...tail]
   let current = abs
@@ -179,7 +188,7 @@ function resolvePath(abs, tail, depth) {
     } catch {}
     if (link !== null) {
       // A link that points at itself must not spin forever.
-      if (depth > 8) return abs
+      if (depth >= MAX_SYMLINK_DEPTH) return null
       return resolvePath(path.resolve(path.dirname(current), link), parts, depth + 1)
     }
     try {
@@ -220,10 +229,16 @@ function isUnder(child, parent) {
 // the protected file, and it folds case, so a differently cased spelling is
 // refused on every filesystem rather than only where the filesystem itself
 // folds case.
+//
+// A path whose link chain cannot be followed is protected, because the driver
+// cannot show that it is not: a chain too long to resolve has no comparable
+// name, and treating it as unprotected would let a catalogue entry reach the
+// protected files through a nest of links.
 export function isProtectedFile(repoRoot, file) {
   const scripts = canonicalPath(repoRoot, SCRIPTS_REL)
   const suite = canonicalPath(repoRoot, SUITE_REL)
   const target = canonicalPath(repoRoot, file)
+  if (target === null || scripts === null || suite === null) return true
   if (samePath(target, suite) || samePath(target, scripts)) return true
   return isUnder(target, scripts)
 }

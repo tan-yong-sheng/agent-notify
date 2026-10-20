@@ -1922,6 +1922,38 @@ async function runMutationProtectionTests() {
     assert(isProtectedFile(dir, 'shared/suite.mjs') === true, 'a symlink to the suite is protected')
     fs.symlinkSync(path.join('..', '.agents', 'skills', 'verify', 'scripts', 'RESTORE.MJS'), path.join(dir, 'shared', 'shouty.mjs'))
     assert(isProtectedFile(dir, 'shared/shouty.mjs') === true, 'a symlink to the recovery is protected however its case is spelled')
+
+    // A link chain is followed to its end however long it is: the depth bound
+    // exists to stop a cycle, not to decide that a real path stops being the
+    // file it names. A chain that cannot be followed at all is protected,
+    // because a path the driver cannot resolve is one it cannot show to be
+    // safe, and this is the shape that used to fail open: a chain of ten links
+    // reached the recovery while the guard called it application code.
+    for (const hops of [2, 5, 10, 12, 20]) {
+      const chain = path.join(dir, `chain-${hops}`)
+      fs.mkdirSync(chain, { recursive: true })
+      let target = path.join(scripts, 'restore.mjs')
+      for (let i = hops - 1; i >= 0; i--) {
+        const link = path.join(chain, `l${i}`)
+        fs.symlinkSync(target, link)
+        target = link
+      }
+      assert(
+        isProtectedFile(dir, path.relative(dir, path.join(chain, 'l0'))) === true,
+        `a chain of ${hops} links to the recovery is still the recovery`
+      )
+    }
+
+    // The cycle the bound is for: two links pointing at each other. It has no
+    // end to follow, so the answer has to be the safe one.
+    const cycle = path.join(dir, 'cycle')
+    fs.mkdirSync(cycle, { recursive: true })
+    fs.symlinkSync(path.join(cycle, 'b'), path.join(cycle, 'a'))
+    fs.symlinkSync(path.join(cycle, 'a'), path.join(cycle, 'b'))
+    assert(
+      isProtectedFile(dir, 'cycle/a') === true,
+      'a link cycle is protected, because the driver cannot show what it reaches'
+    )
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
