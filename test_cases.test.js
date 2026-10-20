@@ -37,6 +37,7 @@ import {
   formatListenError,
   renderDashboardHtml,
   updateBannerLabel,
+  nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
 import {
@@ -672,6 +673,59 @@ async function assertUpdateFailureAndBanner() {
   assert(
     pageLabel(freshCase) === updateBannerLabel(freshCase),
     'the embedded update banner label matches the tested one for a fresh status'
+  )
+
+  // Rows keep the position they were first seen at, so a poll that returns the
+  // agents in another order does not make the table jump around.
+  assert(
+    JSON.stringify(nextAgentOrder([], ['a', 'b', 'c'])) === JSON.stringify(['a', 'b', 'c']),
+    'nextAgentOrder keeps the order the server sent for a fresh page'
+  )
+  assert(
+    JSON.stringify(nextAgentOrder(['a', 'b', 'c'], ['c', 'a', 'b'])) === JSON.stringify(['a', 'b', 'c']),
+    'nextAgentOrder keeps the first-seen order when a poll reorders the agents'
+  )
+  assert(
+    JSON.stringify(nextAgentOrder(['a', 'b'], ['a', 'b', 'c'])) === JSON.stringify(['a', 'b', 'c']),
+    'nextAgentOrder puts a new agent at the bottom'
+  )
+  // The order is historical state, so an agent that is gone must not keep a
+  // slot: otherwise a long-lived page sorts rows for agents that no longer
+  // exist and the list grows with everything ever seen.
+  assert(
+    JSON.stringify(nextAgentOrder(['a', 'b', 'c'], ['a', 'c'])) === JSON.stringify(['a', 'c']),
+    'nextAgentOrder drops the agent that is gone'
+  )
+  assert(
+    nextAgentOrder(['a', 'b', 'c'], ['a', 'c']).includes('b') === false,
+    'the agent that is gone is not kept in the order'
+  )
+  assert(
+    JSON.stringify(nextAgentOrder(['a', 'b'], ['b', 'c', 'a'])) === JSON.stringify(['a', 'b', 'c']),
+    'nextAgentOrder keeps the surviving agents in place and appends the new one'
+  )
+  assert(
+    JSON.stringify(nextAgentOrder([], [])) === JSON.stringify([]),
+    'nextAgentOrder is empty when nothing is running'
+  )
+  assert(
+    JSON.stringify(nextAgentOrder(['a', 'b'], [])) === JSON.stringify([]),
+    'nextAgentOrder drops every id when the snapshot is empty'
+  )
+
+  // The page runs the same function the tests exercise, so the orders above are
+  // the orders a browser actually draws.
+  const embeddedOrder = sliceEmbeddedFunction(dashboardHtml, 'const nextAgentOrder = ')
+  assert(embeddedOrder !== null, 'the dashboard embeds the row order function')
+  const pageOrder = new Function(`return ${embeddedOrder}`)()
+  const reordered = ['c', 'a', 'b']
+  assert(
+    JSON.stringify(pageOrder(['a', 'b', 'c'], reordered)) === JSON.stringify(nextAgentOrder(['a', 'b', 'c'], reordered)),
+    'the embedded row order matches the tested one'
+  )
+  assert(
+    dashboardHtml.includes('agentOrder = nextAgentOrder(agentOrder,'),
+    'the page rebuilds the order through it on every poll'
   )
 }
 

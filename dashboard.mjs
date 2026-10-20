@@ -62,6 +62,27 @@ export function updateBannerLabel(data) {
   return data.stale ? label + ' (last known, the update check could not run)' : label
 }
 
+// The order the rows are drawn in. Exported and embedded into the page for the
+// same reason as the banner label: the browser runs the code the tests exercise.
+//
+// A known id keeps the position it was first seen at, and an id that is no
+// longer in the snapshot is dropped, so a long-lived page does not keep ordering
+// rows for agents that are gone. An agent that has never been seen is appended
+// in the order the server sent it, so it appears at the bottom instead of moving
+// the rows above it.
+export function nextAgentOrder(knownIds, incomingIds) {
+  const live = new Set(incomingIds)
+  const kept = knownIds.filter((id) => live.has(id))
+  const placed = new Set(kept)
+  for (const id of incomingIds) {
+    if (!placed.has(id)) {
+      placed.add(id)
+      kept.push(id)
+    }
+  }
+  return kept
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -450,6 +471,13 @@ export function renderDashboardHtml() {
 
   <script>
     let allAgents = [];
+    // agentOrder tracks first-seen insertion order by id so that rows keep
+    // their position across polls even when the server returns them in a
+    // different order.
+    let agentOrder = [];
+    // An agent that has gone must not stay in the order, or a long-lived page
+    // keeps sorting rows for agents that no longer exist.
+    const nextAgentOrder = ${nextAgentOrder.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
 
@@ -489,7 +517,11 @@ export function renderDashboardHtml() {
       try {
         const res = await fetch('/api/agents');
         const data = await res.json();
-        allAgents = data.agents || [];
+        const incoming = data.agents || [];
+        // Keep the order of the agents that are still here, drop the ones that
+        // are gone, and put a new agent at the bottom.
+        agentOrder = nextAgentOrder(agentOrder, incoming.map((a) => a.id));
+        allAgents = incoming;
         updateStats(data);
         renderRows();
       } catch (err) {
@@ -534,7 +566,11 @@ export function renderDashboardHtml() {
 
     function renderRows() {
       const tbody = document.getElementById('agent-table-body');
-      let filtered = allAgents;
+      // Sort by first-seen position before filtering so the visible order is
+      // stable across polls regardless of the server's payload order.
+      const byId = new Map(allAgents.map(a => [a.id, a]));
+      const ordered = agentOrder.map(id => byId.get(id)).filter(Boolean);
+      let filtered = ordered;
 
       if (currentFilter === 'working') {
         filtered = filtered.filter(a => a.status === 'working');
