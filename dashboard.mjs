@@ -52,6 +52,19 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const PROBE_ARGV = [SCRIPT_PATH]
 const REPO_DIR = path.dirname(SCRIPT_PATH)
 
+// The files the page needs to be installable. They are served from a fixed
+// allowlist rather than by joining the request path onto a directory: the
+// request path is attacker-controlled, and a join would let `..` reach any file
+// the dashboard can read.
+const PUBLIC_DIR = path.join(REPO_DIR, 'public')
+const STATIC_FILES = new Map([
+  ['/manifest.webmanifest', { file: 'manifest.webmanifest', type: 'application/manifest+json; charset=utf-8' }],
+  ['/sw.js', { file: 'sw.js', type: 'text/javascript; charset=utf-8' }],
+  ['/icon-192.png', { file: 'icon-192.png', type: 'image/png' }],
+  ['/icon-512.png', { file: 'icon-512.png', type: 'image/png' }],
+  ['/icon-maskable-512.png', { file: 'icon-maskable-512.png', type: 'image/png' }],
+])
+
 export { normalizeAgentStatus, parseHerdrAgent, parseOrcaAgent, collectLiveState }
 
 // The banner label for an update status. Exported and embedded into the page, so
@@ -92,6 +105,14 @@ export function renderDashboardHtml() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Agent Monitor</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#161b22">
+  <!-- iOS ignores the manifest's icons and reads this one, and it is the only
+       way to launch full screen on an iPhone. -->
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agents">
   <style>
     :root {
       --bg: #0d1117;
@@ -378,6 +399,101 @@ export function renderDashboardHtml() {
       pointer-events: none;
       z-index: 2000;
     }
+
+    /* Narrow screens: the seven columns need about 1020px, so on a phone or a
+       tablet held upright the table scrolls sideways with most of it off
+       screen. Each row becomes a short card instead, and the column headers
+       stop earning their place because every cell is labelled by its content.
+
+       The row is reordered with flex order rather than restructured, so the
+       markup stays one shape for every screen and the desktop table is
+       unaffected. A card is then two or three tight lines instead of seven
+       stacked ones: measured at 375x667 the stacked version was 218px a card
+       and showed one card per screen. */
+    @media (max-width: 900px) {
+      body { padding: 10px; }
+
+      /* Three bars' worth of chrome was 253px of a 667px screen before any
+         content. The counts move onto the title line and the rest folds. */
+      .header {
+        flex-direction: row;
+        align-items: baseline;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 2px 8px;
+        margin-bottom: 8px;
+      }
+      .header h1 { font-size: 16px; }
+      .header-info { font-size: 11px; gap: 6px; }
+
+      .stats-bar { gap: 10px; margin-bottom: 8px; flex-wrap: nowrap; overflow-x: auto; }
+      .stat-pill { padding: 0; border: none; background: none; gap: 5px; font-size: 12px; }
+      .stat-pill .count { font-size: 13px; }
+      .stat-pill .stat-label { display: none; }
+
+      .controls-bar { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .search-box { width: auto; flex: 1 1 40%; min-width: 0; padding: 5px 8px; font-size: 12px; }
+      .filter-tabs { overflow-x: auto; flex-wrap: nowrap; }
+      .filter-tab { padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+
+      .table-container { border: none; background: transparent; overflow-x: visible; }
+      table, thead, tbody { display: block; width: 100%; }
+      thead { display: none; }
+
+      /* Each row is a card of two or three lines, ordered by content rather
+         than by column, and it wraps instead of stacking a cell per line. */
+      tbody tr {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 2px 8px;
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin-bottom: 8px;
+      }
+      tbody td { border: none; padding: 0; max-width: none; }
+
+      /* line 1: state, agent, and how long ago it moved */
+      tbody td:nth-child(1) { order: 1; flex: 0 0 auto; }
+      tbody td:nth-child(3) { order: 2; flex: 0 1 auto; font-size: 14px; min-width: 0; }
+      tbody td:nth-child(7) { order: 3; flex: 0 0 auto; margin-left: auto; font-size: 11px; }
+
+      /* line 2: where it is and which branch. The path chip is dropped here and
+         kept in the modal, because it was the single tallest cell on the card. */
+      tbody td:nth-child(4) { order: 4; flex: 1 1 auto; font-size: 12px; min-width: 0; }
+      tbody td:nth-child(5) { order: 5; flex: 0 0 auto; font-size: 11px; }
+      tbody td:nth-child(4) .path-chip { display: none; }
+      tbody td:nth-child(4) > div { margin-bottom: 0; font-weight: 500; }
+
+      /* line 3: what it is doing, truncated to one line */
+      tbody td:nth-child(6) { order: 6; flex: 1 1 100%; font-size: 12px; min-width: 0; }
+      tbody td:nth-child(6) .action-text {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: none;
+        color: var(--text-muted);
+      }
+      /* The source tag says which runtime found the row, which the agent name
+         already implies for a reader who knows these tools; it costs a whole
+         line on every card, so it moves to the modal. */
+      tbody td:nth-child(2) { display: none; }
+
+      tbody td:empty { display: none; }
+    }
+
+    /* The same cards without the third line: ?layout=dense, for comparing a
+       two-line row against the three-line one on a real phone. */
+    body.layout-dense tbody td:nth-child(6) { display: none; }
+
+    @media (max-width: 600px) {
+      body { padding: 8px; }
+      .header h1 { font-size: 15px; }
+      tbody tr { padding: 7px 9px; }
+    }
   </style>
 </head>
 <body>
@@ -405,21 +521,21 @@ export function renderDashboardHtml() {
       <div class="pulse-dot" style="color: var(--green);"></div>
       <div>
         <div class="count" id="count-working">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Working / Running</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Working / Running</div>
       </div>
     </div>
     <div class="stat-pill">
       <div class="pulse-dot" style="color: var(--red);"></div>
       <div>
         <div class="count" id="count-blocked">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Blocked</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Blocked</div>
       </div>
     </div>
     <div class="stat-pill">
       <div class="pulse-dot" style="color: var(--gray);"></div>
       <div>
         <div class="count" id="count-idle">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Settled / Idle</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Settled / Idle</div>
       </div>
     </div>
   </div>
@@ -480,6 +596,10 @@ export function renderDashboardHtml() {
     const nextAgentOrder = ${nextAgentOrder.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
+    // A two-line row instead of three, for comparing density on a real phone.
+    if (new URLSearchParams(location.search).get('layout') === 'dense') {
+      document.body.classList.add('layout-dense');
+    }
 
     function copyPath(text) {
       navigator.clipboard.writeText(text);
@@ -670,6 +790,14 @@ export function renderDashboardHtml() {
     }
     checkUpdate();
     setInterval(checkUpdate, 600000);
+
+    // A browser over plain http on a non-loopback address refuses to register a
+    // worker, and that rejection is not an error the operator can act on: the
+    // page works either way, it just cannot be installed. Tailscale serves over
+    // https, which is the case this is for.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
   </script>
 </body>
 </html>`
@@ -744,6 +872,21 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-cache',
     })
     return res.end(JSON.stringify(updateInfo))
+  }
+
+  const staticFile = STATIC_FILES.get(reqUrl.pathname)
+  if (staticFile) {
+    // A missing file is a deployment problem, not a 404 the operator can act
+    // on, so say which file and why the browser will refuse the install.
+    let body
+    try {
+      body = fs.readFileSync(path.join(PUBLIC_DIR, staticFile.file))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'text/plain' })
+      return res.end(`the dashboard is missing ${staticFile.file}, so it cannot be installed as an app`)
+    }
+    res.writeHead(200, { 'Content-Type': staticFile.type, 'Cache-Control': 'no-cache' })
+    return res.end(body)
   }
 
   if (reqUrl.pathname === '/' || reqUrl.pathname === '/index.html') {

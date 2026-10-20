@@ -50,6 +50,18 @@ function asId(value, fallback) {
   return fallback
 }
 
+// One tool, one name. Herdr reports this tool as `dsh-tui` and Orca reports it
+// as `dsh`, so a row's name would otherwise depend on which adapter happened to
+// find it. The map is keyed on the reported name alone, and a name that is not
+// in it passes through untouched: this is a rename of two spellings of one
+// tool, not a whitelist of allowed agents.
+const AGENT_ALIASES = new Map([['dsh', 'dsh-tui']])
+
+export function canonicalAgentName(name) {
+  const text = asText(name)
+  return text ? (AGENT_ALIASES.get(text.toLowerCase()) || text) : text
+}
+
 // `index` comes from the extractor and is only used when the runtime omits the
 // id: one shared fallback would key every such row alike, and the dashboard
 // resolves a row by id.
@@ -59,7 +71,7 @@ export function parseHerdrAgent(a = {}, index = 0) {
   return {
     id: `herdr-${asId(record.pane_id, `pane-${index}`)}`,
     source: 'herdr',
-    agent: asText(record.agent) || 'pi',
+    agent: canonicalAgentName(asText(record.agent)) || 'pi',
     status: normalizeAgentStatus(rawStatus),
     rawStatus,
     cwd: asText(record.cwd),
@@ -83,7 +95,7 @@ export function parseOrcaAgent(wt = {}, a = {}, index = 0) {
   return {
     id: `orca-${asId(agent.paneKey, `pane-${index}`)}`,
     source: 'orca',
-    agent: asText(agent.agentType) || 'pi',
+    agent: canonicalAgentName(asText(agent.agentType)) || 'pi',
     status: normalizeAgentStatus(rawStatus),
     rawStatus,
     cwd: asText(worktree.path),

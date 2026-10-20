@@ -4,10 +4,18 @@
     "main.mjs",
     "herdr/herdr-adapter.mjs",
     "dashboard.mjs",
-    "test_cases.test.js"
+    "test_cases.test.js",
+    "tools/make-icons.mjs",
+    "tools/measure-layout.mjs",
+    "public/sw.js"
   ],
   "health": {
     "thresholdOverrides": [
+      {
+        "files": ["tools/make-icons.mjs"],
+        "maxCrap": 60,
+        "reason": "Icon paint loop: covered by runPwaTests, but fallow estimates coverage from the module graph, which does not follow a suite importing a tool script"
+      },
       {
         "files": ["test_cases.test.js"],
         "maxUnitSize": 250,
