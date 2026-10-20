@@ -14,7 +14,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { loadEnv } from './shared/env.mjs'
 import { resolveConfigDir, resolveDashboardPort } from './shared/config.mjs'
-import { handleServiceCommand, handleUpdateCommand, checkUpdateStatusAsync } from './shared/service.mjs'
+import { handleServiceCommand, handleUpdateCommand, checkUpdateStatusAsync, resolveTailscaleBin, resolveTailscaleHostname } from './shared/service.mjs'
 import {
   getLiveAgents,
   normalizeAgentStatus,
@@ -683,20 +683,20 @@ const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
 
 // `tailscale serve` proxies to this listener and forwards the hostname it was
 // reached under, so a tailnet request arrives with a Host the loopback rule
-// rejects. The `*.ts.net` names are resolved by Tailscale, and a rebinding
-// attack needs a name the attacker controls, so allowing that suffix does not
-// reopen the hole the loopback rule closes. Any other name has to be named
-// explicitly, and a tailnet name is never a suffix of someone else's domain
-// because the check is on the label boundary.
-const ALLOWED_HOST_SUFFIXES = ['.ts.net']
-
-// A host is allowed when it is one of the loopback names, when it is one the
-// operator named in AGENT_NOTIFY_ALLOWED_HOSTS, or when it is a Tailscale name.
-export function isAllowedHost(hostHeader, extraHosts = (process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '')) {
+// rejects. Only this node's own name is admitted, not the whole `*.ts.net`
+// space: another tailnet's dashboard is not this dashboard, and admitting the
+// suffix would let any name in it through the guard. Any other name has to be
+// named explicitly in AGENT_NOTIFY_ALLOWED_HOSTS.
+export function isAllowedHost(
+  hostHeader,
+  extraHosts = (process.env.AGENT_NOTIFY_ALLOWED_HOSTS || ''),
+  tailnetHost = ''
+) {
   if (!hostHeader) return false
   const host = String(hostHeader).toLowerCase().replace(/:\d+$/, '')
   if (ALLOWED_HOSTS.includes(host)) return true
-  if (ALLOWED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true
+  const own = String(tailnetHost).toLowerCase().replace(/\.+$/, '')
+  if (own && host === own) return true
   return String(extraHosts)
     .toLowerCase()
     .split(',')
@@ -705,8 +705,19 @@ export function isAllowedHost(hostHeader, extraHosts = (process.env.AGENT_NOTIFY
     .includes(host)
 }
 
+// The tailnet name this dashboard answers under, or an empty string when it is
+// not reached that way. Resolved once at startup: the answer cannot change
+// while the process runs, and a request must not wait on a CLI.
+function detectTailnetHost() {
+  const bin = resolveTailscaleBin()
+  if (!bin) return ''
+  return resolveTailscaleHostname(bin) || ''
+}
+
+const TAILNET_HOST = detectTailnetHost()
+
 const server = http.createServer(async (req, res) => {
-  if (!isAllowedHost(req.headers.host)) {
+  if (!isAllowedHost(req.headers.host, process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '', TAILNET_HOST)) {
     res.writeHead(403, { 'Content-Type': 'text/plain' })
     return res.end('Forbidden host')
   }

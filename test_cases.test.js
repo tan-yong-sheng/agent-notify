@@ -746,25 +746,43 @@ function runAllowedHostTests() {
   assert(!isAllowedHost(undefined), 'isAllowedHost rejects missing host')
 
   // `tailscale serve` forwards the tailnet hostname, so the dashboard has to
-  // accept it or every tailnet request is a 403.
+  // accept it or every tailnet request is a 403. Only this node's name is
+  // admitted: another tailnet's dashboard is not this dashboard.
+  const ownTailnet = 'lenovo-ideapad.tail3260f2.ts.net'
   assert(
-    isAllowedHost('lenovo-ideapad.tail3260f2.ts.net', ''),
-    'isAllowedHost accepts a tailnet hostname'
+    isAllowedHost(ownTailnet, '', ownTailnet),
+    'isAllowedHost accepts this node\'s tailnet hostname'
   )
   assert(
-    isAllowedHost('lenovo-ideapad.tail3260f2.ts.net:443', ''),
-    'isAllowedHost accepts a tailnet hostname with a port'
+    isAllowedHost(`${ownTailnet}:443`, '', ownTailnet),
+    'isAllowedHost accepts this node\'s tailnet hostname with a port'
   )
   assert(
-    !isAllowedHost('ts.net.evil.com', ''),
+    isAllowedHost(ownTailnet, '', `${ownTailnet}.`),
+    'isAllowedHost matches the tailnet name whatever trailing dot it was read with'
+  )
+  assert(
+    !isAllowedHost('someone-else.tail3260f2.ts.net', '', ownTailnet),
+    'isAllowedHost rejects another name in the same tailnet'
+  )
+  assert(
+    !isAllowedHost('other.ts.net', '', ownTailnet),
+    'isAllowedHost rejects a tailnet name that is not this node\'s'
+  )
+  assert(
+    !isAllowedHost(ownTailnet, '', ''),
+    'isAllowedHost rejects the tailnet name when this node has none'
+  )
+  assert(
+    !isAllowedHost('ts.net.evil.com', '', ownTailnet),
     'isAllowedHost rejects a tailnet name buried in another domain'
   )
   assert(
-    !isAllowedHost('evitts.net', ''),
+    !isAllowedHost('evitts.net', '', ownTailnet),
     'isAllowedHost rejects a name that only ends in the same letters'
   )
   assert(
-    !isAllowedHost('myhost.example.com', ''),
+    !isAllowedHost('myhost.example.com', '', ownTailnet),
     'isAllowedHost still rejects an unnamed external host'
   )
   // Anything else has to be named, so a custom domain stays opt-in.
