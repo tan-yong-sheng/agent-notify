@@ -785,6 +785,27 @@ function runAllowedHostTests() {
     !isAllowedHost('myhost.example.com', '', ownTailnet),
     'isAllowedHost still rejects an unnamed external host'
   )
+
+  // Importing the module must not run the Tailscale CLI. Every test, script and
+  // tool that imports `dashboard.mjs` would otherwise pay for a subprocess it
+  // never uses, and a `tailscale` that hangs would hang the import itself. The
+  // name is read on the first request instead, which is where it is needed.
+  const importProbe = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-import-'))
+  try {
+    const callLog = path.join(importProbe, 'calls.log')
+    fs.writeFileSync(path.join(importProbe, 'tailscale'), `#!/bin/sh\necho "$@" >> ${JSON.stringify(callLog)}\necho '{"Self":{"DNSName":"probe.tail0.ts.net."}}'\nexit 0\n`, { mode: 0o755 })
+    execFileSync(process.execPath, ['--input-type=module', '-e', 'import(\'./dashboard.mjs\')'], {
+      cwd: path.dirname(dashboardPath),
+      stdio: 'ignore',
+      env: { ...process.env, PATH: `${importProbe}${path.delimiter}${process.env.PATH}` },
+    })
+    assert(
+      fs.existsSync(callLog) === false,
+      'importing the dashboard does not run the tailscale CLI'
+    )
+  } finally {
+    fs.rmSync(importProbe, { recursive: true, force: true })
+  }
   // Anything else has to be named, so a custom domain stays opt-in.
   assert(
     isAllowedHost('monitor.internal:3333', 'monitor.internal'),

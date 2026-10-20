@@ -706,18 +706,22 @@ export function isAllowedHost(
 }
 
 // The tailnet name this dashboard answers under, or an empty string when it is
-// not reached that way. Resolved once at startup: the answer cannot change
-// while the process runs, and a request must not wait on a CLI.
-function detectTailnetHost() {
-  const bin = resolveTailscaleBin()
-  if (!bin) return ''
-  return resolveTailscaleHostname(bin) || ''
+// not reached that way. Resolved on the first request and then kept: a request
+// must not wait on a CLI it has already asked, but importing this module must
+// not run one either. Every test, script and tool that imports `dashboard.mjs`
+// would otherwise pay for a subprocess it never uses, and a `tailscale` that
+// hangs would hang the import.
+let tailnetHost = null
+function tailnetHostName() {
+  if (tailnetHost === null) {
+    const bin = resolveTailscaleBin()
+    tailnetHost = bin ? (resolveTailscaleHostname(bin) || '') : ''
+  }
+  return tailnetHost
 }
 
-const TAILNET_HOST = detectTailnetHost()
-
 const server = http.createServer(async (req, res) => {
-  if (!isAllowedHost(req.headers.host, process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '', TAILNET_HOST)) {
+  if (!isAllowedHost(req.headers.host, process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '', tailnetHostName())) {
     res.writeHead(403, { 'Content-Type': 'text/plain' })
     return res.end('Forbidden host')
   }
