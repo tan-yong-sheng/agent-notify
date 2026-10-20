@@ -14,7 +14,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { loadEnv } from './shared/env.mjs'
 import { resolveConfigDir, resolveDashboardPort } from './shared/config.mjs'
-import { handleServiceCommand, handleUpdateCommand, checkUpdateStatusAsync } from './shared/service.mjs'
+import { handleServiceCommand, handleUpdateCommand, checkUpdateStatusAsync, resolveTailscaleBin, resolveTailscaleHostname } from './shared/service.mjs'
 import {
   getLiveAgents,
   normalizeAgentStatus,
@@ -681,14 +681,47 @@ export function renderDashboardHtml() {
 // state (prompts, tool input, workspace paths) through the loopback listener.
 const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
 
-export function isAllowedHost(hostHeader) {
+// `tailscale serve` proxies to this listener and forwards the hostname it was
+// reached under, so a tailnet request arrives with a Host the loopback rule
+// rejects. Only this node's own name is admitted, not the whole `*.ts.net`
+// space: another tailnet's dashboard is not this dashboard, and admitting the
+// suffix would let any name in it through the guard. Any other name has to be
+// named explicitly in AGENT_NOTIFY_ALLOWED_HOSTS.
+export function isAllowedHost(
+  hostHeader,
+  extraHosts = (process.env.AGENT_NOTIFY_ALLOWED_HOSTS || ''),
+  tailnetHost = ''
+) {
   if (!hostHeader) return false
   const host = String(hostHeader).toLowerCase().replace(/:\d+$/, '')
-  return ALLOWED_HOSTS.includes(host)
+  if (ALLOWED_HOSTS.includes(host)) return true
+  const own = String(tailnetHost).toLowerCase().replace(/\.+$/, '')
+  if (own && host === own) return true
+  return String(extraHosts)
+    .toLowerCase()
+    .split(',')
+    .map((h) => h.trim().replace(/:\d+$/, ''))
+    .filter(Boolean)
+    .includes(host)
+}
+
+// The tailnet name this dashboard answers under, or an empty string when it is
+// not reached that way. Resolved on the first request and then kept: a request
+// must not wait on a CLI it has already asked, but importing this module must
+// not run one either. Every test, script and tool that imports `dashboard.mjs`
+// would otherwise pay for a subprocess it never uses, and a `tailscale` that
+// hangs would hang the import.
+let tailnetHost = null
+function tailnetHostName() {
+  if (tailnetHost === null) {
+    const bin = resolveTailscaleBin()
+    tailnetHost = bin ? (resolveTailscaleHostname(bin) || '') : ''
+  }
+  return tailnetHost
 }
 
 const server = http.createServer(async (req, res) => {
-  if (!isAllowedHost(req.headers.host)) {
+  if (!isAllowedHost(req.headers.host, process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '', tailnetHostName())) {
     res.writeHead(403, { 'Content-Type': 'text/plain' })
     return res.end('Forbidden host')
   }
@@ -741,8 +774,8 @@ server.on('error', (err) => {
   process.exit(1)
 })
 
-export function handleCliCommands(argv = process.argv) {
-  if (handleServiceCommand(argv, { port: PORT })) return true
+export async function handleCliCommands(argv = process.argv) {
+  if (await handleServiceCommand(argv, { port: PORT })) return true
   if (handleUpdateCommand(argv)) return true
   return false
 }
@@ -762,15 +795,16 @@ export function isDirectInvocation(argv = process.argv, moduleUrl = import.meta.
 }
 
 if (isDirectInvocation(process.argv)) {
-  const handled = handleCliCommands(process.argv)
-  if (!handled) {
-    server.listen(PORT, '127.0.0.1', () => {
-      console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
-      console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
-      console.log(`   Press Ctrl+C to stop.\n`)
-      // Warms the 1h cache off the request path; the probe runs in a child
-      // process, so the first /api/update does not block agent polling.
-      checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV).catch(() => {})
-    })
-  }
+  handleCliCommands(process.argv).then((handled) => {
+    if (!handled) {
+      server.listen(PORT, '127.0.0.1', () => {
+        console.log(`\n⚡ Agent Monitor Dashboard running at: http://localhost:${PORT}`)
+        console.log(`   Monitoring Orca worktrees and Herdr sessions.`)
+        console.log(`   Press Ctrl+C to stop.\n`)
+        // Warms the 1h cache off the request path; the probe runs in a child
+        // process, so the first /api/update does not block agent polling.
+        checkUpdateStatusAsync(REPO_DIR, PROBE_ARGV).catch(() => {})
+      })
+    }
+  })
 }
