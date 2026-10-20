@@ -2283,8 +2283,14 @@ async function runMutationRestoreCommandTests() {
 
       // The recovery path here is CRLF on disk and LF in the commit, which is
       // what the gate has to fold: a gate that called the difference an edit
-      // would refuse with exit 2 and never reach the recovery at all.
+      // would refuse with exit 2 and never reach the recovery at all. A clean
+      // tree alone would not say that, since it is also clean when the
+      // checkout keeps the line endings, so the asymmetry is asserted.
       assert(execSync('git status --porcelain --untracked-files=no', { cwd: eol, encoding: 'utf8', env: gitEnv }).trim() === '', 'the rewritten line endings are the checkout\'s, not an edit')
+      const committedRestore = execSync('git show HEAD:.agents/skills/verify/scripts/restore.mjs', { cwd: eol, encoding: 'utf8', env: gitEnv })
+      const worktreeRestore = fs.readFileSync(path.join(eolScripts, 'restore.mjs'), 'utf8')
+      assert(worktreeRestore.includes('\r\n'), 'the recovery path is CRLF in the worktree')
+      assert(committedRestore.includes('\r\n') === false, 'the recovery path is LF in the commit')
 
       // The bytes the checkout puts in the worktree are not the bytes the
       // mutation was written against. A mutation whose anchor spans lines can
@@ -2311,8 +2317,10 @@ async function runMutationRestoreCommandTests() {
       // run has to name the file instead of undoing it. The exit code is the
       // point: 1 means the run got past the gate and into the recovery, while
       // a gate that mistook the CRLF recovery path for an edit would refuse
-      // with 2 and never reach it.
-      const crlfSource = source.split('\n').join('\r\n')
+      // with 2 and never reach it. The bytes are read back from the checkout
+      // rather than derived from the blob, so there is one source of truth for
+      // what a rewrite of these line endings produces.
+      const crlfSource = fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8')
       const crlfLeftover = crlfSource.replace(entry.find, entry.replace)
       fs.writeFileSync(path.join(eol, 'shared/service.mjs'), crlfLeftover)
       const crlfRestore = runIn(eol, ['--restore'])
