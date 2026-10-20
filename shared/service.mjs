@@ -405,14 +405,41 @@ const PLATFORM_SERVICES = {
 
 // ─── Tailscale serve integration ─────────────────────────────────────────────
 
+// The names the tailscale CLI is installed under. Windows appends the
+// extension, so looking for the bare name there would skip the prompt entirely
+// even with the CLI on PATH.
+export function tailscaleBinNames(platform) {
+  return platform === 'win32' ? ['tailscale.exe', 'tailscale'] : ['tailscale']
+}
+
+// The hostname Tailscale serves this node under, or null when it cannot be
+// read. Trailing dots are stripped: the DNS name in the status JSON is fully
+// qualified, and the Host header a request carries never has the dot.
+export function resolveTailscaleHostname(tailscaleBin) {
+  try {
+    const result = spawnSync(tailscaleBin, ['status', '--self', '--json'], {
+      encoding: 'utf8',
+      env: getExtendedPathEnv(),
+    })
+    const data = JSON.parse(result.stdout || '{}')
+    const dnsName = (data?.Self?.DNSName || '').replace(/\.+$/, '')
+    return dnsName || null
+  } catch {
+    return null
+  }
+}
+
 // Resolves the path of the tailscale CLI, or null if it is not on the extended PATH.
 export function resolveTailscaleBin() {
   const env = getExtendedPathEnv()
+  const names = tailscaleBinNames(process.platform)
   for (const dir of (env.PATH || '').split(path.delimiter)) {
-    const candidate = path.join(dir, 'tailscale')
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate
-    } catch {}
+    for (const name of names) {
+      const candidate = path.join(dir, name)
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate
+      } catch {}
+    }
   }
   return null
 }
@@ -444,22 +471,22 @@ export function enableTailscaleServe(tailscaleBin, port) {
     })
     if (result.status !== 0) {
       const detail = (result.stderr || result.stdout || '').trim().split('\n')[0]
-      console.warn(`\n⚠️  Tailscale serve failed: ${detail}\n   You can enable it manually: tailscale serve --bg ${port}\n`)
+      console.warn(`\n⚠️  Tailscale serve failed: ${detail}`)
+      // Serve config belongs to root until an operator is set, so the same
+      // command run again as the user fails the same way. Say what lifts it.
+      if (/access denied|serve config denied|permission/i.test(detail)) {
+        console.warn(`   Tailscale needs to allow this user to manage serve config first:`)
+        console.warn(`   sudo tailscale set --operator=$USER`)
+        console.warn(`   Then run: tailscale serve --bg ${port}`)
+      } else {
+        console.warn(`   You can enable it manually: tailscale serve --bg ${port}`)
+      }
       return null
     }
     // Build the URL from the node's MagicDNS name (always stable; serve status
     // output format varies across versions and is empty until the serve is live).
-    const statusResult = spawnSync(tailscaleBin, ['status', '--self', '--json'], {
-      encoding: 'utf8',
-      env: getExtendedPathEnv(),
-    })
-    try {
-      const data = JSON.parse(statusResult.stdout || '{}')
-      const dnsName = (data?.Self?.DNSName || '').replace(/\.+$/, '')
-      return dnsName ? `https://${dnsName}` : null
-    } catch {
-      return null
-    }
+    const hostname = resolveTailscaleHostname(tailscaleBin)
+    return hostname ? `https://${hostname}` : null
   } catch {
     return null
   }
