@@ -906,6 +906,18 @@ async function runTailscaleTests() {
   const tsUrlFail = enableTailscaleServe(fakeTailscale, 4006)
   assert(tsUrlFail === null, 'enableTailscaleServe returns null when tailscale exits non-zero')
 
+  // A CLI that never answers must not hold the install open. The fake sleeps
+  // far longer than the bound, and the bound is passed in so the test does not
+  // pay the real 20s to prove it.
+  fs.writeFileSync(fakeTailscale, '#!/bin/sh\nsleep 120\n', { mode: 0o755 })
+  const hungStart = Date.now()
+  const hungUrl = enableTailscaleServe(fakeTailscale, 4006, 1500)
+  const hungElapsed = Date.now() - hungStart
+  assert(hungUrl === null, 'enableTailscaleServe returns null when tailscale never answers')
+  assert(hungElapsed < 30000, 'a hung tailscale CLI cannot hold the install open')
+  const hungHostname = resolveTailscaleHostname(fakeTailscale, 1500)
+  assert(hungHostname === null, 'resolveTailscaleHostname returns null when tailscale never answers')
+
   fs.rmSync(tsHome, { recursive: true, force: true })
 }
 

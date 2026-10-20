@@ -405,6 +405,10 @@ const PLATFORM_SERVICES = {
 
 // ─── Tailscale serve integration ─────────────────────────────────────────────
 
+// A hung tailscale CLI must not hang the install, so both calls below are
+// bounded: the operator asked for a convenience, not for a stuck shell.
+const TAILSCALE_TIMEOUT_MS = 20000
+
 // The names the tailscale CLI is installed under. Windows appends the
 // extension, so looking for the bare name there would skip the prompt entirely
 // even with the CLI on PATH.
@@ -415,10 +419,12 @@ export function tailscaleBinNames(platform) {
 // The hostname Tailscale serves this node under, or null when it cannot be
 // read. Trailing dots are stripped: the DNS name in the status JSON is fully
 // qualified, and the Host header a request carries never has the dot.
-export function resolveTailscaleHostname(tailscaleBin) {
+export function resolveTailscaleHostname(tailscaleBin, timeoutMs = TAILSCALE_TIMEOUT_MS) {
   try {
     const result = spawnSync(tailscaleBin, ['status', '--self', '--json'], {
       encoding: 'utf8',
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
       env: getExtendedPathEnv(),
     })
     const data = JSON.parse(result.stdout || '{}')
@@ -463,10 +469,12 @@ function askYesNo(question) {
 
 // Enables `tailscale serve --bg <port>` so remote tailnet devices can reach the
 // dashboard. Returns the Tailscale HTTPS URL on success, or null on failure.
-export function enableTailscaleServe(tailscaleBin, port) {
+export function enableTailscaleServe(tailscaleBin, port, timeoutMs = TAILSCALE_TIMEOUT_MS) {
   try {
     const result = spawnSync(tailscaleBin, ['serve', '--bg', String(port)], {
       encoding: 'utf8',
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
       env: getExtendedPathEnv(),
     })
     if (result.status !== 0) {
@@ -485,7 +493,7 @@ export function enableTailscaleServe(tailscaleBin, port) {
     }
     // Build the URL from the node's MagicDNS name (always stable; serve status
     // output format varies across versions and is empty until the serve is live).
-    const hostname = resolveTailscaleHostname(tailscaleBin)
+    const hostname = resolveTailscaleHostname(tailscaleBin, timeoutMs)
     return hostname ? `https://${hostname}` : null
   } catch {
     return null
