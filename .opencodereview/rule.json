@@ -1,0 +1,15 @@
+{
+  "include": ["**/*.md", "**/*.test.js"],
+  "rules": [
+    {
+      "path": "**/test_cases.test.js",
+      "rule": "This suite is the proof that the shipped code works, so an assertion that cannot fail is worse than no assertion. For every added or changed assertion, ask what implementation would still satisfy it: if removing the behaviour it names would leave it passing, say so and name the assertion. Flag assertions that restate something the fixture itself just constructed instead of reading it back from the code under test. Flag a test whose label claims more than it exercises. Flag a test that asserts an exit code without asserting the reason for it, when a different code path could produce the same code. Also flag assertions coupled to one machine: a filesystem that folds case, a POSIX shell used as an executable stub where the code claims Windows support, or a bound so loose that an implementation ignoring the parameter would still pass.",
+      "merge_system_rule": true
+    },
+    {
+      "path": "**/*.md",
+      "rule": "The prose in this repository states contracts that the code has to keep, so a documented promise the code does not make is a defect in the document. For each behavioural claim, name the code that makes it true; if the claim is broader than the code (a guarantee the implementation qualifies, a message it does not emit, an exit code that also covers another case), say so and quote the sentence that overstates it. Do not flag style, tone, or length.",
+      "merge_system_rule": true
+    }
+  ]
+}
