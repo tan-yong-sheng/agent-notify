@@ -4,6 +4,12 @@
 //
 // `find` must appear exactly once in the file: the driver refuses an ambiguous
 // anchor rather than risk mutating the wrong site and reporting a false pass.
+//
+// The catalogue targets shipped fixes in the application, never the tooling
+// that verifies it. The driver refuses an entry that touches its own recovery
+// path, because a killed run that left those files changed would leave the
+// recovery unable to recognise a leftover, and an inverted comparison there
+// would overwrite the operator's own work.
 
 export const MUTATIONS = [
   {

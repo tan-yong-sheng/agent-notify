@@ -16,3 +16,7 @@ coverage-v8/
 
 # Verification run output (regenerate with .agents/skills/verify)
 .agents/skills/verify/artifacts/
+
+# A temporary file from an interrupted restore; the next restore of the same
+# file replaces it
+*.restore-tmp

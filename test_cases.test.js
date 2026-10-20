@@ -40,6 +40,30 @@ import {
   nextAgentOrder,
 } from './dashboard.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
+
+// The driver's recovery modules are loaded on demand. A syntax error in one of
+// them must fail the recovery tests, not take the whole suite down with it:
+// the suite is the thing that decides whether a mutation was caught, and it
+// has to be able to report a broken recovery rather than vanish.
+async function recoveryModules() {
+  const [leftover, restore, lib] = await Promise.all([
+    import('./.agents/skills/verify/scripts/leftover.mjs'),
+    import('./.agents/skills/verify/scripts/restore.mjs'),
+    import('./.agents/skills/verify/scripts/lib.mjs'),
+  ])
+  return { ...leftover, ...restore, ...lib }
+}
+
+// The catalogue is one of the modules the driver loads behind its gate, so it
+// is loaded on demand for the same reason: a syntax error in it must fail the
+// recovery tests rather than the whole suite.
+let cataloguePromise = null
+function loadCatalogue() {
+  if (!cataloguePromise) {
+    cataloguePromise = import('./.agents/skills/verify/scripts/mutations.mjs').then((m) => m.MUTATIONS)
+  }
+  return cataloguePromise
+}
 import {
   normalizeAgentStatus,
   parseHerdrAgent,
@@ -1666,6 +1690,850 @@ async function runStatusCommandTimeoutTests() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit tests: the mutation driver's recovery from a killed run
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The committed content of a file, read from git rather than from the
+// worktree. A fixture taken from the worktree changes under the test's feet
+// as soon as somebody edits the file, so the recovery would be proved against
+// whatever the worktree happened to hold.
+function committedFile(root, file) {
+  return execFileSync('git', ['show', `HEAD:${file}`], { cwd: root, encoding: 'utf8' })
+}
+
+async function runMutationRestoreTests() {
+  console.log('\nRunning mutation driver restore tests...\n')
+
+  const { findLeftoverMutations, findRevertedFixes, restoreLeftoverMutations, isDirty, restoreOutcomeMessage } = await recoveryModules()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-restore-'))
+  const gitEnv = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'test',
+    GIT_AUTHOR_EMAIL: 'test@example.com',
+    GIT_COMMITTER_NAME: 'test',
+    GIT_COMMITTER_EMAIL: 'test@example.com',
+  }
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  // A real catalogue entry against a real shipped file: the recovery has to
+  // reproduce the bytes the driver would have written, and that is only
+  // meaningful with the catalogue's own find/replace and the shipped source.
+  const MUTATIONS = await loadCatalogue()
+  const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
+  const source = committedFile(repoRoot, 'shared/service.mjs')
+  const mutations = [entry]
+
+  // The message the driver leaves on the way out has to say what happened to
+  // the files it touched. A restore whose writes failed is not a lost lock,
+  // and a driver that says otherwise sends the operator looking at a lock it
+  // still holds.
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: null, failed: true }) === 'the files this driver touched could not be restored', 'a failed write is reported as a failed write')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: null, failed: true }).includes('lock') === false, 'a failed write is not blamed on the lock')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: 'another mutation driver took the lock over', failed: false }).includes('another mutation driver took the lock over'), 'a lost lock is reported as a lost lock')
+  assert(restoreOutcomeMessage({ restored: 2, touched: 2, lostLock: null, failed: false }) === 'restored 2 tracked file(s) before exiting', 'a restore that happened is reported as a restore')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 0, lostLock: null, failed: false }) === 'there was nothing to restore', 'a driver that touched nothing says so')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 0, lostLock: 'the mutation lock file is gone', failed: false }) === 'there was nothing to restore, and the mutation lock file is gone', 'a driver that lost the lock without touching a file does not claim it left files alone')
+
+  try {
+    execSync('git init', { cwd: dir, stdio: 'ignore' })
+    fs.mkdirSync(path.join(dir, 'shared'))
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), source)
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'operator notes\n')
+    execSync('git add shared/service.mjs notes.txt', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m init', { cwd: dir, stdio: 'ignore', env: gitEnv })
+
+    const leftover = source.replace(entry.find, entry.replace)
+    assert(leftover !== source, 'the catalogue entry still applies to the shipped file')
+
+    // The operator's own edit to the file the catalogue targets is not a
+    // leftover, so the recovery must leave it alone. The file is the one the
+    // mutation targets: an edit to a file no mutation touches would prove
+    // nothing, because the recovery never looks at that file at all.
+    const editedTarget = `${source}\n// operator work in progress\n`
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), editedTarget)
+    assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'an unrelated edit to a mutated file is not mistaken for a leftover mutation')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).restored.length === 0, 'an unrelated edit to a mutated file is not restored')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === editedTarget, "the operator's edit to a mutated file is left alone")
+
+    // A file no mutation touches is likewise not written to.
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'operator notes, in progress\n')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).restored.length === 0, 'a file no mutation touches is not restored')
+    assert(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8') === 'operator notes, in progress\n', 'a file no mutation touches is left alone')
+
+    // A run that was killed outright leaves the mutation applied.
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const found = findLeftoverMutations({ repoRoot: dir, mutations })
+    assert(found.length === 1, 'a killed run leaves a recognisable leftover')
+    assert(found[0]?.id === entry.id, 'the leftover names the mutation that was applied')
+    assert(found[0]?.file === entry.file, 'the leftover names the file it was applied to')
+
+    const restored = restoreLeftoverMutations({ repoRoot: dir, mutations })
+    assert(restored.restored.length === 1, 'the leftover is restored')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the committed content is put back')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).restored.length === 0, 'restoring twice changes nothing')
+
+    // A leftover the operator then edited no longer matches, so the recovery
+    // must leave it alone rather than undo the operator's work along with it.
+    const edited = `${leftover}\n// operator work in progress\n`
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), edited)
+    assert(findLeftoverMutations({ repoRoot: dir, mutations }).length === 0, 'a leftover the operator edited is not a leftover any more')
+    assert(restoreLeftoverMutations({ repoRoot: dir, mutations }).restored.length === 0, 'a leftover the operator edited is not restored over their work')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === edited, "the operator's edit in the leftover file survives")
+
+    // The same file is named as a reverted fix, so the driver can tell the
+    // operator which file to look at instead of leaving them to guess.
+    const reverted = findRevertedFixes({ repoRoot: dir, mutations })
+    assert(reverted.length === 1, 'a leftover with an edit on top is named as a reverted fix')
+    assert(reverted[0]?.file === entry.file, 'the reverted fix names the file it is in')
+    assert(reverted[0]?.id === entry.id, 'the reverted fix names the fix that is missing')
+
+    // An operator save that lands between the decision to write and the write
+    // itself must not be overwritten. The hook sits in exactly that window,
+    // so it is where the save is simulated — once before the temporary file
+    // is written, and once between the temporary file and the rename. The
+    // second one is the window the re-read immediately before the rename
+    // exists to close.
+    for (const window of ['before the temporary file', 'between the temporary file and the rename']) {
+      fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+      let calls = 0
+      const raced = restoreLeftoverMutations({
+        repoRoot: dir,
+        mutations,
+        beforeWrite: (item) => {
+          calls++
+          const onTarget = window === 'between the temporary file and the rename' ? 2 : 1
+          if (calls === onTarget) fs.writeFileSync(path.join(dir, item.file), `${leftover}\n// the operator saved in this window\n`)
+          return true
+        },
+      })
+      assert(raced.restored.length === 0, `a file that changed ${window} is not restored`)
+      assert(raced.skipped.length === 1, `a file that changed ${window} is reported as skipped`)
+      assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8').includes('// the operator saved in this window'), `the operator's save ${window} survives`)
+    }
+
+    // A driver that lost the lock must not write: the lock is re-checked
+    // before every write, and a takeover means another driver owns the tree.
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const stopped = restoreLeftoverMutations({ repoRoot: dir, mutations, beforeWrite: () => false })
+    assert(stopped.restored.length === 0, 'a driver that lost the lock restores nothing')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the lock is lost')
+
+    // A file the operator replaced with a symlink is theirs: the recovery
+    // does not write through the link, because the link may point outside the
+    // repository and the recovery would put the committed content somewhere
+    // the operator never asked for.
+    const outsideFile = path.join(os.tmpdir(), `agent-notify-link-target-${process.pid}.mjs`)
+    try {
+      fs.writeFileSync(outsideFile, leftover)
+      fs.unlinkSync(path.join(dir, 'shared/service.mjs'))
+      fs.symlinkSync(outsideFile, path.join(dir, 'shared/service.mjs'))
+      const linked = restoreLeftoverMutations({ repoRoot: dir, mutations })
+      assert(linked.restored.length === 0, 'a symlinked leftover is not written through')
+      assert(linked.skipped.length === 1, 'a symlinked leftover is reported as skipped')
+      assert(fs.readFileSync(outsideFile, 'utf8') === leftover, 'the file a link points at is left alone')
+    } finally {
+      try { fs.rmSync(outsideFile, { force: true }) } catch {}
+      try { fs.unlinkSync(path.join(dir, 'shared/service.mjs')) } catch {}
+      fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    }
+
+    // The worktree state is tri-state: a git failure is an unknown state, not
+    // a clean one. The gate that decides whether the recovery may run is
+    // driven from the driver itself, and the driver-level tests cover it.
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nogit-'))
+    try {
+      assert(isDirty(outside, { trackedOnly: true }) === null, 'a git failure is an unknown state, not a clean one')
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// The driver's own write must not follow a link at the end of the path. The
+// check that refuses a linked target is a separate step from the write, so a
+// file that is plain when it is checked can be a link by the time it is
+// written, and the write itself has to refuse it too.
+async function runDriverWriteTests() {
+  console.log('\nRunning mutation driver write tests...\n')
+
+  const { writeFileNoFollow } = await recoveryModules()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nofollow-'))
+  try {
+    const destination = path.join(dir, 'destination.txt')
+    fs.writeFileSync(destination, "the operator's own file\n")
+    const link = path.join(dir, 'tracked.mjs')
+    fs.symlinkSync(destination, link)
+    let refused = false
+    try {
+      writeFileNoFollow(link, 'the mutation\n')
+    } catch {
+      refused = true
+    }
+    assert(refused, "the driver's write refuses a target that is a link")
+    assert(fs.readFileSync(destination, 'utf8') === "the operator's own file\n", "the link's destination is left alone")
+    const plain = path.join(dir, 'plain.mjs')
+    writeFileNoFollow(plain, 'the mutation\n')
+    assert(fs.readFileSync(plain, 'utf8') === 'the mutation\n', 'a plain file is written')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// The catalogue must not reach the recovery path. A killed run that left the
+// recovery mutated would leave it unable to recognise a leftover, and an
+// inverted comparison there would overwrite the operator's own work.
+async function runMutationProtectionTests() {
+  console.log('\nRunning mutation catalogue protection tests...\n')
+
+  const { isProtectedFile } = await recoveryModules()
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  assert(isProtectedFile(repoRoot, 'shared/service.mjs') === false, 'the application code is not protected')
+  assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts/restore.mjs') === true, 'the recovery module is protected')
+  assert(isProtectedFile(repoRoot, './.agents/skills/verify/scripts/lib.mjs') === true, 'a protected file is protected however it is spelled')
+  assert(isProtectedFile(repoRoot, 'test_cases.test.js') === true, 'the suite the driver reads is protected')
+  assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts-evil/x.mjs') === false, 'a directory that only shares a prefix is not protected')
+  // The case of the spelling must not decide the answer: a catalogue entry
+  // that spells a protected file in a different case reaches the very same
+  // file on a case-insensitive filesystem, and the guard has to hold on
+  // every filesystem rather than only where the filesystem itself folds case.
+  assert(isProtectedFile(repoRoot, 'TEST_CASES.TEST.JS') === true, 'the suite is protected however its case is spelled')
+  assert(isProtectedFile(repoRoot, '.AGENTS/SKILLS/VERIFY/SCRIPTS/RESTORE.MJS') === true, 'the recovery module is protected however its case is spelled')
+  assert(isProtectedFile(repoRoot, '.agents/skills/verify/scripts/LEFTOVER.MJS') === true, 'the read-only half of the recovery is protected too')
+  assert(isProtectedFile(repoRoot, 'Shared/Service.mjs') === false, 'the application code is not protected however its case is spelled')
+
+  const MUTATIONS = await loadCatalogue()
+  const reachable = MUTATIONS.filter((m) => isProtectedFile(repoRoot, m.file))
+  assert(reachable.length === 0, 'no catalogue entry reaches the recovery path or the suite')
+
+  // A symlink to a protected file is the same file, so it is protected too:
+  // a mutation through the link would reach the recovery just the same.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-link-'))
+  try {
+    const scripts = path.join(dir, '.agents/skills/verify/scripts')
+    fs.mkdirSync(scripts, { recursive: true })
+    fs.mkdirSync(path.join(dir, 'shared'))
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), 'the shipped recovery\n')
+    fs.symlinkSync(path.join('..', '.agents', 'skills', 'verify', 'scripts', 'restore.mjs'), path.join(dir, 'shared', 'service.mjs'))
+    assert(isProtectedFile(dir, 'shared/service.mjs') === true, 'a symlink to the recovery is protected')
+    fs.writeFileSync(path.join(dir, 'test_cases.test.js'), 'the suite\n')
+    fs.symlinkSync(path.join('..', 'test_cases.test.js'), path.join(dir, 'shared', 'suite.mjs'))
+    assert(isProtectedFile(dir, 'shared/suite.mjs') === true, 'a symlink to the suite is protected')
+    fs.symlinkSync(path.join('..', '.agents', 'skills', 'verify', 'scripts', 'RESTORE.MJS'), path.join(dir, 'shared', 'shouty.mjs'))
+    assert(isProtectedFile(dir, 'shared/shouty.mjs') === true, 'a symlink to the recovery is protected however its case is spelled')
+
+    // A link chain is followed to its end however long it is: the depth bound
+    // exists to stop a cycle, not to decide that a real path stops being the
+    // file it names. A chain that cannot be followed at all is protected,
+    // because a path the driver cannot resolve is one it cannot show to be
+    // safe, and this is the shape that used to fail open: a chain of ten links
+    // reached the recovery while the guard called it application code.
+    for (const hops of [2, 5, 10, 12, 20]) {
+      const chain = path.join(dir, `chain-${hops}`)
+      fs.mkdirSync(chain, { recursive: true })
+      let target = path.join(scripts, 'restore.mjs')
+      for (let i = hops - 1; i >= 0; i--) {
+        const link = path.join(chain, `l${i}`)
+        fs.symlinkSync(target, link)
+        target = link
+      }
+      assert(
+        isProtectedFile(dir, path.relative(dir, path.join(chain, 'l0'))) === true,
+        `a chain of ${hops} links to the recovery is still the recovery`
+      )
+    }
+
+    // The cycle the bound is for: two links pointing at each other. It has no
+    // end to follow, so the answer has to be the safe one.
+    const cycle = path.join(dir, 'cycle')
+    fs.mkdirSync(cycle, { recursive: true })
+    fs.symlinkSync(path.join(cycle, 'b'), path.join(cycle, 'a'))
+    fs.symlinkSync(path.join(cycle, 'a'), path.join(cycle, 'b'))
+    assert(
+      isProtectedFile(dir, 'cycle/a') === true,
+      'a link cycle is protected, because the driver cannot show what it reaches'
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// The driver wiring itself: the `--restore` flag, its exit codes, and the
+// recovery it runs. The unit tests above cover the pure functions; this
+// covers the command the operator actually types.
+async function runMutationRestoreCommandTests() {
+  console.log('\nRunning mutation driver restore command tests...\n')
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-'))
+  const gitEnv = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'test',
+    GIT_AUTHOR_EMAIL: 'test@example.com',
+    GIT_COMMITTER_NAME: 'test',
+    GIT_COMMITTER_EMAIL: 'test@example.com',
+  }
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  const MUTATIONS = await loadCatalogue()
+  const entry = MUTATIONS.find((m) => m.id === 'stale-status-not-marked')
+  const source = committedFile(repoRoot, 'shared/service.mjs')
+  const shippedRestore = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/restore.mjs'), 'utf8')
+  const shippedLeftover = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/leftover.mjs'), 'utf8')
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-marker-'))
+  const marker = path.join(markerDir, 'loaded')
+  // A copy of the deciding half that writes a file the moment it is
+  // evaluated, so a test can see when it was loaded.
+  const markOnLoad = (text) => `import { writeFileSync as __mark } from 'node:fs'\n__mark(${JSON.stringify(marker)}, 'loaded')\n${text}`
+
+  // A driver run that is meant to be short gets a short leash: a run that
+  // turns into a mutation sweep would take minutes, and the test that runs it
+  // has to fail rather than wait.
+  const runIn = (root, args) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [path.join(root, '.agents/skills/verify/scripts/mutate.mjs'), ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, timeout: 60000 }) }
+    } catch (err) {
+      return { code: err.status ?? 1, out: `${err.stdout || ''}${err.stderr || ''}` }
+    }
+  }
+  const run = (args) => runIn(dir, args)
+
+  // A throwaway copy of the driver and the suite, in a repository of its own.
+  // The driver finds its repository root from where it sits, so a copy has to
+  // carry the scripts, the suite and a file the catalogue can mutate.
+  const makeRepo = (root, { git = true } = {}) => {
+    const rootScripts = path.join(root, '.agents/skills/verify/scripts')
+    fs.mkdirSync(rootScripts, { recursive: true })
+    fs.mkdirSync(path.join(root, 'shared'), { recursive: true })
+    for (const name of ['mutate.mjs', 'restore.mjs', 'leftover.mjs', 'lib.mjs', 'mutations.mjs']) {
+      fs.copyFileSync(path.join(repoRoot, '.agents/skills/verify/scripts', name), path.join(rootScripts, name))
+    }
+    fs.copyFileSync(path.join(repoRoot, 'test_cases.test.js'), path.join(root, 'test_cases.test.js'))
+    fs.writeFileSync(path.join(root, 'shared/service.mjs'), source)
+    if (git) {
+      execSync('git init', { cwd: root, stdio: 'ignore', env: gitEnv })
+      execSync('git add .', { cwd: root, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m init', { cwd: root, stdio: 'ignore', env: gitEnv })
+    }
+    return rootScripts
+  }
+
+  try {
+    const scripts = makeRepo(dir)
+    const leftover = source.replace(entry.find, entry.replace)
+    assert(leftover !== source, 'the catalogue entry still applies to the shipped file')
+
+    // A clean tree: the driver has nothing to undo and says so.
+    const clean = run(['--restore'])
+    assert(clean.code === 0, 'the driver exits 0 when the worktree is clean')
+    assert(clean.out.includes('no tracked file has uncommitted changes'), 'the driver says the tracked files are clean')
+
+    // The check is about tracked files because the driver only ever writes a
+    // tracked one: an untracked file is not the driver's and is not a leftover
+    // either, so it must not turn a successful restore into a refusal. This is
+    // the half the contract in SKILL.md used to leave out.
+    fs.writeFileSync(path.join(dir, 'operator-notes.txt'), 'not ours\n')
+    const withUntracked = run(['--restore'])
+    assert(withUntracked.code === 0, 'the driver exits 0 when only an untracked file is present')
+    assert(
+      withUntracked.out.includes('no tracked file has uncommitted changes'),
+      'the driver says the tracked files are clean even with an untracked file present'
+    )
+    fs.rmSync(path.join(dir, 'operator-notes.txt'))
+
+    // A leftover of a killed run: the driver undoes it and exits 0.
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const undone = run(['--restore'])
+    assert(undone.code === 0, 'the driver exits 0 after undoing a leftover')
+    assert(undone.out.includes('restored shared/service.mjs'), 'the driver says which file it restored')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover is undone by the driver')
+
+    // A leftover the operator has since edited: the driver refuses to touch
+    // it and says the tree is still dirty.
+    const edited = `${leftover}\n// operator work in progress\n`
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), edited)
+    const refused = run(['--restore'])
+    assert(refused.code === 1, 'the driver exits 1 when the worktree is still dirty')
+    assert(refused.out.includes('the tracked files still have uncommitted changes'), 'the driver says the tracked files are still dirty')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === edited, "the operator's edit survives the driver")
+
+    // A plain run on the same tree refuses for the same reason, and names the
+    // file that looks like a reverted fix.
+    const plain = run(['--only', entry.id])
+    assert(plain.code === 2, 'the driver exits 2 on a worktree it cannot judge')
+    assert(plain.out.includes('shared/service.mjs'), 'the driver names the file to look at')
+
+    // The recovery runs code from the worktree, so it must not run against
+    // the operator's uncommitted version of that code: the driver refuses,
+    // and the leftover it was asked to undo is left exactly as it was.
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), `${shippedRestore}\n// the operator is editing the recovery\n`)
+    const editedRecovery = run(['--restore'])
+    assert(editedRecovery.code === 2, 'the driver exits 2 when the recovery path is not the shipped one')
+    assert(editedRecovery.out.includes('the recovery path has uncommitted changes'), 'the driver says why it skipped the recovery')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the recovery path is edited')
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), shippedRestore)
+
+    // The guard asks git about the content of the modules, not about their
+    // timestamps. A module marked assume-unchanged is reported as clean by
+    // `git status`, so a guard that asked git that way would be fooled and
+    // would run the operator's version of the recovery.
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), `${shippedRestore}\n// the operator is editing the recovery\n`)
+    execSync('git update-index --assume-unchanged .agents/skills/verify/scripts/restore.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    const hidden = run(['--restore'])
+    assert(hidden.code === 2, 'the driver exits 2 when a gated module is edited and marked assume-unchanged')
+    assert(hidden.out.includes('the recovery path has uncommitted changes'), 'the guard sees through the assume-unchanged flag')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the guard is fooled')
+    execSync('git update-index --no-assume-unchanged .agents/skills/verify/scripts/restore.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), shippedRestore)
+
+    // The writing half of the recovery is loaded only after the guard has
+    // passed, so a recovery that does not even parse is never evaluated: the
+    // driver skips it instead of dying on it.
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), 'export const broken = (\n')
+    const brokenRecovery = run(['--restore'])
+    assert(brokenRecovery.code === 2, 'the driver exits 2 rather than dying on a recovery it must not run')
+    assert(brokenRecovery.out.includes('could not load the leftover recovery') === false, 'the driver does not load the recovery before the guard has passed')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the recovery cannot be loaded')
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), shippedRestore)
+
+    // The same copy, committed: now the guard has nothing to object to, so
+    // the driver does load it, and it says so. This is what makes the
+    // assertion above worth anything: the message the driver prints when it
+    // does load a broken recovery is the one the assertion looks for.
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), 'export const broken = (\n')
+    execSync('git add .agents/skills/verify/scripts/restore.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m broken', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    const brokenCommitted = run(['--restore'])
+    assert(brokenCommitted.code === 2, 'the driver exits 2 when the recovery it is allowed to load does not parse')
+    assert(brokenCommitted.out.includes('could not load the leftover recovery'), 'the driver says the recovery could not be loaded')
+    fs.writeFileSync(path.join(scripts, 'restore.mjs'), shippedRestore)
+    execSync('git add .agents/skills/verify/scripts/restore.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m restore-back', { cwd: dir, stdio: 'ignore', env: gitEnv })
+
+    // The deciding half of the recovery is loaded under the same guard as the
+    // writing half. A copy that marks the moment it is evaluated proves the
+    // ordering from both sides: the marker is there once the guard has passed,
+    // and it is absent when the guard refused.
+    const committedLeftover = markOnLoad(shippedLeftover)
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), committedLeftover)
+    execSync('git add .agents/skills/verify/scripts/leftover.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m marker', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const guarded = run(['--restore'])
+    assert(guarded.code === 0, 'the driver runs when the guard has passed')
+    assert(fs.existsSync(marker), 'the deciding half of the recovery is loaded once the guard has passed')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the deciding half of the recovery finds the leftover')
+    fs.rmSync(marker, { force: true })
+
+    // The same copy with an uncommitted change on top: the guard refuses, and
+    // the deciding half is never evaluated, so it never gets to say which of
+    // the operator's files would be overwritten.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), `${committedLeftover}\n// the operator is editing the recovery\n`)
+    const refusedLoad = run(['--restore'])
+    assert(refusedLoad.code === 2, 'the driver exits 2 when the recovery path is not the shipped one')
+    assert(refusedLoad.out.includes('the recovery path has uncommitted changes'), 'the driver says why it skipped the recovery')
+    assert(fs.existsSync(marker) === false, 'the deciding half of the recovery is not evaluated before the guard has passed')
+
+    // A deciding half that does not even parse must not kill the driver: it
+    // is never reached, because the guard refuses it first.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), 'export const broken = (\n')
+    const brokenLeftover = run(['--restore'])
+    assert(brokenLeftover.code === 2, 'the driver exits 2 rather than dying on a deciding half it must not run')
+    assert(brokenLeftover.out.includes('could not load the leftover recovery') === false, 'the driver does not load the deciding half before the guard has passed')
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), committedLeftover)
+
+    // The catalogue is the list the recovery searches, so it sits behind the
+    // guard as well: an edited copy is never evaluated, and the leftover is
+    // left alone.
+    const catalogueMarker = path.join(markerDir, 'catalogue')
+    const markCatalogue = (text) => `import { writeFileSync as __markCatalogue } from 'node:fs'\n__markCatalogue(${JSON.stringify(catalogueMarker)}, 'loaded')\n${text}`
+    const shippedMutationsSource = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/mutations.mjs'), 'utf8')
+    fs.writeFileSync(path.join(scripts, 'mutations.mjs'), `${markCatalogue(shippedMutationsSource)}\n// the operator is editing the catalogue\n`)
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const editedCatalogue = run(['--restore'])
+    assert(editedCatalogue.code === 2, 'the driver exits 2 when the catalogue has uncommitted changes')
+    assert(editedCatalogue.out.includes('the recovery path has uncommitted changes'), 'the driver says the recovery path is not the shipped one')
+    assert(fs.existsSync(catalogueMarker) === false, 'the catalogue is not evaluated before the guard has passed')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the catalogue is not the shipped one')
+    fs.writeFileSync(path.join(scripts, 'mutations.mjs'), shippedMutationsSource)
+
+    // The guard asks git itself, in the driver, and not of a helper the
+    // operator could edit: a helper that always answers "the tree is clean"
+    // is not what the guard asks, so it cannot make the guard lie.
+    const shippedLib = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/lib.mjs'), 'utf8')
+    const helperStart = shippedLib.indexOf('export function isDirty(')
+    const helperBody = shippedLib.indexOf(') {', helperStart) + 3
+    const lyingHelper = `${shippedLib.slice(0, helperBody)}\n  return false\n${shippedLib.slice(helperBody)}`
+    fs.writeFileSync(path.join(scripts, 'lib.mjs'), lyingHelper)
+    // A probe that no longer parses would prove nothing, so it has to parse.
+    try {
+      execFileSync(process.execPath, ['--check', path.join(scripts, 'lib.mjs')], { stdio: 'ignore' })
+    } catch {
+      assert(false, 'the probe that lies about the worktree still parses')
+    }
+    // The helper lies and one of the gated modules is edited. The guard must
+    // still fire, because it does not ask the helper.
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), `${shippedLeftover}\n// the operator is editing the recovery\n`)
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const lyingGate = run(['--restore'])
+    assert(lyingGate.code === 2, 'the driver exits 2 when the recovery path is edited')
+    assert(lyingGate.out.includes('the recovery path has uncommitted changes'), 'a helper that lies about the worktree cannot silence the guard')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the guard cannot be trusted')
+    fs.writeFileSync(path.join(scripts, 'lib.mjs'), shippedLib)
+    fs.writeFileSync(path.join(scripts, 'leftover.mjs'), shippedLeftover)
+    // The committed copy of the deciding half is the marked one, so the
+    // shipped copy has to be committed back before the gate can be clean
+    // again.
+    execSync('git add .agents/skills/verify/scripts/leftover.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m leftover-back', { cwd: dir, stdio: 'ignore', env: gitEnv })
+
+    // The guard covers the modules the recovery evaluates, and nothing else:
+    // a change to a script the recovery never loads says nothing about
+    // whether the recovery is the shipped one, so the recovery still runs.
+    fs.writeFileSync(path.join(scripts, 'doctor.mjs'), '// a script the recovery never loads\n')
+    execSync('git add .agents/skills/verify/scripts/doctor.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m doctor', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    fs.writeFileSync(path.join(scripts, 'doctor.mjs'), '// the operator is editing a script the recovery never loads\n')
+    const outsideScope = run(['--restore'])
+    assert(outsideScope.code === 1, 'the driver reports the tree it could not clean, because the unrelated edit is still there')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the recovery still undoes the leftover when an unrelated script is edited')
+
+    // The guard fails closed: an answer it does not understand is not a clean
+    // tree, so the driver refuses rather than running the recovery.
+    const shippedDriver = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/mutate.mjs'), 'utf8')
+    const gateLine = 'return differs'
+    assert(shippedDriver.includes(gateLine), 'the driver still has the guard line the probe replaces')
+    fs.writeFileSync(path.join(scripts, 'mutate.mjs'), shippedDriver.replace(gateLine, 'return undefined'))
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const failClosed = run(['--restore'])
+    assert(failClosed.code === 2, 'the driver exits 2 when the guard answers something it does not understand')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when the guard fails closed')
+    fs.writeFileSync(path.join(scripts, 'mutate.mjs'), shippedDriver)
+
+    // The catalogue must not be able to reach the recovery path or the suite.
+    // A driver that is handed such an entry refuses it, whatever the
+    // catalogue says.
+    const shippedMutations = fs.readFileSync(path.join(repoRoot, '.agents/skills/verify/scripts/mutations.mjs'), 'utf8')
+    fs.writeFileSync(path.join(scripts, 'mutations.mjs'), shippedMutations.replace('export const MUTATIONS = [', "export const MUTATIONS = [\n  { id: 'reaches-the-suite', file: 'test_cases.test.js', find: 'Results:', replace: 'Nope:', expectTest: 'x', description: 'x' },"))
+    execSync('git add .agents/skills/verify/scripts/mutations.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m catalogue', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    const preflight = run(['--preflight'])
+    assert(preflight.code === 1, 'the driver refuses a catalogue entry that reaches the suite')
+    assert(preflight.out.includes('reaches-the-suite'), 'the driver names the entry it refused')
+    assert(preflight.out.includes("carries the driver's own recovery path or the suite it reads"), 'the driver says why the entry is refused')
+    fs.writeFileSync(path.join(scripts, 'mutations.mjs'), shippedMutations)
+    execSync('git add .agents/skills/verify/scripts/mutations.mjs', { cwd: dir, stdio: 'ignore', env: gitEnv })
+    execSync('git commit -m catalogue-back', { cwd: dir, stdio: 'ignore', env: gitEnv })
+
+    // A git failure is an unknown state, not a clean one: the driver refuses
+    // rather than guessing whether the recovery path is the shipped one.
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-nogit-'))
+    try {
+      makeRepo(outside, { git: false })
+      fs.writeFileSync(path.join(outside, 'shared/service.mjs'), leftover)
+      const noGit = runIn(outside, ['--restore'])
+      assert(noGit.code === 2, 'the driver exits 2 when it cannot read the worktree state from git')
+      assert(noGit.out.includes('could not read the worktree state from git'), 'the driver says it cannot judge the worktree')
+      assert(fs.readFileSync(path.join(outside, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when git cannot be read')
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+
+    // The temporary file sits at a fixed, predictable path, so a link planted
+    // there must not receive the committed bytes.
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-outside-'))
+    try {
+      const planted = path.join(outsideDir, 'planted.txt')
+      fs.writeFileSync(planted, "the operator's own file\n")
+      fs.symlinkSync(planted, path.join(dir, 'shared/service.mjs.restore-tmp'))
+      fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+      const plantedRun = run(['--restore'])
+      assert(plantedRun.out.includes('restored shared/service.mjs'), 'the driver undoes the leftover when a link waits at the temporary path')
+      assert(fs.readFileSync(planted, 'utf8') === "the operator's own file\n", 'the recovery does not write through a link at the temporary path')
+      assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover is still undone when a link waited at the temporary path')
+
+      // A link in place of a directory on the path would put the committed
+      // bytes outside the repository just as surely as a link at the file.
+      const outsideService = path.join(outsideDir, 'service.mjs')
+      fs.writeFileSync(outsideService, leftover)
+      fs.rmSync(path.join(dir, 'shared'), { recursive: true })
+      fs.symlinkSync(outsideDir, path.join(dir, 'shared'))
+      const linkedDir = run(['--restore'])
+      assert(linkedDir.out.includes('a link that leaves the repository'), 'the driver says the file is reached through a link out of the repository')
+      assert(fs.readFileSync(outsideService, 'utf8') === leftover, 'the recovery does not write through a link out of the repository')
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true })
+    }
+    // The block above put a link where the shared directory was, so it has to
+    // be a directory again before anything else reads a file in it.
+    fs.unlinkSync(path.join(dir, 'shared'))
+    fs.mkdirSync(path.join(dir, 'shared'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), source)
+
+    // A flag that is present is a flag. `--restore` with a file name after it
+    // is still a restore, and must not turn into a mutation sweep.
+    // The unrelated edit of doctor.mjs above is still in the tree, so it is
+    // put back: the runs below are about the flags, not about a dirty tree.
+    fs.writeFileSync(path.join(scripts, 'doctor.mjs'), '// a script the recovery never loads\n')
+    fs.rmSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json'), { force: true })
+    fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+    const restoreWithFile = run(['--restore', 'shared/service.mjs'])
+    assert(restoreWithFile.code === 0, 'the driver exits 0 when --restore is given a file name')
+    assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover is undone when --restore is given a file name')
+    assert(fs.existsSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json')) === false, 'a restore with a file name after it does not run a mutation sweep')
+
+    // The same for the other boolean flag.
+    const preflightWithFile = run(['--preflight', 'shared/service.mjs'])
+    assert(preflightWithFile.out.includes('mutations are runnable'), '--preflight with a file name after it is still a preflight')
+    assert(fs.existsSync(path.join(dir, '.agents/skills/verify/artifacts/mutations.json')) === false, 'a preflight with a file name after it does not run a mutation sweep')
+
+    // A clean filter can hide an edit from git. The filter runs before git
+    // compares anything, so a file whose edit the filter removes looks
+    // unmodified to `git status` and to any hash git computes. The gate
+    // compares the bytes on disk with the bytes in the commit, so it sees
+    // the edit the filter hides.
+    const filtered = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-filter-'))
+    try {
+      const filteredScripts = makeRepo(filtered)
+      fs.writeFileSync(path.join(filtered, '.gitattributes'), '*.mjs filter=hide-edit\n')
+      execSync('git config filter.hide-edit.clean "grep -v HIDDEN_EDIT"', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      const shippedRestoreInFiltered = fs.readFileSync(path.join(filteredScripts, 'restore.mjs'), 'utf8')
+      fs.writeFileSync(path.join(filteredScripts, 'restore.mjs'), `${shippedRestoreInFiltered}\n// HIDDEN_EDIT\n`)
+      execSync('git add .', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m filtered', { cwd: filtered, stdio: 'ignore', env: gitEnv })
+      fs.writeFileSync(path.join(filtered, 'shared/service.mjs'), leftover)
+      const filteredRun = runIn(filtered, ['--restore'])
+      assert(filteredRun.code === 2, 'the driver exits 2 when a clean filter hides an edit of the recovery path')
+      assert(filteredRun.out.includes('the recovery path has uncommitted changes'), 'the gate sees the edit that the clean filter hides')
+      assert(fs.readFileSync(path.join(filtered, 'shared/service.mjs'), 'utf8') === leftover, 'the leftover is left alone when a clean filter hides the edit')
+    } finally {
+      fs.rmSync(filtered, { recursive: true, force: true })
+    }
+
+    // A checkout that rewrites line endings holds different bytes for the
+    // same code. The gate compares the code, so such a checkout is not an
+    // edited recovery path.
+    const eol = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-eol-'))
+    try {
+      const eolScripts = makeRepo(eol)
+      execSync('git config core.autocrlf true', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      const shippedRestoreInEol = fs.readFileSync(path.join(eolScripts, 'restore.mjs'), 'utf8')
+      fs.writeFileSync(path.join(eolScripts, 'restore.mjs'), shippedRestoreInEol.split('\n').join('\r\n'))
+      execSync('git add .', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      // The line endings are the only change, so the blob does not move and
+      // there is nothing to commit. The commit is empty on purpose: the
+      // point of the test is what the worktree holds, not what the commit
+      // holds.
+      execSync('git commit --allow-empty -m eol', { cwd: eol, stdio: 'ignore', env: gitEnv })
+
+      // The recovery path here is CRLF on disk and LF in the commit, which is
+      // what the gate has to fold: a gate that called the difference an edit
+      // would refuse with exit 2 and never reach the recovery at all. A clean
+      // tree alone would not say that, since it is also clean when the
+      // checkout keeps the line endings, so the asymmetry is asserted.
+      assert(execSync('git status --porcelain --untracked-files=no', { cwd: eol, encoding: 'utf8', env: gitEnv }).trim() === '', 'the rewritten line endings are the checkout\'s, not an edit')
+      const committedRestore = execSync('git show HEAD:.agents/skills/verify/scripts/restore.mjs', { cwd: eol, encoding: 'utf8', env: gitEnv })
+      const worktreeRestore = fs.readFileSync(path.join(eolScripts, 'restore.mjs'), 'utf8')
+      assert(worktreeRestore.includes('\r\n'), 'the recovery path is CRLF in the worktree')
+      assert(committedRestore.includes('\r\n') === false, 'the recovery path is LF in the commit')
+
+      // The bytes the checkout puts in the worktree are not the bytes the
+      // mutation was written against. A mutation whose anchor spans lines can
+      // never match a file the checkout wrote with CRLF, so the run has to say
+      // so instead of blaming a killed run. Let git write those bytes itself,
+      // so the tree stays clean while the anchor misses.
+      const multiLineAnchor = MUTATIONS.find((m) => m.file === 'shared/service.mjs' && m.find.includes('\n'))
+      assert(multiLineAnchor, 'the catalogue has a mutation whose anchor spans lines')
+      fs.rmSync(path.join(eol, 'shared/service.mjs'))
+      execSync('git checkout -- shared/service.mjs', { cwd: eol, stdio: 'ignore', env: gitEnv })
+      const eolBytes = fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8')
+      assert(eolBytes.includes('\r\n'), 'the checkout writes the line endings it was configured to write')
+
+      const anchorMiss = runIn(eol, ['--only', multiLineAnchor.id])
+      assert(anchorMiss.code === 1, 'the run fails when a mutation anchor cannot match')
+      assert(anchorMiss.out.includes('cannot run: anchor not found in the worktree'), 'the run says the anchor was not found')
+      assert(anchorMiss.out.includes('this checkout rewrites line endings'), 'the run names the rewritten line endings as the reason')
+      assert(anchorMiss.out.includes(multiLineAnchor.id), 'the run names the mutation it could not run')
+      assert(fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8') === eolBytes, 'the file is left alone when its anchor cannot match')
+
+      // A killed run on this checkout leaves a leftover in the checkout's own
+      // bytes: the CRLF file with the mutation applied. The recovery matches
+      // bytes against the committed blob, so this one cannot match, and the
+      // run has to name the file instead of undoing it. The exit code is the
+      // point: 1 means the run got past the gate and into the recovery, while
+      // a gate that mistook the CRLF recovery path for an edit would refuse
+      // with 2 and never reach it. The bytes are read back from the checkout
+      // rather than derived from the blob, so there is one source of truth for
+      // what a rewrite of these line endings produces.
+      const crlfSource = fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8')
+      const crlfLeftover = crlfSource.replace(entry.find, entry.replace)
+      fs.writeFileSync(path.join(eol, 'shared/service.mjs'), crlfLeftover)
+      const crlfRestore = runIn(eol, ['--restore'])
+      assert(crlfRestore.code === 1, 'the driver reaches the recovery on a checkout that rewrites line endings')
+      assert(crlfRestore.out.includes('the tracked files still have uncommitted changes'), 'the restore says the tree is still dirty')
+      assert(crlfRestore.out.includes(`${entry.file} (${entry.id})`), 'the restore names the file the leftover was found in')
+      assert(crlfRestore.out.includes('check them by hand'), 'the restore sends the operator to check the file by hand')
+      assert(fs.readFileSync(path.join(eol, 'shared/service.mjs'), 'utf8') === crlfLeftover, 'the file it could not match is not written')
+    } finally {
+      fs.rmSync(eol, { recursive: true, force: true })
+    }
+
+    // The driver puts back the files it mutated, and it puts them where
+    // they were. A file the operator replaced with a link while the run was
+    // going must not receive the content the driver was going to write.
+    const linked = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-linked-'))
+    const victimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-victim-'))
+    try {
+      const linkedScripts = makeRepo(linked)
+      const victim = path.join(victimDir, 'victim.txt')
+      // The link points at a copy of the file, so a write through it would
+      // show up, and the copy still holds the anchor, so the next mutation
+      // really does try to write there.
+      const victimBytes = `${source}\n// the operator's own file\n`
+      fs.writeFileSync(victim, victimBytes)
+      // The suite the driver runs is replaced by one that swaps the mutated
+      // file for a link, so the driver's own undo is the write under test.
+      const mutated = path.join(linked, 'shared/service.mjs')
+      fs.writeFileSync(path.join(linked, 'test_cases.test.js'), [
+        `import { unlinkSync, symlinkSync } from 'node:fs'`,
+        `unlinkSync(${JSON.stringify(mutated)})`,
+        `symlinkSync(${JSON.stringify(victim)}, ${JSON.stringify(mutated)})`,
+        `console.log('Results: 1/1 passed')`,
+        `// ${entry.expectTest}`,
+        '',
+      ].join('\n'))
+      // Two mutations on the same file: the first one is undone through the
+      // link, and the second one finds the link where the file was.
+      fs.writeFileSync(path.join(linkedScripts, 'mutations.mjs'), `export const MUTATIONS = [
+  {
+    id: 'first-of-two',
+    file: 'shared/service.mjs',
+    description: 'the first of two mutations',
+    find: ${JSON.stringify(entry.find)},
+    replace: ${JSON.stringify(entry.replace)},
+    expectTest: ${JSON.stringify(entry.expectTest)},
+  },
+  {
+    id: 'second-of-two',
+    file: 'shared/service.mjs',
+    description: 'the second of two mutations',
+    find: ${JSON.stringify(entry.find)},
+    replace: ${JSON.stringify(entry.replace)},
+    expectTest: ${JSON.stringify(entry.expectTest)},
+  },
+]
+`)
+      execSync('git add .', { cwd: linked, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m linked', { cwd: linked, stdio: 'ignore', env: gitEnv })
+      const linkedRun = runIn(linked, [])
+      assert(fs.readFileSync(victim, 'utf8') === victimBytes, 'the driver does not write the file it mutated through a link')
+      assert(linkedRun.out.includes('the path is not a plain file inside the repository'), 'the driver says it refused to write through a link')
+      assert(linkedRun.out.includes('cannot run: shared/service.mjs is not a plain file inside the repository'), 'the driver refuses to mutate a file that is a link')
+    } finally {
+      fs.rmSync(linked, { recursive: true, force: true })
+      fs.rmSync(victimDir, { recursive: true, force: true })
+    }
+
+    // A write that fails is reported as a failed write, not as a crash. A
+    // file the operator replaced with a directory while the run was going
+    // cannot be written to, and the driver has to say so rather than die on
+    // it and leave the operator guessing.
+    const blocked = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-blocked-'))
+    try {
+      makeRepo(blocked)
+      const mutated = path.join(blocked, 'shared/service.mjs')
+      fs.writeFileSync(path.join(blocked, 'test_cases.test.js'), [
+        `import { unlinkSync, mkdirSync } from 'node:fs'`,
+        `unlinkSync(${JSON.stringify(mutated)})`,
+        `mkdirSync(${JSON.stringify(mutated)})`,
+        `console.log('Results: 1/1 passed')`,
+        `// ${entry.expectTest}`,
+        '',
+      ].join('\n'))
+      execSync('git add .', { cwd: blocked, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m blocked', { cwd: blocked, stdio: 'ignore', env: gitEnv })
+      const blockedRun = runIn(blocked, [])
+      assert(blockedRun.out.includes('could not restore the file:'), 'the driver says the write failed instead of dying on it')
+    } finally {
+      fs.rmSync(blocked, { recursive: true, force: true })
+    }
+
+    // The recovery searches the tree git says the driver is in, not the tree
+    // an edited helper points at. The helper is not behind the gate, so it
+    // must not be able to send the recovery somewhere else.
+    const decoy = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-decoy-'))
+    try {
+      makeRepo(decoy)
+      fs.writeFileSync(path.join(decoy, 'shared/service.mjs'), leftover)
+      const shippedLibInDir = fs.readFileSync(path.join(scripts, 'lib.mjs'), 'utf8')
+      fs.writeFileSync(path.join(scripts, 'lib.mjs'), shippedLibInDir.replace(
+        "export const REPO_ROOT = path.resolve(SKILL_ROOT, '..', '..', '..')",
+        `export const REPO_ROOT = ${JSON.stringify(decoy)}`,
+      ))
+      fs.writeFileSync(path.join(dir, 'shared/service.mjs'), leftover)
+      const redirected = run(['--restore'])
+      assert(redirected.out.includes('restored shared/service.mjs'), 'the recovery undoes the leftover in the tree git says the driver is in')
+      assert(fs.readFileSync(path.join(dir, 'shared/service.mjs'), 'utf8') === source, 'the leftover in the tree git says the driver is in is undone')
+      assert(fs.readFileSync(path.join(decoy, 'shared/service.mjs'), 'utf8') === leftover, 'the recovery leaves the tree an edited helper points at alone')
+      fs.writeFileSync(path.join(scripts, 'lib.mjs'), shippedLibInDir)
+    } finally {
+      fs.rmSync(decoy, { recursive: true, force: true })
+    }
+
+    // A broken recovery module must fail the recovery tests, not take the
+    // whole suite down with it: the suite is what decides whether a mutation
+    // was caught, so it has to be able to report a broken recovery rather
+    // than vanish. A suite whose catalogue does not parse still prints its
+    // results. The nested suite is told not to run this test again, or the
+    // two suites would nest forever.
+    if (!process.env.AGENT_NOTIFY_NO_NESTED_SUITE) {
+      const nested = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-nested-'))
+      try {
+        const tracked = execSync('git ls-files', { cwd: repoRoot, encoding: 'utf8' }).split('\n').filter(Boolean)
+        for (const file of tracked) {
+          const target = path.join(nested, file)
+          fs.mkdirSync(path.dirname(target), { recursive: true })
+          fs.copyFileSync(path.join(repoRoot, file), target)
+        }
+        execSync('git init', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git add .', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git commit -m init', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        fs.writeFileSync(path.join(nested, '.agents/skills/verify/scripts/mutations.mjs'), 'export const MUTATIONS = [\n')
+        execSync('git add .', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        execSync('git commit -m broken-catalogue', { cwd: nested, stdio: 'ignore', env: gitEnv })
+        let nestedCode = 0
+        let nestedOut = ''
+        try {
+          nestedOut = execFileSync(process.execPath, ['test_cases.test.js'], { cwd: nested, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...gitEnv, AGENT_NOTIFY_NO_NESTED_SUITE: '1' } })
+        } catch (err) {
+          nestedCode = err.status ?? 1
+          nestedOut = `${err.stdout || ''}${err.stderr || ''}`
+        }
+        assert(nestedOut.includes('Results:'), 'the suite still reports its results when a recovery module cannot be loaded')
+        assert(nestedOut.includes('the mutation restore tests could not run'), 'the recovery test group is named when it cannot run')
+        assert(nestedCode === 1, 'the suite fails when a recovery module cannot be loaded')
+      } finally {
+        fs.rmSync(nested, { recursive: true, force: true })
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// A broken recovery module must fail the recovery tests, not take the whole
+// suite down with it: the suite is the thing that decides whether a mutation
+// was caught, and it has to be able to report a broken recovery rather than
+// vanish. So each recovery test runs behind a guard that turns a thrown
+// error into a failed test and lets the rest of the suite report.
+async function runRecoveryTest(name, fn) {
+  try {
+    await fn()
+  } catch (err) {
+    assert(false, `${name}: ${err && err.message ? err.message : err}`)
+  }
+}
+
 async function main() {
   runIntegrationTests()
   await runUnitTests()
@@ -1676,6 +2544,10 @@ async function main() {
   await runTailscaleTests()
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
+  await runRecoveryTest('the mutation restore tests could not run', runMutationRestoreTests)
+  await runRecoveryTest('the mutation driver write tests could not run', runDriverWriteTests)
+  await runRecoveryTest('the mutation protection tests could not run', runMutationProtectionTests)
+  await runRecoveryTest('the mutation restore command tests could not run', runMutationRestoreCommandTests)
 
   console.log(`\nResults: ${results.pass}/${results.total} passed, ${results.fail} failed`)
   if (results.fail > 0) {
