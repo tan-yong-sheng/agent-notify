@@ -631,6 +631,13 @@ try {
     let output = ''
     try {
       writeFileNoFollow(state.target, state.source.replace(mutation.find, mutation.replace))
+    } catch (err) {
+      // A write that fails is not a suite that failed: say which one it was,
+      // so the report does not blame a test for a write that never happened.
+      report.check(mutation.id, false, `cannot run: could not write the mutation: ${err.message}`)
+      continue
+    }
+    try {
       output = execFileSync(runtime, ['test_cases.test.js'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 900000, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (err) {
       output = `${err.stdout || ''}${err.stderr || ''}`
@@ -645,8 +652,17 @@ try {
       // very file this one would write, and overwriting it would corrupt
       // that run's evidence.
       if (!lockIsOurs()) lockLost = true
-      else if (writeTargetIsSafe(state.target)) writeFileNoFollow(state.target, state.source)
-      else report.check(`restored ${path.relative(REPO_ROOT, state.target)}`, false, 'the path is not a plain file inside the repository')
+      else if (!writeTargetIsSafe(state.target)) report.check(`restored ${path.relative(REPO_ROOT, state.target)}`, false, 'the path is not a plain file inside the repository')
+      else {
+        try {
+          writeFileNoFollow(state.target, state.source)
+        } catch (err) {
+          // A write that fails is reported as a failed write. The driver
+          // says what happened rather than dying on it, and the leftover it
+          // leaves behind is one the recovery can undo.
+          report.check(`restored ${path.relative(REPO_ROOT, state.target)}`, false, `could not restore the file: ${err.message}`)
+        }
+      }
     }
     if (interrupted) break
     completed++

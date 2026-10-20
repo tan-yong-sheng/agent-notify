@@ -2344,6 +2344,30 @@ async function runMutationRestoreCommandTests() {
       fs.rmSync(victimDir, { recursive: true, force: true })
     }
 
+    // A write that fails is reported as a failed write, not as a crash. A
+    // file the operator replaced with a directory while the run was going
+    // cannot be written to, and the driver has to say so rather than die on
+    // it and leave the operator guessing.
+    const blocked = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-driver-blocked-'))
+    try {
+      makeRepo(blocked)
+      const mutated = path.join(blocked, 'shared/service.mjs')
+      fs.writeFileSync(path.join(blocked, 'test_cases.test.js'), [
+        `import { unlinkSync, mkdirSync } from 'node:fs'`,
+        `unlinkSync(${JSON.stringify(mutated)})`,
+        `mkdirSync(${JSON.stringify(mutated)})`,
+        `console.log('Results: 1/1 passed')`,
+        `// ${entry.expectTest}`,
+        '',
+      ].join('\n'))
+      execSync('git add .', { cwd: blocked, stdio: 'ignore', env: gitEnv })
+      execSync('git commit -m blocked', { cwd: blocked, stdio: 'ignore', env: gitEnv })
+      const blockedRun = runIn(blocked, [])
+      assert(blockedRun.out.includes('could not restore the file:'), 'the driver says the write failed instead of dying on it')
+    } finally {
+      fs.rmSync(blocked, { recursive: true, force: true })
+    }
+
     // The recovery searches the tree git says the driver is in, not the tree
     // an edited helper points at. The helper is not behind the gate, so it
     // must not be able to send the recovery somewhere else.
