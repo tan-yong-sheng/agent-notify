@@ -228,6 +228,27 @@ export function isProtectedFile(repoRoot, file) {
   return isUnder(target, scripts)
 }
 
+// Write to a path without following a link at the end of it.
+//
+// The driver checks a path before it writes to it, and a check that is a
+// separate step from the write leaves a window: a file that is a plain file
+// when it is checked can be a link by the time it is written, and the write
+// would then put the content into the link's destination. Opening the file
+// itself with O_NOFOLLOW closes that window for the last component of the
+// path, so a link there fails the write instead of receiving it. The
+// directories above the file are not covered by the flag; those are checked
+// by the caller, and the same gap is left open by the recovery's write.
+export function writeFileNoFollow(target, content) {
+  const noFollow = fs.constants.O_NOFOLLOW || 0
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | noFollow
+  const fd = fs.openSync(target, flags)
+  try {
+    fs.writeFileSync(fd, content)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 // What the driver says on its way out, in words that do not claim a restore
 // that did not happen. The three cases are different problems and the
 // operator has to be able to tell them apart: a restore that happened, a
@@ -235,7 +256,13 @@ export function isProtectedFile(repoRoot, file) {
 // writes failed. A driver that lost the lock says so, and a driver whose
 // writes failed says that instead of blaming a lock it still holds.
 export function restoreOutcomeMessage({ restored, touched, lostLock, failed }) {
-  if (lostLock) return `left the files this driver touched alone, because ${lostLock}`
+  if (lostLock) {
+    // A driver that touched nothing has no files to leave alone, so it says
+    // that instead of claiming it left files it never wrote.
+    return touched === 0
+      ? `there was nothing to restore, and ${lostLock}`
+      : `left the files this driver touched alone, because ${lostLock}`
+  }
   if (touched === 0) return 'there was nothing to restore'
   if (failed) {
     return restored > 0

@@ -1732,6 +1732,7 @@ async function runMutationRestoreTests() {
   assert(restoreOutcomeMessage({ restored: 0, touched: 1, lostLock: 'another mutation driver took the lock over', failed: false }).includes('another mutation driver took the lock over'), 'a lost lock is reported as a lost lock')
   assert(restoreOutcomeMessage({ restored: 2, touched: 2, lostLock: null, failed: false }) === 'restored 2 tracked file(s) before exiting', 'a restore that happened is reported as a restore')
   assert(restoreOutcomeMessage({ restored: 0, touched: 0, lostLock: null, failed: false }) === 'there was nothing to restore', 'a driver that touched nothing says so')
+  assert(restoreOutcomeMessage({ restored: 0, touched: 0, lostLock: 'the mutation lock file is gone', failed: false }) === 'there was nothing to restore, and the mutation lock file is gone', 'a driver that lost the lock without touching a file does not claim it left files alone')
 
   try {
     execSync('git init', { cwd: dir, stdio: 'ignore' })
@@ -1845,6 +1846,36 @@ async function runMutationRestoreTests() {
     } finally {
       fs.rmSync(outside, { recursive: true, force: true })
     }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// The driver's own write must not follow a link at the end of the path. The
+// check that refuses a linked target is a separate step from the write, so a
+// file that is plain when it is checked can be a link by the time it is
+// written, and the write itself has to refuse it too.
+async function runDriverWriteTests() {
+  console.log('\nRunning mutation driver write tests...\n')
+
+  const { writeFileNoFollow } = await recoveryModules()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-nofollow-'))
+  try {
+    const destination = path.join(dir, 'destination.txt')
+    fs.writeFileSync(destination, "the operator's own file\n")
+    const link = path.join(dir, 'tracked.mjs')
+    fs.symlinkSync(destination, link)
+    let refused = false
+    try {
+      writeFileNoFollow(link, 'the mutation\n')
+    } catch {
+      refused = true
+    }
+    assert(refused, "the driver's write refuses a target that is a link")
+    assert(fs.readFileSync(destination, 'utf8') === "the operator's own file\n", "the link's destination is left alone")
+    const plain = path.join(dir, 'plain.mjs')
+    writeFileNoFollow(plain, 'the mutation\n')
+    assert(fs.readFileSync(plain, 'utf8') === 'the mutation\n', 'a plain file is written')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2400,6 +2431,7 @@ async function main() {
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
   await runRecoveryTest('the mutation restore tests could not run', runMutationRestoreTests)
+  await runRecoveryTest('the mutation driver write tests could not run', runDriverWriteTests)
   await runRecoveryTest('the mutation protection tests could not run', runMutationProtectionTests)
   await runRecoveryTest('the mutation restore command tests could not run', runMutationRestoreCommandTests)
 

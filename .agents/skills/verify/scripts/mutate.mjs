@@ -20,7 +20,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { parseArgs, flagValue, makeReport, restoreOutcomeMessage, REPO_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
+import { parseArgs, flagValue, makeReport, restoreOutcomeMessage, writeFileNoFollow, REPO_ROOT, ARTIFACTS, gitHead, isDirty, isProtectedFile } from './lib.mjs'
 
 const flags = parseArgs(process.argv.slice(2))
 // A flag that is present is a flag, whatever follows it: `--restore` must
@@ -258,6 +258,11 @@ let restoreOutcome = null
 // asked for, so a link is refused here for the same reason the recovery
 // refuses one. The recovery keeps its own copy of this rule: it may not
 // depend on a module the guard has not cleared.
+//
+// The check and the write are two steps, so the write itself refuses to
+// follow a link at the end of the path as well. The directories above the
+// file are not covered by that: the same gap is left open by the recovery's
+// write.
 function writeTargetIsSafe(target) {
   try {
     if (fs.lstatSync(target).isSymbolicLink()) return false
@@ -287,7 +292,7 @@ function restoreOnce() {
       continue
     }
     try {
-      fs.writeFileSync(file, source)
+      writeFileNoFollow(file, source)
       count++
     } catch (err) {
       failed = true
@@ -583,7 +588,7 @@ function restoreAll() {
       continue
     }
     try {
-      fs.writeFileSync(file, source)
+      writeFileNoFollow(file, source)
       count++
       if (fs.readFileSync(file, 'utf8') !== source) report.check(`restored ${path.relative(REPO_ROOT, file)}`, false, 'file differs from the original after restore')
     } catch (err) {
@@ -625,7 +630,7 @@ try {
     const started = Date.now()
     let output = ''
     try {
-      fs.writeFileSync(state.target, state.source.replace(mutation.find, mutation.replace))
+      writeFileNoFollow(state.target, state.source.replace(mutation.find, mutation.replace))
       output = execFileSync(runtime, ['test_cases.test.js'], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 900000, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (err) {
       output = `${err.stdout || ''}${err.stderr || ''}`
@@ -640,7 +645,7 @@ try {
       // very file this one would write, and overwriting it would corrupt
       // that run's evidence.
       if (!lockIsOurs()) lockLost = true
-      else if (writeTargetIsSafe(state.target)) fs.writeFileSync(state.target, state.source)
+      else if (writeTargetIsSafe(state.target)) writeFileNoFollow(state.target, state.source)
       else report.check(`restored ${path.relative(REPO_ROOT, state.target)}`, false, 'the path is not a plain file inside the repository')
     }
     if (interrupted) break
