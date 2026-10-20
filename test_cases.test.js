@@ -62,6 +62,8 @@ import {
   nonInteractiveGitEnv,
   resolveTailscaleBin,
   enableTailscaleServe,
+  tailscaleBinNames,
+  resolveTailscaleHostname,
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
@@ -731,6 +733,182 @@ async function assertUpdateFailureAndBanner() {
   )
 }
 
+// The Host allowlist is its own unit: `tailscale serve` forwards the tailnet
+// hostname, and the loopback-only rule rejected it, so the rules are asserted
+// together and away from the dashboard unit tests they would otherwise inflate.
+function runAllowedHostTests() {
+  console.log('\nRunning Host allowlist tests...\n')
+  assert(isAllowedHost('localhost:3333'), 'isAllowedHost accepts localhost with port')
+  assert(isAllowedHost('127.0.0.1:3333'), 'isAllowedHost accepts loopback ip')
+  assert(isAllowedHost('[::1]:3333'), 'isAllowedHost accepts ipv6 loopback')
+  assert(!isAllowedHost('evil.example.com:3333'), 'isAllowedHost rejects external host')
+  assert(!isAllowedHost('localhost.evil.com'), 'isAllowedHost rejects host suffix trick')
+  assert(!isAllowedHost(undefined), 'isAllowedHost rejects missing host')
+
+  // `tailscale serve` forwards the tailnet hostname, so the dashboard has to
+  // accept it or every tailnet request is a 403.
+  assert(
+    isAllowedHost('lenovo-ideapad.tail3260f2.ts.net', ''),
+    'isAllowedHost accepts a tailnet hostname'
+  )
+  assert(
+    isAllowedHost('lenovo-ideapad.tail3260f2.ts.net:443', ''),
+    'isAllowedHost accepts a tailnet hostname with a port'
+  )
+  assert(
+    !isAllowedHost('ts.net.evil.com', ''),
+    'isAllowedHost rejects a tailnet name buried in another domain'
+  )
+  assert(
+    !isAllowedHost('evitts.net', ''),
+    'isAllowedHost rejects a name that only ends in the same letters'
+  )
+  assert(
+    !isAllowedHost('myhost.example.com', ''),
+    'isAllowedHost still rejects an unnamed external host'
+  )
+  // Anything else has to be named, so a custom domain stays opt-in.
+  assert(
+    isAllowedHost('monitor.internal:3333', 'monitor.internal'),
+    'isAllowedHost accepts a host the operator named'
+  )
+  assert(
+    isAllowedHost('monitor.internal', ' other.internal , monitor.internal '),
+    'isAllowedHost reads the named hosts through their whitespace'
+  )
+  assert(
+    !isAllowedHost('monitor.internal', ''),
+    'isAllowedHost rejects a host that was not named'
+  )
+  const savedAllowed = process.env.AGENT_NOTIFY_ALLOWED_HOSTS
+  try {
+    process.env.AGENT_NOTIFY_ALLOWED_HOSTS = 'monitor.internal,other.internal'
+    assert(
+      isAllowedHost('monitor.internal:3333'),
+      'isAllowedHost reads the named hosts from the environment when none are passed'
+    )
+    assert(!isAllowedHost('unnamed.internal'), 'isAllowedHost rejects a host the environment does not name')
+  } finally {
+    if (savedAllowed === undefined) delete process.env.AGENT_NOTIFY_ALLOWED_HOSTS
+    else process.env.AGENT_NOTIFY_ALLOWED_HOSTS = savedAllowed
+  }
+
+}
+
+// The Tailscale helpers talk to a CLI and a spawnSync'd binary, so they are
+// asserted on their own rather than inflating the dashboard unit tests.
+async function runTailscaleTests() {
+  console.log('\nRunning Tailscale serve tests...\n')
+  // ── Tailscale serve helpers ──────────────────────────────────────────────
+  // resolveTailscaleBin finds a real binary when it is on PATH and returns null
+  // when it is absent. Verified with a fake directory to stay offline.
+  const tsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-ts-'))
+  const tsBinDir = path.join(tsHome, 'bin')
+  fs.mkdirSync(tsBinDir, { recursive: true })
+  const fakeTailscale = path.join(tsBinDir, 'tailscale')
+  fs.writeFileSync(fakeTailscale, '#!/bin/sh\necho ok\n', { mode: 0o755 })
+  const savedPathForTs = process.env.PATH
+  process.env.PATH = `${tsBinDir}${path.delimiter}${savedPathForTs}`
+  assert(resolveTailscaleBin() === fakeTailscale, 'resolveTailscaleBin finds a tailscale binary on PATH')
+  process.env.PATH = '/nonexistent-ts-dir'
+  assert(resolveTailscaleBin() === null, 'resolveTailscaleBin returns null when tailscale is absent')
+  process.env.PATH = savedPathForTs
+
+  // Windows installs the CLI as tailscale.exe, so looking for the bare name
+  // would skip the prompt on a platform this dashboard supports.
+  assert(
+    JSON.stringify(tailscaleBinNames('win32')) === JSON.stringify(['tailscale.exe', 'tailscale']),
+    'tailscaleBinNames looks for the Windows executable first'
+  )
+  assert(
+    JSON.stringify(tailscaleBinNames('linux')) === JSON.stringify(['tailscale']),
+    'tailscaleBinNames looks for the bare name elsewhere'
+  )
+  const winDir = path.join(tsHome, 'winbin')
+  fs.mkdirSync(winDir, { recursive: true })
+  fs.writeFileSync(path.join(winDir, 'tailscale.exe'), '#!/bin/sh\necho ok\n', { mode: 0o755 })
+  process.env.PATH = winDir
+  const expectedWinLookup = process.platform === 'win32' ? path.join(winDir, 'tailscale.exe') : null
+  assert(
+    resolveTailscaleBin() === expectedWinLookup,
+    'resolveTailscaleBin looks for the name its platform installs'
+  )
+  process.env.PATH = savedPathForTs
+  // enableTailscaleServe runs the binary and captures the URL from `serve status`.
+  // A fake tailscale that prints a URL to status is enough to prove the happy path;
+  // a fake that exits 1 proves the graceful failure path.
+  const tsLog = path.join(tsHome, 'ts.log')
+  fs.writeFileSync(
+    fakeTailscale,
+    [
+      '#!/bin/sh',
+      `printf '%s\n' "$*" >> ${JSON.stringify(tsLog)}`,
+      '[ "$1" = status ] && printf \'{"Self":{"DNSName":"myhost.example.ts.net."}}\'  && exit 0',
+      'exit 0',
+      '',
+    ].join('\n'),
+    { mode: 0o755 }
+  )
+  const tsUrl = enableTailscaleServe(fakeTailscale, 4006)
+  const tsCalls = fs.readFileSync(tsLog, 'utf8')
+  assert(tsCalls.includes('serve --bg 4006'), 'enableTailscaleServe calls tailscale serve --bg <port>')
+  assert(tsCalls.includes('status --self --json'), 'enableTailscaleServe queries tailscale status --self --json for the hostname')
+  assert(tsUrl === 'https://myhost.example.ts.net', 'enableTailscaleServe returns the HTTPS URL (trailing dot stripped)')
+
+  assert(
+    resolveTailscaleHostname(fakeTailscale) === 'myhost.example.ts.net',
+    'resolveTailscaleHostname reads the MagicDNS name without its trailing dot'
+  )
+
+  // Serve config belongs to root until an operator is set, so the failure has
+  // to name the command that lifts it instead of repeating the one that failed.
+  const tsWarned = []
+  const realWarn = console.warn
+  console.warn = (...args) => tsWarned.push(args.join(' '))
+  try {
+    fs.writeFileSync(
+      fakeTailscale,
+      '#!/bin/sh\necho "sending serve config: Access denied: serve config denied" >&2\nexit 1\n',
+      { mode: 0o755 }
+    )
+    const deniedUrl = enableTailscaleServe(fakeTailscale, 4006)
+    assert(deniedUrl === null, 'enableTailscaleServe returns null when serve is denied')
+    const deniedOutput = tsWarned.join('\n')
+    assert(
+      deniedOutput.includes('sudo tailscale set --operator=$USER'),
+      'a denied serve names the command that grants the permission'
+    )
+    assert(
+      deniedOutput.includes('tailscale serve --bg 4006'),
+      'a denied serve still says how to run it once it is permitted'
+    )
+  } finally {
+    console.warn = realWarn
+  }
+
+  fs.writeFileSync(tsLog, '')
+  tsWarned.length = 0
+  console.warn = (...args) => tsWarned.push(args.join(' '))
+  try {
+    fs.writeFileSync(fakeTailscale, '#!/bin/sh\necho "some other failure" >&2\nexit 1\n', { mode: 0o755 })
+    enableTailscaleServe(fakeTailscale, 4006)
+    const otherOutput = tsWarned.join('\n')
+    assert(
+      !otherOutput.includes('set --operator'),
+      'a failure that is not a permission problem does not suggest the operator command'
+    )
+    assert(otherOutput.includes('some other failure'), 'a failure that is not a permission problem says what failed')
+  } finally {
+    console.warn = realWarn
+  }
+
+  fs.writeFileSync(fakeTailscale, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  const tsUrlFail = enableTailscaleServe(fakeTailscale, 4006)
+  assert(tsUrlFail === null, 'enableTailscaleServe returns null when tailscale exits non-zero')
+
+  fs.rmSync(tsHome, { recursive: true, force: true })
+}
+
 async function runDashboardUnitTests() {
   console.log('\nRunning dashboard.mjs unit tests...\n')
 
@@ -812,13 +990,6 @@ async function runDashboardUnitTests() {
     formatListenError(new Error('boom'), 3333).includes('boom'),
     'formatListenError falls back to the error message'
   )
-
-  assert(isAllowedHost('localhost:3333'), 'isAllowedHost accepts localhost with port')
-  assert(isAllowedHost('127.0.0.1:3333'), 'isAllowedHost accepts loopback ip')
-  assert(isAllowedHost('[::1]:3333'), 'isAllowedHost accepts ipv6 loopback')
-  assert(!isAllowedHost('evil.example.com:3333'), 'isAllowedHost rejects external host')
-  assert(!isAllowedHost('localhost.evil.com'), 'isAllowedHost rejects host suffix trick')
-  assert(!isAllowedHost(undefined), 'isAllowedHost rejects missing host')
 
   assert(normalizeAgentStatus('WORKING') === 'working', 'normalizeAgentStatus working')
   assert(normalizeAgentStatus('blocked') === 'blocked', 'normalizeAgentStatus blocked')
@@ -1104,47 +1275,6 @@ async function runDashboardUnitTests() {
   }
   fs.rmSync(tmpRepoDir, { recursive: true, force: true })
 
-  // ── Tailscale serve helpers ──────────────────────────────────────────────
-  // resolveTailscaleBin finds a real binary when it is on PATH and returns null
-  // when it is absent. Verified with a fake directory to stay offline.
-  const tsHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-ts-'))
-  const tsBinDir = path.join(tsHome, 'bin')
-  fs.mkdirSync(tsBinDir, { recursive: true })
-  const fakeTailscale = path.join(tsBinDir, 'tailscale')
-  fs.writeFileSync(fakeTailscale, '#!/bin/sh\necho ok\n', { mode: 0o755 })
-  const savedPathForTs = process.env.PATH
-  process.env.PATH = `${tsBinDir}${path.delimiter}${savedPathForTs}`
-  assert(resolveTailscaleBin() === fakeTailscale, 'resolveTailscaleBin finds a tailscale binary on PATH')
-  process.env.PATH = '/nonexistent-ts-dir'
-  assert(resolveTailscaleBin() === null, 'resolveTailscaleBin returns null when tailscale is absent')
-  process.env.PATH = savedPathForTs
-
-  // enableTailscaleServe runs the binary and captures the URL from `serve status`.
-  // A fake tailscale that prints a URL to status is enough to prove the happy path;
-  // a fake that exits 1 proves the graceful failure path.
-  const tsLog = path.join(tsHome, 'ts.log')
-  fs.writeFileSync(
-    fakeTailscale,
-    [
-      '#!/bin/sh',
-      `printf '%s\n' "$*" >> ${JSON.stringify(tsLog)}`,
-      '[ "$1" = status ] && printf \'{"Self":{"DNSName":"myhost.example.ts.net."}}\'  && exit 0',
-      'exit 0',
-      '',
-    ].join('\n'),
-    { mode: 0o755 }
-  )
-  const tsUrl = enableTailscaleServe(fakeTailscale, 4006)
-  const tsCalls = fs.readFileSync(tsLog, 'utf8')
-  assert(tsCalls.includes('serve --bg 4006'), 'enableTailscaleServe calls tailscale serve --bg <port>')
-  assert(tsCalls.includes('status --self --json'), 'enableTailscaleServe queries tailscale status --self --json for the hostname')
-  assert(tsUrl === 'https://myhost.example.ts.net', 'enableTailscaleServe returns the HTTPS URL (trailing dot stripped)')
-
-  fs.writeFileSync(fakeTailscale, '#!/bin/sh\nexit 1\n', { mode: 0o755 })
-  const tsUrlFail = enableTailscaleServe(fakeTailscale, 4006)
-  assert(tsUrlFail === null, 'enableTailscaleServe returns null when tailscale exits non-zero')
-
-  fs.rmSync(tsHome, { recursive: true, force: true })
 
   // This check runs inside the HTTP server: git must never sit on a credential
   // prompt there. Proven against real git rather than asserted: without the
@@ -1491,6 +1621,8 @@ async function main() {
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
   await runDashboardUnitTests()
+  runAllowedHostTests()
+  await runTailscaleTests()
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()
 

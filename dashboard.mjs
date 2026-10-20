@@ -681,10 +681,28 @@ export function renderDashboardHtml() {
 // state (prompts, tool input, workspace paths) through the loopback listener.
 const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
 
-export function isAllowedHost(hostHeader) {
+// `tailscale serve` proxies to this listener and forwards the hostname it was
+// reached under, so a tailnet request arrives with a Host the loopback rule
+// rejects. The `*.ts.net` names are resolved by Tailscale, and a rebinding
+// attack needs a name the attacker controls, so allowing that suffix does not
+// reopen the hole the loopback rule closes. Any other name has to be named
+// explicitly, and a tailnet name is never a suffix of someone else's domain
+// because the check is on the label boundary.
+const ALLOWED_HOST_SUFFIXES = ['.ts.net']
+
+// A host is allowed when it is one of the loopback names, when it is one the
+// operator named in AGENT_NOTIFY_ALLOWED_HOSTS, or when it is a Tailscale name.
+export function isAllowedHost(hostHeader, extraHosts = (process.env.AGENT_NOTIFY_ALLOWED_HOSTS || '')) {
   if (!hostHeader) return false
   const host = String(hostHeader).toLowerCase().replace(/:\d+$/, '')
-  return ALLOWED_HOSTS.includes(host)
+  if (ALLOWED_HOSTS.includes(host)) return true
+  if (ALLOWED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true
+  return String(extraHosts)
+    .toLowerCase()
+    .split(',')
+    .map((h) => h.trim().replace(/:\d+$/, ''))
+    .filter(Boolean)
+    .includes(host)
 }
 
 const server = http.createServer(async (req, res) => {
