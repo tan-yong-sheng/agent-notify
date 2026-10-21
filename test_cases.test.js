@@ -1553,7 +1553,49 @@ async function runTimingTests() {
     { 'w2:p1': 'done' }
   )
   assert(legacyRows[0].stateSinceExact === false, 'a legacy string entry yields no duration')
-  assert(applyRecordedTransitions([], null).length === 0, 'applyRecordedTransitions survives a null store')
+  // The row must be a Herdr row: with an empty agent list the helper never reads
+  // the store, so that version of this assertion passed even when indexing a
+  // null store threw.
+  // Caught here rather than allowed to escape: an unguarded index would throw
+  // out of this synchronous test and abort the suite, which reports as "abort
+  // evidence" instead of naming the assertion that failed.
+  let nullStore = null
+  try {
+    nullStore = applyRecordedTransitions(
+      [{ id: 'herdr-w5:p1', source: 'herdr', status: 'working', stateSince: 5, stateSinceExact: false }],
+      null
+    )
+  } catch {
+    nullStore = null
+  }
+  assert(
+    Array.isArray(nullStore) && nullStore[0].stateSinceExact === false,
+    'applyRecordedTransitions survives a null store'
+  )
+
+  // A pane that cycled working -> done -> working keeps a record whose status
+  // matches again, but it belongs to the earlier occurrence. A transition this
+  // process watched is at most one poll old, so the older record loses.
+  const cycled = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p1', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: true, stateSinceExact: false }],
+    { 'w6:p1': { status: 'working', at: 10_000 } }
+  )
+  assert(cycled[0].stateSinceExact === false, 'a record older than a witnessed transition is not applied')
+
+  // A record newer than the witnessed transition is the real one.
+  const fresher = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p2', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: true, stateSinceExact: false }],
+    { 'w6:p2': { status: 'working', at: 21_000 } }
+  )
+  assert(fresher[0].stateSince === 21_000, 'a record newer than a witnessed transition is applied')
+
+  // A row first seen already running has no witnessed transition to prefer, so
+  // the adapter's record is the best evidence available.
+  const firstSightRow = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p3', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: false, stateSinceExact: false }],
+    { 'w6:p3': { status: 'working', at: 10_000 } }
+  )
+  assert(firstSightRow[0].stateSince === 10_000, 'a first-sight row takes the adapter record')
 }
 
 async function runDashboardUnitTests() {

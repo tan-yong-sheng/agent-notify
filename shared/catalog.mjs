@@ -297,23 +297,22 @@ function isActive(status) {
   return ACTIVE_STATUSES.has(status)
 }
 
-// Works out when the current status began, in one of three ways:
+// Works out when the current status began, in one of four ways:
 //   1. the runtime said so (Orca) — exact, and it survives a restart;
 //   2. the same status as last poll — the clock it was first given;
-//   3. first sight, or a change this poll is the first to see — now.
-// Only case 1 and a genuine transition are exact starts; case 3 on first sight
-// is a lower bound, which is what stateSinceExact reports.
+//   3. a change this process watched happen — measured to within one poll;
+//   4. first sight — a lower bound, and the only case that knows nothing.
+// `witnessed` marks case 3, which is how a stale adapter record is told apart
+// from a fresh one below.
 function resolveTiming(agent, previous, now) {
   if (agent.stateStartedAt !== null) {
-    return { at: agent.stateStartedAt, exact: true, settledAt: agent.stateStartedAt }
+    return { at: agent.stateStartedAt, exact: true, settledAt: agent.stateStartedAt, witnessed: false }
   }
   const changed = previous ? previous.status !== agent.status : true
   if (previous && !changed) {
-    return { at: previous.at, exact: previous.exact, settledAt: previous.settledAt }
+    return { at: previous.at, exact: previous.exact, settledAt: previous.settledAt, witnessed: previous.witnessed }
   }
-  // A row first seen settled has no observed transition behind it, so there is
-  // nothing honest to print in the last-active column.
-  return { at: now, exact: false, settledAt: previous ? now : null }
+  return { at: now, exact: false, settledAt: previous ? now : null, witnessed: Boolean(previous) }
 }
 
 // Exported for tests. The clock is a parameter so a suite can step time
@@ -326,6 +325,7 @@ export function trackStateSince(agents, now, answered = null) {
     const timing = resolveTiming(agent, previous, now)
     agent.stateSince = timing.at
     agent.stateSinceExact = timing.exact
+    agent.stateSinceWitnessed = timing.witnessed
     agent.settledSince = timing.settledAt
 
     stateSince.set(agent.id, {
@@ -333,6 +333,7 @@ export function trackStateSince(agents, now, answered = null) {
       at: timing.at,
       exact: timing.exact,
       settledAt: timing.settledAt,
+      witnessed: timing.witnessed,
     })
 
     // Last activity is a runtime fact, not an inference. Herdr reports none, so
@@ -380,20 +381,39 @@ function sameState(recordedStatus, rowStatus) {
 // a duration from first observation is the inaccurate number this replaced.
 // The pure half, so the mapping from a recorded time to a row can be tested
 // without a running adapter or a Herdr CLI.
+// Rows are keyed `herdr-<paneId>`; the store is keyed by Herdr's own pane id,
+// which is what the row id carries after its prefix. A non-Herdr row has none.
+function herdrPaneId(agent) {
+  if (agent.source !== 'herdr') return ''
+  return agent.id.startsWith('herdr-') ? agent.id.slice('herdr-'.length) : ''
+}
+
+// The recorded time for this row, or null when there is none it may trust.
+//
+// Two separate reasons to refuse. The stored time describes the status it was
+// recorded for, so a missed or delayed event leaves the row on a newer status
+// and that clock belongs to the previous state. And a matching status is not
+// enough on its own: a pane that cycled working -> done -> working matches a
+// record from the earlier `working`. A transition this process watched happen is
+// at most one poll old, so a record older than it describes the earlier
+// occurrence and must not date the current one.
+function recordedTimeFor(agent, store) {
+  const paneId = herdrPaneId(agent)
+  if (!paneId) return null
+  const entry = store[paneId]
+  if (!sameState(entryStatus(entry), agent.status)) return null
+  const recorded = entryStartedAt(entry)
+  if (recorded === null) return null
+  if (agent.stateSinceWitnessed && recorded < agent.stateSince) return null
+  return recorded
+}
+
 export function applyRecordedTransitions(agents, state) {
+  // A missing or corrupt store means no recorded times, not a crash: this runs
+  // inside snapshot collection, where a throw takes every row down with it.
+  const store = state && typeof state === 'object' ? state : {}
   for (const agent of agents) {
-    if (agent.source !== 'herdr') continue
-    // Rows are keyed `herdr-<paneId>`; the store is keyed by Herdr's own pane id,
-    // which is what the row id carries after its prefix.
-    const paneId = agent.id.startsWith('herdr-') ? agent.id.slice('herdr-'.length) : ''
-    if (!paneId) continue
-    const entry = state[paneId]
-    // The stored time describes the status it was recorded for. If a transition
-    // event was missed or delayed, the row has already moved on and this clock
-    // belongs to the previous state: showing it would date the current status
-    // from when the previous one began.
-    if (!sameState(entryStatus(entry), agent.status)) continue
-    const recorded = entryStartedAt(entry)
+    const recorded = recordedTimeFor(agent, store)
     if (recorded === null) continue
     agent.stateSince = recorded
     agent.stateSinceExact = true
