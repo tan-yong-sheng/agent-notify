@@ -49,6 +49,9 @@ import {
   workspaceLabel,
   agentMatchesQuery,
   showsDuration,
+  shortAge,
+  durationLabel,
+  lastActiveLabel,
 } from './dashboard.mjs'
 import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
@@ -1397,56 +1400,40 @@ async function runTimingTests() {
   assert(!showsDuration(null), 'showsDuration survives a null row')
 
   // The page embeds the same rule, so the browser cannot drift from the test.
-  const embeddedShowsDuration = sliceEmbeddedFunction(renderDashboardHtml(), 'const showsDuration = ')
-  assert(embeddedShowsDuration !== null, 'the dashboard embeds the duration rule')
-  const pageShowsDuration = new Function(`return ${embeddedShowsDuration}`)()
-  assert(
-    pageShowsDuration({ stateSince: t0, stateSinceExact: true }) === true &&
-      pageShowsDuration({ stateSince: t0, stateSinceExact: false }) === false,
-    'the embedded duration rule agrees with the module'
-  )
+  // Asserted on the rendered page text, not by compiling it: the function is
+  // exported and imported above, so compiling a copy would prove nothing about
+  // the code the page runs.
+  const pageHtml = renderDashboardHtml()
+  assert(pageHtml.includes('const showsDuration = '), 'the dashboard embeds the duration rule')
 
   // The gate above decides *whether* a duration may print; it does not prove
-  // anything prints. Exercise the renderer the page actually runs, so a
-  // durationLabel that returned '' for every row would fail here.
-  const pageHtml = renderDashboardHtml()
-  const embeddedDurationLabel = sliceEmbeddedFunction(pageHtml, 'function durationLabel')
-  const embeddedShortAge = sliceEmbeddedFunction(pageHtml, 'function shortAge')
-  assert(embeddedDurationLabel !== null, 'the dashboard embeds the duration formatter')
-  assert(embeddedShortAge !== null, 'the dashboard embeds the short-age formatter')
-  // sliceEmbeddedFunction returns the parameter list and body, without the
-  // `function` keyword, so each slice is spliced in as an expression.
-  const renderDuration = new Function(
-    'showsDuration',
-    'Date',
-    `const shortAge = function${embeddedShortAge};\nconst durationLabel = function${embeddedDurationLabel};\nreturn durationLabel;`
-  )(pageShowsDuration, { now: () => 1792600000000 })
-  const elevenMinutes = renderDuration({ stateSince: 1792600000000 - 660000, stateSinceExact: true })
+  // anything prints. These call the exported formatters directly — the same
+  // functions the page embeds — so a durationLabel that returned '' for every
+  // row would fail here without compiling any page source.
+  const now = 1792600000000
+  const elevenMinutes = durationLabel({ stateSince: now - 660000, stateSinceExact: true }, now)
   assert(
     elevenMinutes.includes('11m') && elevenMinutes.includes('badge-duration'),
     'an exact start renders a duration in the badge'
   )
-  assert(renderDuration({ stateSince: 1792600000000 - 660000, stateSinceExact: false }) === '',
+  assert(durationLabel({ stateSince: now - 660000, stateSinceExact: false }, now) === '',
     'an inexact start renders no duration')
 
   // The settled column must not round seconds down to "0m": shortAge() floors to
   // minutes, so a row that settled six seconds ago would claim zero minutes.
-  const embeddedLastActive = sliceEmbeddedFunction(pageHtml, 'function lastActiveHTML')
-  assert(embeddedLastActive !== null, 'the dashboard embeds the last-active formatter')
-  const renderLastActive = new Function(
-    'Date',
-    `const shortAge = function${embeddedShortAge};\nconst lastActiveHTML = function${embeddedLastActive};\nreturn lastActiveHTML;`
-  )({ now: () => 1792600000000 })
-  const sixSeconds = renderLastActive({ status: 'done', settledSince: 1792600000000 - 6000, updatedAt: null })
-  assert(sixSeconds === 'Settled 6s ago', 'a settled row under a minute shows seconds, not 0m')
-  const elevenMinutesAgo = renderLastActive({ status: 'done', settledSince: 1792600000000 - 660000, updatedAt: null })
-  assert(elevenMinutesAgo === 'Settled 11m ago', 'a settled row over a minute shows minutes')
-  assert(
-    renderLastActive({ status: 'done', settledSince: null, updatedAt: null }) === '—',
-    'a settled row with no recorded time shows a dash'
-  )
-  assert(renderLastActive({ status: 'working', settledSince: null, updatedAt: null }) === 'Active now',
+  assert(lastActiveLabel({ status: 'done', settledSince: now - 6000, updatedAt: null }, now) === 'Settled 6s ago',
+    'a settled row under a minute shows seconds, not 0m')
+  assert(lastActiveLabel({ status: 'done', settledSince: now - 660000, updatedAt: null }, now) === 'Settled 11m ago',
+    'a settled row over a minute shows minutes')
+  assert(lastActiveLabel({ status: 'done', settledSince: null, updatedAt: null }, now) === '—',
+    'a settled row with no recorded time shows a dash')
+  assert(lastActiveLabel({ status: 'working', settledSince: null, updatedAt: null }, now) === 'Active now',
     'a running row says it is active now')
+
+  // The page must embed the same functions, or it would run a copy that drifts.
+  for (const name of ['shortAge', 'durationLabel', 'lastActiveHTML']) {
+    assert(pageHtml.includes(`const ${name} = `), `the dashboard embeds ${name}`)
+  }
 
   // ── The transition store the adapter writes and the catalog reads ─────────
   // Entries were bare status strings; an existing file holds hundreds of them.

@@ -120,6 +120,42 @@ export function showsDuration(agent) {
   return Boolean(agent?.stateSinceExact) && Number.isFinite(agent?.stateSince)
 }
 
+// A compact age: 12m, 5h, 3d. Pure, so the page and the tests share one rule and
+// a test can assert it without compiling page source.
+export function shortAge(seconds) {
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+// The duration suffix for a running row's badge, or '' when the start is not
+// measured. The span keeps it out of the badge's uppercase transform, which
+// turned "12m" into "12M" — a month.
+export function durationLabel(agent, now = Date.now()) {
+  if (!showsDuration(agent)) return ''
+  const seconds = Math.floor((now - agent.stateSince) / 1000)
+  if (seconds < 0) return ''
+  const text = seconds < 60 ? `${seconds}s` : shortAge(seconds)
+  return `<span class="badge-duration"> · ${text}</span>`
+}
+
+// The Last Active cell, in one wording for both runtimes: a running row is
+// active right now whichever adapter found it. Under a minute reports seconds,
+// because shortAge() floors to minutes and a row six seconds old would otherwise
+// claim "Settled 0m ago".
+export function lastActiveLabel(agent, now = Date.now()) {
+  if (agent.status === 'working' || agent.status === 'blocked') return 'Active now'
+  const hasSettled = agent.settledSince !== null && agent.settledSince !== undefined
+  const since = hasSettled ? agent.settledSince : agent.updatedAt
+  if (since === null || since === undefined) return '—'
+  const seconds = Math.floor((now - since) / 1000)
+  if (seconds < 5) return 'Settled just now'
+  if (seconds < 60) return `Settled ${seconds}s ago`
+  return `Settled ${shortAge(seconds)} ago`
+}
+
 // What a search term is matched against. The host is in the list because it is
 // the one field the header's health tags do not filter: they say whether a
 // runtime answers, not which rows came from it, and the row tag that does say so
@@ -801,40 +837,11 @@ export function renderDashboardHtml() {
       document.getElementById('last-updated').innerText = 'Synced ' + new Date().toLocaleTimeString();
     }
 
-    // Only a measured start gets a duration; showsDuration() holds the rule.
-    function durationLabel(a) {
-      if (!showsDuration(a)) return '';
-      const seconds = Math.floor((Date.now() - a.stateSince) / 1000);
-      if (seconds < 0) return '';
-      const text = seconds < 60 ? seconds + 's' : shortAge(seconds);
-      return '<span class="badge-duration"> · ' + text + '</span>';
-    }
-
-    function shortAge(seconds) {
-      const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return minutes + 'm';
-      const hours = Math.floor(minutes / 60);
-      if (hours < 24) return hours + 'h';
-      return Math.floor(hours / 24) + 'd';
-    }
-
-    // One wording for both runtimes. A running row is active right now whichever
-    // adapter found it, so it says so; the alternative was Orca printing "9s
-    // ago" beside Herdr printing "just now" for the same fact.
-    function lastActiveHTML(a) {
-      if (a.status === 'working' || a.status === 'blocked') return 'Active now';
-      // Explicit null checks: a zero timestamp is falsy, and a loose inequality
-      // would hide the difference between "no time recorded" and "time is 0".
-      const hasSettled = a.settledSince !== null && a.settledSince !== undefined;
-      const since = hasSettled ? a.settledSince : a.updatedAt;
-      if (since === null || since === undefined) return '—';
-      const seconds = Math.floor((Date.now() - since) / 1000);
-      if (seconds < 5) return 'Settled just now';
-      // Under a minute is seconds, not a rounded "0m": shortAge() floors to
-      // minutes, so a row 6 seconds old would otherwise read "Settled 0m ago".
-      if (seconds < 60) return 'Settled ' + seconds + 's ago';
-      return 'Settled ' + shortAge(seconds) + ' ago';
-    }
+    // The timing formatters are exported and embedded, so the browser runs the
+    // same code the unit tests exercise rather than a copy that can drift.
+    const shortAge = ${shortAge.toString()};
+    const durationLabel = ${durationLabel.toString()};
+    const lastActiveHTML = ${lastActiveLabel.toString()};
 
     function badgeHTML(status, agent) {
       // The duration is its own span so the badge's uppercase transform does not

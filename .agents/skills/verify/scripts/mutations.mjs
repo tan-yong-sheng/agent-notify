@@ -104,7 +104,7 @@ export const MUTATIONS = [
     id: 'settled-shows-zero-minutes',
     file: 'dashboard.mjs',
     description: 'a row that settled seconds ago reads "Settled 0m ago"',
-    find: "      if (seconds < 60) return 'Settled ' + seconds + 's ago';",
+    find: '  if (seconds < 60) return `Settled ${seconds}s ago`',
     replace: '',
     expectTest: 'a settled row under a minute shows seconds',
   },
