@@ -39,6 +39,7 @@ import {
   updateBannerLabel,
   nextAgentOrder,
   workspaceLabel,
+  agentMatchesQuery,
 } from './dashboard.mjs'
 import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
@@ -943,6 +944,27 @@ async function assertUpdateFailureAndBanner() {
     /focusedRowControl[\s\S]{0,600}dataset\.copyPath[\s\S]{0,200}dataset\.agentId/.test(dashboardHtml),
     'the recorded focus is identified by the data attribute that also drives the action'
   )
+
+  // The search covers the host, so typing a runtime's name narrows the table to
+  // its rows. That is the filter the header tags do not offer: they report
+  // whether a runtime answers, not which rows came from it.
+  const herdrRow = { id: 'h1', source: 'herdr', agent: 'pi', cwd: '/h/.pi/x', displayName: 'π - x', branch: 'main', prompt: null }
+  const orcaRow = { id: 'o1', source: 'orca', agent: 'dsh-tui', cwd: '/h/c/agent-notify', displayName: 'main', branch: 'main', prompt: 'Run the suite' }
+  assert(agentMatchesQuery(herdrRow, 'herdr') === true, 'the search matches a row by its host')
+  assert(agentMatchesQuery(orcaRow, 'herdr') === false, 'the search excludes the other host')
+  assert(agentMatchesQuery(orcaRow, 'ORCA') === true, 'the host match folds case')
+  assert(agentMatchesQuery(orcaRow, '') === true, 'an empty query keeps every row, which is the cancel')
+  assert(agentMatchesQuery(herdrRow, 'run the suite') === false, 'a prompt match does not cross rows')
+  assert(agentMatchesQuery(orcaRow, 'run the suite') === true, 'the search still matches a prompt')
+  assert(agentMatchesQuery({ id: 'x' }, 'anything') === false, 'a row with no fields matches nothing')
+  assert(agentMatchesQuery({ id: 'x' }, '') === true, 'a row with no fields still survives an empty query')
+
+  // Same rule as the helpers above: the browser must run this function, not a
+  // second copy of the field list that the tests never see.
+  const embeddedMatch = sliceEmbeddedFunction(dashboardHtml, 'const agentMatchesQuery = ')
+  assert(embeddedMatch !== null, 'the dashboard embeds the search predicate')
+  assert(dashboardHtml.includes('filter(a => agentMatchesQuery(a, searchQuery))'), 'the table filters through it')
+  assert(dashboardHtml.includes('host, prompt'), 'the search box says it filters by host')
 }
 
 // The files that make the page installable. Chrome refuses to offer

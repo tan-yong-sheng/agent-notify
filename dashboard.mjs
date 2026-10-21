@@ -111,6 +111,18 @@ export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' 
   return seen.includes(label.toLowerCase()) ? '' : label
 }
 
+// What a search term is matched against. The host is in the list because it is
+// the one field the header's health tags do not filter: they say whether a
+// runtime answers, not which rows came from it, and the row tag that does say so
+// is the only place the runtime appears. A term matches case-insensitively in
+// any of these fields.
+export function agentMatchesQuery(agent, query) {
+  const q = String(query || '').toLowerCase().trim()
+  if (!q) return true
+  return ['cwd', 'displayName', 'branch', 'agent', 'source', 'prompt']
+    .some((field) => String(agent?.[field] ?? '').toLowerCase().includes(q))
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -629,7 +641,7 @@ export function renderDashboardHtml() {
   </div>
 
   <div class="controls-bar">
-    <input type="text" id="search-box" class="search-box" placeholder="Filter by directory, branch, agent, prompt..." />
+    <input type="text" id="search-box" class="search-box" placeholder="Filter by directory, branch, agent, host, prompt..." />
     <div class="filter-tabs">
       <button class="filter-tab active" data-filter="all" onclick="setFilter('all')">All (<span id="tab-count-all">0</span>)</button>
       <button class="filter-tab" data-filter="working" onclick="setFilter('working')">Working (<span id="tab-count-working">0</span>)</button>
@@ -687,6 +699,10 @@ export function renderDashboardHtml() {
     // itself. Exported and embedded the same way as the order above, so the
     // browser runs the code the tests exercise.
     const workspaceLabel = ${workspaceLabel.toString()};
+    // The search predicate is embedded for the same reason: the browser runs the
+    // function the unit tests exercise, so a field dropped from the list here is
+    // a field the tests notice.
+    const agentMatchesQuery = ${agentMatchesQuery.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
     // A two-line row instead of three, for comparing density on a real phone.
@@ -816,13 +832,7 @@ export function renderDashboardHtml() {
       }
 
       if (searchQuery) {
-        filtered = filtered.filter(a => {
-          return (a.cwd && a.cwd.toLowerCase().includes(searchQuery)) ||
-                 (a.displayName && a.displayName.toLowerCase().includes(searchQuery)) ||
-                 (a.branch && a.branch.toLowerCase().includes(searchQuery)) ||
-                 (a.agent && a.agent.toLowerCase().includes(searchQuery)) ||
-                 (a.prompt && a.prompt.toLowerCase().includes(searchQuery));
-        });
+        filtered = filtered.filter(a => agentMatchesQuery(a, searchQuery));
       }
 
       if (filtered.length === 0) {

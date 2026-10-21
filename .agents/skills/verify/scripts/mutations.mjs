@@ -260,4 +260,12 @@ export const MUTATIONS = [
     replace: '      void focused;',
     expectTest: 'the page puts keyboard focus back on the same row control after a poll',
   },
+  {
+    id: 'host-search-dropped',
+    file: 'dashboard.mjs',
+    description: 'searching a host name stops narrowing to that runtime',
+    find: "  return ['cwd', 'displayName', 'branch', 'agent', 'source', 'prompt']",
+    replace: "  return ['cwd', 'displayName', 'branch', 'agent', 'prompt']",
+    expectTest: 'the search matches a row by its host',
+  },
 ]

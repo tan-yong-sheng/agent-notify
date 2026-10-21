@@ -133,6 +133,18 @@ try {
   browser(['type', '--selector', '#search-box', '--value', ''])
   report.check('clearing the query restores every row', rowsText().length === 3)
 
+  // Typing a host name is the filter the header's health tags do not provide:
+  // the tags report whether a runtime answers, not which rows came from it. The
+  // cancel is the one the page already has — clearing the box.
+  browser(['type', '--selector', '#search-box', '--value', 'herdr'])
+  const herdrRows = rowsText()
+  report.check('searching a host name narrows to that runtime', herdrRows.length === 1 && herdrRows[0].includes('charlie-docs'), `${herdrRows.length} rows`)
+  browser(['type', '--selector', '#search-box', '--value', 'orca'])
+  const orcaRows = rowsText()
+  report.check('searching the other host name narrows to its rows', orcaRows.length === 2 && orcaRows.every((r) => r.includes('orca') === false) && orcaRows.every((r) => /alpha-service|bravo-web/.test(r)), `${orcaRows.length} rows`)
+  browser(['type', '--selector', '#search-box', '--value', ''])
+  report.check('clearing the host query is the cancel', rowsText().length === 3)
+
   // ── filter tabs ───────────────────────────────────────────────────────────
   browser(['click', '--selector', '.filter-tab[data-filter="blocked"]'])
   report.check('the Blocked tab shows only blocked agents', rowsText().length === 1 && rowsText()[0].includes('bravo-web'))
