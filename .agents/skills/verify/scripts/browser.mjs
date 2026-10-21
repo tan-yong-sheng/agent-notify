@@ -11,6 +11,7 @@
 //   text                         print document.body.innerText
 //   aria [--path FILE]           print the accessibility tree as 'role "name"' lines
 //   wait --selector CSS [--timeout MS]
+//   viewport --width N [--height N] [--mobile]
 //   click --selector CSS
 //   type --selector CSS --value TEXT
 //   screenshot --path FILE
@@ -267,7 +268,24 @@ async function pageSession() {
     )
   }
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true })
+  // A device-metrics override belongs to the session that set it, and every
+  // command here attaches a fresh one, so the recorded viewport is re-applied
+  // rather than lost between commands.
+  if (state.viewport) await applyViewport(cdp, sessionId, state.viewport)
   return { cdp, sessionId, state }
+}
+
+function applyViewport(cdp, sessionId, viewport) {
+  return cdp.send(
+    'Emulation.setDeviceMetricsOverride',
+    {
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor ?? 2,
+      mobile: Boolean(viewport.mobile),
+    },
+    sessionId
+  )
 }
 
 // ─── Commands ───────────────────────────────────────────────────────────────
@@ -391,9 +409,34 @@ async function open(url) {
     writeState({ ...state, targetId })
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
     await cdp.send('Page.enable', {}, sessionId)
+    // A viewport set before the navigation is how a run drives a phone-size
+    // layout: the width has to hold while the page lays out, not after.
+    if (state.viewport) await applyViewport(cdp, sessionId, state.viewport)
     await waitFor(sessionId, 'document.readyState === "complete"', 15000, cdp).catch(() => {})
     const { result } = await cdp.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
     console.log(result.value)
+  } finally {
+    cdp.close()
+  }
+}
+
+async function viewport() {
+  const width = Number(flags.width)
+  if (!Number.isInteger(width) || width < 1) throw new Error('viewport needs --width N')
+  const height = flags.height && flags.height !== true ? Number(flags.height) : 800
+  const viewport = { width, height, mobile: Boolean(flags.mobile), deviceScaleFactor: 2 }
+  const state = readState()
+  // Recorded before the override is attempted so a session that has not opened
+  // a page yet still gets the width when it does.
+  writeState({ ...state, viewport })
+  if (!state.targetId) {
+    console.log(`viewport ${width}x${height} recorded; it applies when the page opens`)
+    return
+  }
+  const { cdp, sessionId } = await pageSession()
+  try {
+    const { result } = await cdp.send('Runtime.evaluate', { expression: 'innerWidth + "x" + innerHeight', returnByValue: true }, sessionId)
+    console.log(`viewport ${width}x${height}; page now reports ${result.value}`)
   } finally {
     cdp.close()
   }
@@ -571,6 +614,7 @@ const COMMANDS = {
   },
   click,
   type,
+  viewport,
   screenshot,
   close,
 }

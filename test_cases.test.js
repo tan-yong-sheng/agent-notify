@@ -844,6 +844,29 @@ async function assertUpdateFailureAndBanner() {
     /max-width: 100%[^}]*overflow-wrap: anywhere/s.test(dashboardHtml),
     'the workspace path wraps instead of overflowing on a narrow screen'
   )
+
+  // The host tag is the only thing on a card that says which runtime found the
+  // row: after the dsh -> dsh-tui rename both runtimes report the same agent
+  // name, so the column cannot be dropped on the grounds that the name implies
+  // it. Below 900px the cell used to be display:none, which cost every phone
+  // the one field a reader cannot infer.
+  const narrowBlock = dashboardHtml.slice(
+    dashboardHtml.indexOf('@media (max-width: 900px)'),
+    dashboardHtml.indexOf('@media (max-width: 900px)') + 6000
+  )
+  assert(narrowBlock.length > 100, 'the page has a narrow-screen block to check')
+  assert(
+    !/nth-child\(2\)\s*\{[^}]*display:\s*none/s.test(narrowBlock),
+    'the narrow-screen block does not hide the Host cell'
+  )
+  assert(
+    /nth-child\(2\)\s*\{[^}]*order:\s*\d/s.test(narrowBlock),
+    'the Host cell is ordered onto the card rather than dropped'
+  )
+  assert(
+    dashboardHtml.includes('tag-source tag-orca') && dashboardHtml.includes('tag-source tag-herdr'),
+    'a row renders a source tag for each runtime'
+  )
 }
 
 // The files that make the page installable. Chrome refuses to offer

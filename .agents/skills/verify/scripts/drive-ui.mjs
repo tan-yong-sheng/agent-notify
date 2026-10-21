@@ -184,6 +184,37 @@ try {
       (JSON.stringify(orderBefore) === JSON.stringify(orderAfter) ? '' : ' — known defect: the table is rebuilt from the payload order on every poll')
   )
 
+  // ── the same table on a phone ─────────────────────────────────────────────
+  // The narrow layout reshapes each row into a card with flex order, so a cell
+  // can be dropped without any markup change. The host tag went missing on a
+  // phone through a `display: none` in the media query, which every check above
+  // missed because they all run at the desktop width.
+  browser(['viewport', '--width', '320', '--height', '568', '--mobile'])
+  browser(['open', `http://127.0.0.1:${port}/`])
+  const phone = evalIn(`(() => {
+    const rows = [...document.querySelectorAll('#agent-table-body tr')];
+    const row = rows[0];
+    const tag = row.querySelector('.tag-source');
+    return {
+      width: innerWidth,
+      rows: rows.length,
+      header: getComputedStyle(document.querySelector('thead')).display,
+      card: getComputedStyle(row).display,
+      hostVisible: tag ? tag.getBoundingClientRect().width > 0 : false,
+      hostText: tag ? tag.innerText : '',
+      agent: row.children[2].innerText.trim(),
+      offsetWidth: document.documentElement.scrollWidth,
+    };
+  })()`)
+  report.check('the phone viewport is the width the run asked for', phone.width === 320, `${phone.width}px`)
+  report.check('every row is still rendered on a phone', phone.rows === 3, `${phone.rows} rows`)
+  report.check('the table becomes cards below 900px', phone.header === 'none' && phone.card === 'flex', `thead ${phone.header}, row ${phone.card}`)
+  report.check('a card still says which runtime found the row', phone.hostVisible && /Orca|Herdr/.test(phone.hostText), phone.hostText || 'no host tag')
+  report.check('the card still names the agent', Boolean(phone.agent), phone.agent)
+  report.check('a phone card does not scroll sideways', phone.offsetWidth <= 320, `document ${phone.offsetWidth}px`)
+  browser(['screenshot', '--path', path.join(outDir, 'phone.png')])
+  report.check('the phone screenshot is captured', fs.statSync(path.join(outDir, 'phone.png')).size > 1000, path.join(outDir, 'phone.png'))
+
   report.writeEvidence('drive-ui.json')
 } finally {
   if (browserStarted) runBrowserHere(['close'])

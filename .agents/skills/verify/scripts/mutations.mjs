@@ -228,4 +228,12 @@ export const MUTATIONS = [
     replace: 'env: execEnv }',
     expectTest: 'a status CLI that ignores SIGTERM does not stall the snapshot',
   },
+  {
+    id: 'phone-host-column-hidden',
+    file: 'dashboard.mjs',
+    description: 'the Host cell is dropped from the phone card again',
+    find: '      tbody td:nth-child(2) { order: 2; flex: 0 0 auto; }',
+    replace: '      tbody td:nth-child(2) { display: none; }',
+    expectTest: 'the narrow-screen block does not hide the Host cell',
+  },
 ]

@@ -481,16 +481,20 @@ export function renderDashboardHtml() {
       }
       tbody td { border: none; padding: 0; max-width: none; }
 
-      /* line 1: state, agent, and how long ago it moved */
+      /* line 1: state, host, agent, and how long ago it moved. The host tag
+         stays: after the dsh -> dsh-tui rename both runtimes report the same
+         agent name, so the tag is the only thing on the card that says which
+         one found the row. */
       tbody td:nth-child(1) { order: 1; flex: 0 0 auto; }
-      tbody td:nth-child(3) { order: 2; flex: 0 1 auto; font-size: 14px; min-width: 0; }
-      tbody td:nth-child(7) { order: 3; flex: 0 0 auto; margin-left: auto; font-size: 11px; }
+      tbody td:nth-child(2) { order: 2; flex: 0 0 auto; }
+      tbody td:nth-child(3) { order: 3; flex: 0 1 auto; font-size: 14px; min-width: 0; }
+      tbody td:nth-child(7) { order: 4; flex: 0 0 auto; margin-left: auto; font-size: 11px; }
 
       /* line 2: where it is and which branch. The path chip is dropped here and
          kept in the modal, because it was the single tallest cell on the card. */
       /* The name and the directory share one line: the directory is what
          identifies the project, and the name alone repeats the agent. */
-      tbody td:nth-child(4) { order: 4; flex: 1 1 auto; font-size: 12px; min-width: 0; display: flex; align-items: center; gap: 6px; }
+      tbody td:nth-child(4) { order: 5; flex: 1 1 auto; font-size: 12px; min-width: 0; display: flex; align-items: center; gap: 6px; }
       tbody td:nth-child(4) > div {
         margin-bottom: 0;
         font-weight: 500;
@@ -520,7 +524,7 @@ export function renderDashboardHtml() {
       tbody td:nth-child(4) > div { margin-bottom: 0; font-weight: 500; }
 
       /* line 3: what it is doing, truncated to one line */
-      tbody td:nth-child(6) { order: 6; flex: 1 1 100%; font-size: 12px; min-width: 0; }
+      tbody td:nth-child(6) { order: 7; flex: 1 1 100%; font-size: 12px; min-width: 0; }
       tbody td:nth-child(6) .action-text {
         display: block;
         overflow: hidden;
@@ -529,10 +533,6 @@ export function renderDashboardHtml() {
         max-width: none;
         color: var(--text-muted);
       }
-      /* The source tag says which runtime found the row, which the agent name
-         already implies for a reader who knows these tools; it costs a whole
-         line on every card, so it moves to the modal. */
-      tbody td:nth-child(2) { display: none; }
 
       tbody td:empty { display: none; }
     }
