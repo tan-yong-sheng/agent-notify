@@ -96,26 +96,19 @@ export function nextAgentOrder(knownIds, incomingIds) {
   return kept
 }
 
-// The last part of a directory, for a narrow screen where the whole absolute
-// path does not fit. The directory is what says which project a row belongs to,
-// so it is never dropped: an absolute path on a phone is cut to its last two
-// parts, which is what fits. A `home` prefix is folded to `~` when the caller
-// knows it, because it is the same on every row and says nothing about the
-// project — the caller passes it, this does not read the environment, so the
-// same function runs in the page and in the tests.
-export function shortPath(cwd, home = '', parts = 2) {
-  const text = typeof cwd === 'string' ? cwd.trim() : ''
-  if (!text) return ''
-  let trimmed = text.replace(/[\\/]+$/, '')
-  if (home && (trimmed === home || trimmed.startsWith(home + '/') || trimmed.startsWith(home + '\\'))) {
-    trimmed = '~' + trimmed.slice(home.length)
-  }
-  const segments = trimmed.split(/[\\/]/).filter(Boolean)
-  // A root path has no segments to shorten, and returning '' for it would hide
-  // the directory the row belongs to, which is the one thing this must not do.
-  if (segments.length === 0) return trimmed || '/'
-  if (segments.length <= parts) return trimmed
-  return '…/' + segments.slice(-parts).join('/')
+// The workspace label a row shows above its path, or an empty string when the
+// label would say nothing new. The two runtimes disagree about what this field
+// means: Herdr puts the terminal title there (`π - extensions`), which tells the
+// operator what the session is for, while Orca puts the worktree's display name
+// there, which is the branch — and the branch already has a column. A label that
+// only repeats the agent, the branch, or the directory's own name is dropped, so
+// a row never shows the same word twice.
+export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' } = {}) {
+  const label = typeof displayName === 'string' ? displayName.trim() : ''
+  if (!label) return ''
+  const base = String(cwd).replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || ''
+  const seen = [String(agent || ''), String(branch || ''), base].map((v) => v.trim().toLowerCase()).filter(Boolean)
+  return seen.includes(label.toLowerCase()) ? '' : label
 }
 
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
@@ -266,17 +259,18 @@ export function renderDashboardHtml() {
       cursor: pointer;
       display: inline-block;
       max-width: 360px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      /* The directory is the field that says which project a row belongs to, so
+         a long one wraps instead of being cut: an ellipsis here would hide the
+         part that tells two rows apart. */
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
       transition: background 0.1s ease;
     }
     .path-chip:hover {
       background: rgba(110, 118, 129, 0.25);
       text-decoration: underline;
     }
-    /* The short form is for a narrow screen; the full path is shown at width. */
-    .path-short { display: none; }
 
     /* Controls Bar: Search & Filter Tabs */
     .controls-bar {
@@ -359,6 +353,14 @@ export function renderDashboardHtml() {
       line-height: 1.4;
     }
     .action-text:hover { color: #fff; }
+    /* A row with no tool and no prompt has nothing to expand, so it does not
+       offer the hand cursor that promises a panel. */
+    .action-plain { cursor: default; }
+    .action-plain:hover { color: #c9d1d9; }
+    .ws-label { font-weight: 600; margin-bottom: 2px; }
+    /* The inline branch sits beside the path on a narrow screen, where the
+       branch has no column of its own; at width the column shows it. */
+    .branch-inline { display: none; color: var(--accent); margin-left: 6px; font-size: 11px; }
 
     /* Modal / Drawer for Full Prompt */
     .modal-backdrop {
@@ -497,11 +499,24 @@ export function renderDashboardHtml() {
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      tbody td:nth-child(5) { order: 5; flex: 0 0 auto; font-size: 11px; }
-      /* The directory stays: it is what tells one row's project from another.
-         The full path is what does not fit, so the short form replaces it. */
-      tbody td:nth-child(4) .path-full { display: none; }
-      tbody td:nth-child(4) .path-short { display: inline-block; max-width: 100%; }
+      /* The branch moves beside the path, which is where the operator reads it
+         anyway: a column of its own costs a whole line on a card. */
+      tbody td:nth-child(5) { display: none; }
+      tbody td:nth-child(4) .branch-inline { display: inline; }
+      /* The whole directory, at every width. It is the field that says which
+         project a row belongs to, so it is never shortened or clipped: a narrow
+         screen wraps it onto another line instead, which costs a line and keeps
+         the information. */
+      tbody td:nth-child(4) .path-chip {
+        display: inline-block;
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        overflow: visible;
+        text-overflow: clip;
+        font-size: 11px;
+      }
       tbody td:nth-child(4) > div { margin-bottom: 0; font-weight: 500; }
 
       /* line 3: what it is doing, truncated to one line */
@@ -631,9 +646,11 @@ export function renderDashboardHtml() {
     // An agent that has gone must not stay in the order, or a long-lived page
     // keeps sorting rows for agents that no longer exist.
     const nextAgentOrder = ${nextAgentOrder.toString()};
-    // The workspace path is the field that says which project a row belongs to,
-    // so it is never hidden; on a narrow screen it is cut to its last parts.
-    const shortPath = ${shortPath.toString()};
+    // The row renderer calls this to decide whether the workspace label says
+    // anything the row does not already say, so the page needs the function
+    // itself. Exported and embedded the same way as the order above, so the
+    // browser runs the code the tests exercise.
+    const workspaceLabel = ${workspaceLabel.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
     // A two-line row instead of three, for comparing density on a real phone.
@@ -762,16 +779,35 @@ export function renderDashboardHtml() {
             <td>\${sourceTagHTML(a.source)}</td>
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
-              <div style="font-weight:600; margin-bottom:2px;">\${escapeHTML(a.displayName)}</div>
-              <span class="path-chip path-full" data-copy-path="\${escapeHTML(a.cwd)}" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
-              <span class="path-chip path-short" data-copy-path="\${escapeHTML(a.cwd)}" title="\${escapeHTML(a.cwd)}">\${escapeHTML(shortPath(a.cwd, '', 2))}</span>
+              \${(() => {
+                // The label is dropped when it would only repeat the agent, the
+                // branch or the directory: Orca puts the branch in this field,
+                // so every Orca row said "main" above a path whose branch
+                // column already said "main".
+                const label = workspaceLabel(a.displayName, { agent: a.agent, branch: a.branch, cwd: a.cwd });
+                // The branch belongs with the path it is checked out on, so it
+                // sits beside it in brackets instead of in a column of its own
+                // on a narrow screen. The column stays for the table.
+                const branch = a.branch ? '<span class="branch-inline">(' + escapeHTML(a.branch) + ')</span>' : '';
+                return (label ? '<div class="ws-label">' + escapeHTML(label) + '</div>' : '') +
+                  '<span class="path-chip path-full" data-copy-path="' + escapeHTML(a.cwd) + '" title="Click to copy full path">' + escapeHTML(a.cwd) + '</span>' +
+                  branch;
+              })()}
             </td>
-            <td>\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="branch-cell">\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
             <td style="max-width:340px;">
-              <div class="action-text" data-agent-id="\${escapeHTML(a.id)}" title="Click to expand prompt">
-                \${a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : ''}
-                <span>\${escapeHTML(a.prompt || (a.status === 'working' ? 'Processing...' : 'Idle'))}</span>
-              </div>
+              \${(() => {
+                // Only a row with something to show is worth a tap: an idle row
+                // with no tool and no prompt opened an empty panel that said so,
+                // which is a dead end dressed as a control.
+                const detail = Boolean(a.tool || a.toolInput || a.prompt);
+                const label = a.prompt || (a.status === 'working' ? 'Processing...' : 'Idle');
+                const body = (a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : '') +
+                  '<span>' + escapeHTML(label) + '</span>';
+                return detail
+                  ? '<div class="action-text" data-agent-id="' + escapeHTML(a.id) + '" title="Click to expand prompt">' + body + '</div>'
+                  : '<div class="action-text action-plain">' + body + '</div>';
+              })()}
             </td>
             <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${timeSince(a.updatedAt)}</td>
           </tr>

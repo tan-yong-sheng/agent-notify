@@ -38,7 +38,7 @@ import {
   renderDashboardHtml,
   updateBannerLabel,
   nextAgentOrder,
-  shortPath,
+  workspaceLabel,
 } from './dashboard.mjs'
 import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
@@ -117,22 +117,43 @@ function captureConsole(fn) {
 // Function.prototype.toString() is re-serialized by some runtimes (Bun emits its
 // own formatting, semicolons included), so the function embedded in the page is
 // sliced by matching braces instead of by a regex over its source.
+// The index just past the `)` that closes the parameter list starting at `open`.
+function endOfParams(source, open) {
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '(') depth++
+    else if (source[i] === ')' && --depth === 0) return i + 1
+  }
+  return -1
+}
+
+// The index of the `}` that closes the body starting at `from`.
+function endOfBody(source, from) {
+  let depth = 0
+  for (let i = from; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}' && --depth === 0) return i + 1
+  }
+  return -1
+}
+
+// The source of an embedded function, from its declaration to its closing brace.
+//
+// The parameter list is skipped before the body is measured: a destructured
+// parameter has braces of its own, so counting from the first `{` would end the
+// slice at the end of the parameters instead of the end of the body.
 function sliceEmbeddedFunction(source, prelude) {
   const start = source.indexOf(prelude)
   if (start === -1) return null
-  const from = start + prelude.length
-  let depth = 0
-  let seenBrace = false
-  for (let i = from; i < source.length; i++) {
-    if (source[i] === '{') {
-      depth++
-      seenBrace = true
-    } else if (source[i] === '}') {
-      depth--
-      if (seenBrace && depth === 0) return source.slice(from, i + 1)
-    }
-  }
-  return null
+  const open = source.indexOf('(', start + prelude.length)
+  if (open === -1) return null
+  const bodyStart = endOfParams(source, open)
+  if (bodyStart === -1) return null
+  const bodyFrom = source.indexOf('{', bodyStart)
+  if (bodyFrom === -1) return null
+  const bodyEnd = endOfBody(source, bodyFrom)
+  if (bodyEnd === -1) return null
+  return source.slice(start + prelude.length, bodyEnd)
 }
 
 function assert(condition, label) {
@@ -759,37 +780,69 @@ async function assertUpdateFailureAndBanner() {
     'the page rebuilds the order through it on every poll'
   )
 
-  // A narrow screen shows the workspace directory shortened, because it is the
-  // field that says which project a row belongs to and it has to survive at
-  // every width. What it must never do is come back empty.
-  assert(shortPath('/home/me/Documents/Coding/agent-notify', '/home/me') === '…/Coding/agent-notify', 'shortPath keeps the last two segments')
-  assert(shortPath('/home/me/.pi/agent/extensions', '/home/me') === '…/agent/extensions', 'shortPath keeps the last two segments of a dotted path')
-  assert(shortPath('/home/me/Documents/Coding/agent-notify', '/home/me', 3) === '…/Documents/Coding/agent-notify', 'shortPath keeps three segments when asked')
-  assert(shortPath('/opt/work', '/home/me') === '/opt/work', 'shortPath leaves a short absolute path alone')
-  assert(shortPath('/home/me', '/home/me') === '~', 'shortPath folds the home directory')
-  assert(shortPath('/home/me/Documents', '/home/me') === '~/Documents', 'shortPath folds the home prefix')
-  assert(shortPath('/home/me/project/', '/home/me', 2) === '~/project', 'shortPath ignores a trailing slash')
-  assert(shortPath('C:\\\\Users\\\\me\\\\proj', '', 2) === '…/me/proj', 'shortPath handles Windows separators')
-
-  // The cases where a shortened path must not become nothing: a root, an empty
-  // value and a missing one. An empty string for a real directory is the one
-  // outcome that loses the information this exists to keep.
-  assert(shortPath('/', '/home/me') === '/', 'shortPath keeps a root path')
-  assert(shortPath('/', '', 1) === '/', 'shortPath keeps a root path at any width')
-  assert(shortPath('') === '', 'shortPath returns empty for an empty path')
-  assert(shortPath(undefined) === '', 'shortPath does not throw on a missing path')
-  assert(shortPath(null) === '', 'shortPath does not throw on a null path')
-  for (const real of ['/', '/opt/work', '/home/me', '/home/me/Documents']) {
-    assert(shortPath(real, '/home/me', 1) !== '', `shortPath never empties the directory ${real}`)
+  // The page calls workspaceLabel while rendering a row, so the page has to have
+  // it. It was exported and unit-tested but never embedded, which left the table
+  // on its "Loading running agents..." placeholder for ever while the counts
+  // above it updated: the fetch worked, renderRows() threw a ReferenceError, and
+  // the catch swallowed it. Assert the embed, not just the function.
+  const embeddedWorkspaceLabel = sliceEmbeddedFunction(dashboardHtml, 'const workspaceLabel = ')
+  assert(embeddedWorkspaceLabel !== null, 'the dashboard embeds the workspace label function')
+  const pageWorkspaceLabel = new Function(`return ${embeddedWorkspaceLabel}`)()
+  const labelCases = [
+    ['π - extensions', { agent: 'pi', branch: '', cwd: '/h/.pi/agent/extensions' }],
+    ['main', { agent: 'dsh-tui', branch: 'main', cwd: '/h/c/agent-notify' }],
+    ['', { agent: 'pi', branch: 'main', cwd: '/h/c/x' }],
+  ]
+  for (const [name, row] of labelCases) {
+    assert(
+      pageWorkspaceLabel(name, row) === workspaceLabel(name, row),
+      `the embedded workspace label matches the tested one for ${JSON.stringify(name)}`
+    )
   }
 
-  // The page renders both spellings and lets the width decide, so neither the
-  // full path nor the short one can disappear from the markup.
-  assert(dashboardHtml.includes('path-full'), 'the page renders the full path')
-  assert(dashboardHtml.includes('path-short'), 'the page renders the shortened path')
+  // The general form of that bug: anything the page calls must be defined in the
+  // page. The two helpers above are embedded by name, so a third added without
+  // its embed would fail here rather than on someone's screen.
+  const pageScript = dashboardHtml.slice(dashboardHtml.indexOf('<script>'), dashboardHtml.lastIndexOf('</script>'))
+  for (const [name, fn] of [
+    ['nextAgentOrder', nextAgentOrder],
+    ['workspaceLabel', workspaceLabel],
+    ['updateBannerLabel', updateBannerLabel],
+  ]) {
+    assert(
+      pageScript.includes(`function ${name}(`),
+      `the page defines ${name} before it calls it`
+    )
+  }
+
+  // The label above the path is only worth a line when it says something the
+  // row does not already say. Orca puts the branch in this field, so every Orca
+  // row read "main" above a path whose branch column also read "main".
+  assert(workspaceLabel('π - extensions', { agent: 'pi', branch: '', cwd: '/h/.pi/agent/extensions' }) === 'π - extensions', 'workspaceLabel keeps a title that says something new')
+  assert(workspaceLabel('main', { agent: 'dsh-tui', branch: 'main', cwd: '/h/c/agent-notify' }) === '', 'workspaceLabel drops a label that only repeats the branch')
+  assert(workspaceLabel('pi', { agent: 'pi', branch: 'main', cwd: '/h/c/proj' }) === '', 'workspaceLabel drops a label that only repeats the agent')
+  assert(workspaceLabel('agent-notify', { agent: 'dsh', branch: 'main', cwd: '/h/c/agent-notify' }) === '', 'workspaceLabel drops a label that only repeats the directory name')
+  assert(workspaceLabel('MAIN', { agent: 'dsh', branch: 'main', cwd: '/h/c/x' }) === '', 'workspaceLabel folds case when comparing')
+  assert(workspaceLabel('', {}) === '', 'workspaceLabel returns empty for an empty label')
+  assert(workspaceLabel(undefined, {}) === '', 'workspaceLabel does not throw on a missing label')
+  assert(workspaceLabel('feat/pwa-responsive', { agent: 'dsh', branch: 'main', cwd: '/h/c/x' }) === 'feat/pwa-responsive', 'workspaceLabel keeps a label that differs from everything on the row')
+
+  // The branch sits beside the path on a narrow screen, where it has no column.
+  assert(dashboardHtml.includes('branch-inline'), 'the page renders the branch beside the path')
+  assert(dashboardHtml.includes('ws-label'), 'the page renders the workspace label through a class')
+
+  // The workspace directory is the field that says which project a row belongs
+  // to, so it is rendered in full at every width. A narrow screen wraps it onto
+  // another line rather than cutting it, and nothing may clip it to nothing.
+  assert(dashboardHtml.includes('path-full'), 'the page renders the workspace path in full')
+  assert(!dashboardHtml.includes('path-short'), 'the page does not render a shortened workspace path')
   assert(
-    dashboardHtml.includes("shortPath(a.cwd, '', 2)"),
-    'the page shortens through the tested function'
+    !dashboardHtml.includes("'…/' +"),
+    'the page does not abbreviate a path with an ellipsis'
+  )
+  assert(
+    /max-width: 100%[^}]*overflow-wrap: anywhere/s.test(dashboardHtml),
+    'the workspace path wraps instead of overflowing on a narrow screen'
   )
 }
 
