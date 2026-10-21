@@ -43,6 +43,11 @@ const port = Number(flags.port || 4740)
 const startedAt = Date.now()
 let polls = 0
 
+// The timing fields the catalog computes are carried in the fixture the way the
+// API serves them: the stub replaces collectLiveState entirely, so nothing here
+// observes a transition. `stateSinceExact: false` is the row the catalog first
+// saw already working, which the page must print with a "+" because the start
+// is a lower bound.
 const AGENTS = [
   {
     id: 'orca:alpha',
@@ -55,6 +60,9 @@ const AGENTS = [
     tool: 'Bash',
     toolInput: { command: 'node test_cases.test.js' },
     prompt: 'Run the suite and report the failing assertion with its file and line.',
+    stateSince: startedAt - 754000,
+    stateSinceExact: false,
+    settledSince: null,
     updatedAt: startedAt - 4000,
   },
   {
@@ -68,6 +76,9 @@ const AGENTS = [
     tool: 'Edit',
     toolInput: { file: 'src/app.mjs' },
     prompt: 'Waiting for approval before rewriting the migration.',
+    stateSince: startedAt - 65000,
+    stateSinceExact: true,
+    settledSince: startedAt - 65000,
     updatedAt: startedAt - 65000,
   },
   {
@@ -81,6 +92,9 @@ const AGENTS = [
     tool: '',
     toolInput: null,
     prompt: '',
+    stateSince: startedAt - 600000,
+    stateSinceExact: false,
+    settledSince: startedAt - 600000,
     updatedAt: startedAt - 600000,
   },
 ]
@@ -92,8 +106,48 @@ const SWAPPED = [AGENTS[2], AGENTS[0], AGENTS[1]].map((agent, index) => ({
   updatedAt: startedAt - index * 1000,
 }))
 
+// One running Herdr row, in the shape the catalog produces when the adapter has
+// recorded no transition for it: an observed start the page must not print as a
+// duration, because it would count from when the dashboard started looking.
+const HERDR_RUNNING = [
+  {
+    id: 'herdr:delta',
+    source: 'herdr',
+    agent: 'pi',
+    displayName: 'delta-long-run',
+    cwd: '/tmp/verify-fixtures/delta-long-run',
+    branch: 'feat/delta',
+    status: 'working',
+    tool: '',
+    toolInput: null,
+    prompt: '',
+    stateSince: startedAt - 60000,
+    stateSinceExact: false,
+    settledSince: null,
+    updatedAt: startedAt,
+  },
+]
+
+// The same row once the adapter has recorded when it began. A recorded time is
+// exact, so the page shows it exactly like an Orca one.
+// A distinct id, so a driver waiting for this fixture cannot be satisfied by the
+// previous one still on screen: both rows describe the same pane, but waiting on
+// identical ids would pass before the page re-rendered.
+const HERDR_RECORDED = [
+  {
+    ...HERDR_RUNNING[0],
+    id: 'herdr:echo',
+    displayName: 'echo-recorded',
+    cwd: '/tmp/verify-fixtures/echo-recorded',
+    stateSince: startedAt - 4 * 60 * 60 * 1000,
+    stateSinceExact: true,
+  },
+]
+
 const FIXTURES = {
   mixed: { agents: AGENTS, sources: { orca: { available: true }, herdr: { available: true } } },
+  'herdr-running': { agents: HERDR_RUNNING, sources: { orca: { available: true }, herdr: { available: true } } },
+  'herdr-recorded': { agents: HERDR_RECORDED, sources: { orca: { available: true }, herdr: { available: true } } },
   swapped: { agents: SWAPPED, sources: { orca: { available: true }, herdr: { available: true } } },
   empty: { agents: [], sources: { orca: { available: false }, herdr: { available: false } } },
 }

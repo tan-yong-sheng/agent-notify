@@ -111,6 +111,15 @@ export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' 
   return seen.includes(label.toLowerCase()) ? '' : label
 }
 
+// A duration is shown only where it is measured, not inferred. Orca reports
+// when a run began; Herdr reports no wall clock at all, so its only available
+// duration would count from when this dashboard started looking, and an agent
+// four hours into a run showed "32m+" on a page started 32 minutes earlier.
+// Rather than qualify a number that wrong, Herdr rows carry no duration.
+export function showsDuration(agent) {
+  return Boolean(agent?.stateSinceExact) && Number.isFinite(agent?.stateSince)
+}
+
 // What a search term is matched against. The host is in the list because it is
 // the one field the header's health tags do not filter: they say whether a
 // runtime answers, not which rows came from it, and the row tag that does say so
@@ -243,6 +252,14 @@ export function renderDashboardHtml() {
     .badge-working { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63, 185, 80, 0.4); }
     .badge-blocked { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248, 81, 73, 0.4); }
     .badge-done, .badge-idle { background: var(--gray-bg); color: var(--gray); border: 1px solid rgba(139, 148, 158, 0.4); }
+    /* The badge shouts its state in caps, but a duration is a unit: uppercased,
+       "12m" reads as "12M", which is a month or a megabyte, not minutes. */
+    .badge-duration {
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 500;
+      opacity: 0.85;
+    }
     .pulse-dot {
       width: 7px;
       height: 7px;
@@ -703,6 +720,9 @@ export function renderDashboardHtml() {
     // function the unit tests exercise, so a field dropped from the list here is
     // a field the tests notice.
     const agentMatchesQuery = ${agentMatchesQuery.toString()};
+    // Whether a row's duration may be printed at all, embedded so the browser
+    // applies the same rule the unit tests assert.
+    const showsDuration = ${showsDuration.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
     // A two-line row instead of three, for comparing density on a real phone.
@@ -781,9 +801,48 @@ export function renderDashboardHtml() {
       document.getElementById('last-updated').innerText = 'Synced ' + new Date().toLocaleTimeString();
     }
 
-    function badgeHTML(status) {
-      if (status === 'working') return '<span class="badge badge-working"><span class="pulse-dot"></span> Working</span>';
-      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Blocked</span>';
+    // Only a measured start gets a duration; showsDuration() holds the rule.
+    function durationLabel(a) {
+      if (!showsDuration(a)) return '';
+      const seconds = Math.floor((Date.now() - a.stateSince) / 1000);
+      if (seconds < 0) return '';
+      const text = seconds < 60 ? seconds + 's' : shortAge(seconds);
+      return '<span class="badge-duration"> · ' + text + '</span>';
+    }
+
+    function shortAge(seconds) {
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return minutes + 'm';
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return hours + 'h';
+      return Math.floor(hours / 24) + 'd';
+    }
+
+    // One wording for both runtimes. A running row is active right now whichever
+    // adapter found it, so it says so; the alternative was Orca printing "9s
+    // ago" beside Herdr printing "just now" for the same fact.
+    function lastActiveHTML(a) {
+      if (a.status === 'working' || a.status === 'blocked') return 'Active now';
+      // Explicit null checks: a zero timestamp is falsy, and a loose inequality
+      // would hide the difference between "no time recorded" and "time is 0".
+      const hasSettled = a.settledSince !== null && a.settledSince !== undefined;
+      const since = hasSettled ? a.settledSince : a.updatedAt;
+      if (since === null || since === undefined) return '—';
+      const seconds = Math.floor((Date.now() - since) / 1000);
+      if (seconds < 5) return 'Settled just now';
+      // Under a minute is seconds, not a rounded "0m": shortAge() floors to
+      // minutes, so a row 6 seconds old would otherwise read "Settled 0m ago".
+      if (seconds < 60) return 'Settled ' + seconds + 's ago';
+      return 'Settled ' + shortAge(seconds) + ' ago';
+    }
+
+    function badgeHTML(status, agent) {
+      // The duration is its own span so the badge's uppercase transform does not
+      // turn "12m" into "12M"; the separator rides along so the spacing is the
+      // badge's and not two elements' worth of guesswork.
+      const duration = durationLabel(agent);
+      if (status === 'working') return '<span class="badge badge-working"><span class="pulse-dot"></span> Working' + duration + '</span>';
+      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Blocked' + duration + '</span>';
       return '<span class="badge badge-done">Done / Idle</span>';
     }
 
@@ -843,7 +902,7 @@ export function renderDashboardHtml() {
       tbody.innerHTML = filtered.map((a) => {
         return \`
           <tr>
-            <td>\${badgeHTML(a.status)}</td>
+            <td>\${badgeHTML(a.status, a)}</td>
             <td>\${sourceTagHTML(a.source)}</td>
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
@@ -877,7 +936,7 @@ export function renderDashboardHtml() {
                   : '<div class="action-text action-plain">' + body + '</div>';
               })()}
             </td>
-            <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${timeSince(a.updatedAt)}</td>
+            <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${lastActiveHTML(a)}</td>
           </tr>
         \`;
       }).join('');
@@ -905,17 +964,6 @@ export function renderDashboardHtml() {
     function escapeHTML(str) {
       if (!str) return '';
       return String(str).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[m]);
-    }
-
-    function timeSince(date) {
-      if (!date) return '—';
-      const seconds = Math.floor((new Date() - date) / 1000);
-      if (seconds < 5) return 'just now';
-      if (seconds < 60) return seconds + 's ago';
-      const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return minutes + 'm ago';
-      const hours = Math.floor(minutes / 60);
-      return hours + 'h ago';
     }
 
     // Polling

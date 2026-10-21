@@ -119,7 +119,25 @@ try {
   report.check('rows show status, host, agent, branch and activity', /WORKING/.test(table) && /BLOCKED/.test(table) && /DONE \/ IDLE/.test(table) && /Orca/.test(table) && /Herdr/.test(table) && /feat\/alpha/.test(table), '')
   const charlieRow = rows.find((row) => row.includes('charlie-docs')) || ''
   report.check('a blank branch renders as a dash', /—/.test(charlieRow) && !/feat\/|fix\//.test(charlieRow), charlieRow.replace(/\s+/g, ' ').slice(0, 60))
-  report.check('the settled row shows a relative age', /(m ago|h ago|just now)/.test(table))
+  // The settled row says when it settled, in the same words an Orca row uses.
+  // The old column said "9s ago" on one row and "just now" on the next for the
+  // same kind of fact, and Herdr's answer was never anything but "just now".
+  report.check('the settled row names when it settled', /Settled \d+[mh] ago/.test(charlieRow), charlieRow.replace(/\s+/g, ' ').slice(0, 80))
+
+  // rowsText() joins a card's cells with " | ", and the badge is its own cell,
+  // so the row text is compared with that separator flattened out.
+  const flat = (row) => row.replace(/\s*\|\s*/g, ' ')
+  const alphaRow = rows.find((row) => row.includes('alpha-service')) || ''
+  // Orca reports when a run began, so its duration is a measurement. This
+  // fixture row is deliberately inexact to prove the page no longer prints a
+  // duration it cannot measure, even when the server sends one.
+  report.check('an unmeasurable start shows no duration', !/WORKING ·/.test(flat(alphaRow)), flat(alphaRow).slice(0, 80))
+  report.check('a running row is active now rather than ago', /Active now/.test(flat(alphaRow)), flat(alphaRow).slice(0, 80))
+
+  const bravoRow = rows.find((row) => row.includes('bravo-web')) || ''
+  // An exact start is the only kind that prints, and it prints without a marker
+  // because there is no lower bound to admit.
+  report.check('an exact start shows a measured duration', /BLOCKED · 1m\b/.test(flat(bravoRow)) && !/1m\+/.test(flat(bravoRow)), flat(bravoRow).slice(0, 80))
 
   // ── search ────────────────────────────────────────────────────────────────
   browser(['type', '--selector', '#search-box', '--value', 'bravo'])
@@ -215,6 +233,29 @@ try {
     return { tag: plain?.tagName ?? null, hasId: plain?.hasAttribute('data-agent-id') ?? null, tabIndex: plain?.tabIndex ?? null };
   })()`)
   report.check('the row with nothing to expand is not a button', inert.tag === 'DIV' && inert.hasId === false && inert.tabIndex === -1, JSON.stringify(inert))
+
+  // ── a Herdr duration is not shown, because it cannot be measured ──────────
+  // Herdr reports no timestamps, so an observed duration counts from when this
+  // page started looking. An agent four hours into a run was labelled "32m+" on
+  // a dashboard started 32 minutes earlier, so the column is Orca-only.
+  await setFixture('herdr-running')
+  const runningIds = (await httpGet(`http://127.0.0.1:${port}/api/agents`)).json.agents.map((a) => a.id)
+  report.check('the herdr-running fixture is loaded', await waitForPayload(runningIds), runningIds.join(', '))
+  const runningRows = rowsText()
+  const deltaRow = flat(runningRows[0] || '')
+  report.check('an unrecorded running Herdr row shows no duration', /WORKING/.test(deltaRow) && !/·/.test(deltaRow), deltaRow.slice(0, 80))
+  report.check('a running Herdr row is still active now', /Active now/.test(deltaRow), deltaRow.slice(0, 80))
+
+  // Once the adapter has recorded when the run began, Herdr gets a real
+  // duration instead of the observation-window estimate that was removed.
+  await setFixture('herdr-recorded')
+  const recordedIds = (await httpGet(`http://127.0.0.1:${port}/api/agents`)).json.agents.map((a) => a.id)
+  report.check('the herdr-recorded fixture is loaded', await waitForPayload(recordedIds), recordedIds.join(', '))
+  const recordedRow = flat(rowsText()[0] || '')
+  report.check('a recorded Herdr start shows a measured duration', /WORKING · 4h/.test(recordedRow), recordedRow.slice(0, 80))
+  await setFixture('mixed')
+  const restoredIds = (await httpGet(`http://127.0.0.1:${port}/api/agents`)).json.agents.map((a) => a.id)
+  report.check('the mixed fixture is restored', await waitForPayload(restoredIds), restoredIds.join(', '))
 
   // ── evidence before the order journey mutates the fixture ─────────────────
   browser(['aria', '--path', path.join(outDir, 'mixed.aria.txt')])

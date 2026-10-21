@@ -24,6 +24,14 @@ import {
 import { findPaneCwd } from './herdr/snapshot.mjs'
 import { shouldNotify, updateState } from './herdr/state.mjs'
 import {
+  entryStatus,
+  entryStartedAt,
+  readStateFile,
+  writeStateFile,
+  readTransitions,
+  statePath,
+} from './shared/timings.mjs'
+import {
   resolveNotifyState,
   forgetPane,
   isSettleAlreadyNotified,
@@ -40,6 +48,7 @@ import {
   nextAgentOrder,
   workspaceLabel,
   agentMatchesQuery,
+  showsDuration,
 } from './dashboard.mjs'
 import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
@@ -75,6 +84,9 @@ import {
   resolveBranch,
   mapWithConcurrency,
   canonicalAgentName,
+  trackStateSince,
+  resetStateSince,
+  applyRecordedTransitions,
 } from './shared/catalog.mjs'
 import {
   buildSystemdUnit,
@@ -628,12 +640,18 @@ async function runHerdrUnitTests() {
   assert(shouldNotify('blocked', 'p1', { p1: 'blocked' }) === false, 'shouldNotify skips blocked->blocked')
   assert(shouldNotify('working', 'p1', {}) === false, 'shouldNotify never notifies working')
 
-  // updateState
+  // updateState records the status and when it was observed. The clock is a
+  // parameter so the assertions do not depend on wall time.
   const us = {}
-  updateState(us, 'p1', 'working')
-  assert(us.p1 === 'working', 'updateState stores working')
-  updateState(us, 'p1', 'waiting')
-  assert(us.p1 === 'working', 'updateState ignores waiting')
+  updateState(us, 'p1', 'working', 1000)
+  assert(us.p1.status === 'working', 'updateState stores working')
+  assert(us.p1.at === 1000, 'updateState records when the status was first seen')
+  updateState(us, 'p1', 'working', 5000)
+  assert(us.p1.at === 1000, 'updateState keeps the clock when the status is unchanged')
+  updateState(us, 'p1', 'done', 9000)
+  assert(us.p1.status === 'done' && us.p1.at === 9000, 'updateState resets the clock on a real transition')
+  updateState(us, 'p1', 'waiting', 12000)
+  assert(us.p1.status === 'done' && us.p1.at === 9000, 'updateState ignores waiting')
 }
 
 function runOrcaMainUnitTests() {
@@ -1276,6 +1294,266 @@ async function runTailscaleTests() {
   assert(hungHostname === null, 'resolveTailscaleHostname returns null when tailscale never answers')
 
   fs.rmSync(tsHome, { recursive: true, force: true })
+}
+
+// The timing columns are their own group: they assert on a module-level map
+// whose state spans polls, which is a different kind of fixture from the rest of
+// the dashboard unit tests and would make that group larger without being
+// clearer. resetStateSince() makes each assertion independent.
+async function runTimingTests() {
+  console.log('\nRunning timing column tests...\n')
+  // Herdr reports no wall clock at all, so a timestamp invented at parse time
+  // made every Herdr row claim "just now" on every poll. The parser must say it
+  // does not know; collectLiveState() supplies the observed transition instead.
+  const herdrTimed = parseHerdrAgent({ pane_id: 'p1', agent_status: 'working' })
+  assert(herdrTimed.stateStartedAt === null, 'parseHerdrAgent does not invent a state start')
+  assert(herdrTimed.updatedAt === null, 'parseHerdrAgent does not invent a last-active time')
+
+  // Orca does report one, and it is the only exact source, so it must survive.
+  const orcaTimed = parseOrcaAgent({}, { paneKey: 'k', state: 'working', stateStartedAt: 1700000000000, updatedAt: 1700000005000 })
+  assert(orcaTimed.stateStartedAt === 1700000000000, 'parseOrcaAgent keeps the runtime state start')
+  assert(orcaTimed.updatedAt === 1700000005000, 'parseOrcaAgent keeps the runtime last activity')
+
+  // A JSON timestamp that is a string or NaN would render as a row running since
+  // 1970, so it is rejected rather than coerced.
+  const orcaBadTime = parseOrcaAgent({}, { paneKey: 'k', state: 'working', stateStartedAt: 'yesterday', updatedAt: NaN })
+  assert(orcaBadTime.stateStartedAt === null && orcaBadTime.updatedAt === null, 'parseOrcaAgent rejects a non-numeric timestamp')
+
+  // A status seen once is a lower bound, not a start: a row first observed while
+  // working cannot know when the work began, and the page says "12m+" for it.
+  resetStateSince()
+  const t0 = 1_000_000
+  const herdrRow = (status) => parseHerdrAgent({ pane_id: 'p1', agent_status: status })
+  const firstSight = [herdrRow('working')]
+  trackStateSince(firstSight, t0)
+  assert(firstSight[0].stateSince === t0, 'a first sighting starts the clock at observation')
+  assert(firstSight[0].stateSinceExact === false, 'a first sighting is not an exact start')
+
+  // The clock must survive a poll: this is the whole point of the map.
+  const stillWorking = [herdrRow('working')]
+  trackStateSince(stillWorking, t0 + 600_000)
+  assert(stillWorking[0].stateSince === t0, 'a poll with unchanged status keeps the original clock')
+  assert(stillWorking[0].stateSinceExact === false, 'a poll with unchanged status stays inexact')
+
+  // A transition is observed exactly: the poll that saw it is the real start.
+  const settled = [herdrRow('done')]
+  trackStateSince(settled, t0 + 900_000)
+  assert(settled[0].settledSince === t0 + 900_000, 'a transition records when it was observed')
+  assert(settled[0].updatedAt === t0 + 900_000, 'a settled row is last active at its transition')
+
+  const stillSettled = [herdrRow('done')]
+  trackStateSince(stillSettled, t0 + 1_200_000)
+  assert(stillSettled[0].settledSince === t0 + 900_000, 'the settled time is not rewritten on each poll')
+
+  // A row first seen already settled has no observed transition behind it, so
+  // the page shows a dash rather than claiming it settled at process start.
+  resetStateSince()
+  const bornSettled = [herdrRow('done')]
+  trackStateSince(bornSettled, t0)
+  assert(bornSettled[0].settledSince === null, 'a row first seen settled has no invented settle time')
+  assert(bornSettled[0].updatedAt === null, 'a row first seen settled has no invented last activity')
+
+  // Orca's exact timestamp wins over the observed one.
+  resetStateSince()
+  const orcaRows = [{ id: 'orca-k', status: 'working', stateStartedAt: t0 - 300_000, updatedAt: t0 }]
+  trackStateSince(orcaRows, t0)
+  assert(orcaRows[0].stateSince === t0 - 300_000, 'an exact runtime start is preferred over observation')
+  assert(orcaRows[0].stateSinceExact === true, 'an exact runtime start is marked exact')
+
+  // A vanished row must not hand its clock to the next agent in that pane.
+  resetStateSince()
+  trackStateSince([herdrRow('working')], t0)
+  trackStateSince([], t0 + 1_000)
+  const reusedPane = [herdrRow('working')]
+  trackStateSince(reusedPane, t0 + 500_000)
+  assert(reusedPane[0].stateSince === t0 + 500_000, 'a reused pane id starts a new clock')
+
+  // A runtime that fails to answer returns no rows. Pruning on that would throw
+  // away every clock it had, so one Herdr hiccup would reset every Herdr run.
+  resetStateSince()
+  trackStateSince([herdrRow('working')], t0, new Set(['herdr', 'orca']))
+  trackStateSince([], t0 + 60_000, new Set(['orca']))
+  const afterOutage = [herdrRow('working')]
+  trackStateSince(afterOutage, t0 + 120_000, new Set(['herdr', 'orca']))
+  assert(afterOutage[0].stateSince === t0, 'a runtime that did not answer keeps its clocks')
+
+  // A runtime that did answer, and reports no such row, has really lost it.
+  trackStateSince([], t0 + 180_000, new Set(['herdr', 'orca']))
+  const afterGone = [herdrRow('working')]
+  trackStateSince(afterGone, t0 + 240_000, new Set(['herdr', 'orca']))
+  assert(afterGone[0].stateSince === t0 + 240_000, 'a runtime that answered and dropped a row starts a new clock')
+  resetStateSince()
+
+  // ── Which runtimes may show a duration at all ─────────────────────────────
+  // An observed duration counts from when this page started looking, not from
+  // when the agent started: a run four hours old was labelled "32m+" on a
+  // dashboard started 32 minutes earlier. A number that wrong is worse than no
+  // number, so only a start the runtime reported gets a duration.
+  assert(showsDuration({ stateSince: t0, stateSinceExact: true }), 'showsDuration allows an exact start')
+  assert(!showsDuration({ stateSince: t0, stateSinceExact: false }), 'showsDuration refuses an observed start')
+  assert(!showsDuration({ stateSince: t0 }), 'showsDuration refuses a row with no exactness flag')
+  assert(!showsDuration({ stateSinceExact: true }), 'showsDuration refuses a missing start')
+  assert(!showsDuration({ stateSince: NaN, stateSinceExact: true }), 'showsDuration refuses a non-finite start')
+  assert(!showsDuration(null), 'showsDuration survives a null row')
+
+  // The page embeds the same rule, so the browser cannot drift from the test.
+  const embeddedShowsDuration = sliceEmbeddedFunction(renderDashboardHtml(), 'const showsDuration = ')
+  assert(embeddedShowsDuration !== null, 'the dashboard embeds the duration rule')
+  const pageShowsDuration = new Function(`return ${embeddedShowsDuration}`)()
+  assert(
+    pageShowsDuration({ stateSince: t0, stateSinceExact: true }) === true &&
+      pageShowsDuration({ stateSince: t0, stateSinceExact: false }) === false,
+    'the embedded duration rule agrees with the module'
+  )
+
+  // The gate above decides *whether* a duration may print; it does not prove
+  // anything prints. Exercise the renderer the page actually runs, so a
+  // durationLabel that returned '' for every row would fail here.
+  const pageHtml = renderDashboardHtml()
+  const embeddedDurationLabel = sliceEmbeddedFunction(pageHtml, 'function durationLabel')
+  const embeddedShortAge = sliceEmbeddedFunction(pageHtml, 'function shortAge')
+  assert(embeddedDurationLabel !== null, 'the dashboard embeds the duration formatter')
+  assert(embeddedShortAge !== null, 'the dashboard embeds the short-age formatter')
+  // sliceEmbeddedFunction returns the parameter list and body, without the
+  // `function` keyword, so each slice is spliced in as an expression.
+  const renderDuration = new Function(
+    'showsDuration',
+    'Date',
+    `const shortAge = function${embeddedShortAge};\nconst durationLabel = function${embeddedDurationLabel};\nreturn durationLabel;`
+  )(pageShowsDuration, { now: () => 1792600000000 })
+  const elevenMinutes = renderDuration({ stateSince: 1792600000000 - 660000, stateSinceExact: true })
+  assert(
+    elevenMinutes.includes('11m') && elevenMinutes.includes('badge-duration'),
+    'an exact start renders a duration in the badge'
+  )
+  assert(renderDuration({ stateSince: 1792600000000 - 660000, stateSinceExact: false }) === '',
+    'an inexact start renders no duration')
+
+  // The settled column must not round seconds down to "0m": shortAge() floors to
+  // minutes, so a row that settled six seconds ago would claim zero minutes.
+  const embeddedLastActive = sliceEmbeddedFunction(pageHtml, 'function lastActiveHTML')
+  assert(embeddedLastActive !== null, 'the dashboard embeds the last-active formatter')
+  const renderLastActive = new Function(
+    'Date',
+    `const shortAge = function${embeddedShortAge};\nconst lastActiveHTML = function${embeddedLastActive};\nreturn lastActiveHTML;`
+  )({ now: () => 1792600000000 })
+  const sixSeconds = renderLastActive({ status: 'done', settledSince: 1792600000000 - 6000, updatedAt: null })
+  assert(sixSeconds === 'Settled 6s ago', 'a settled row under a minute shows seconds, not 0m')
+  const elevenMinutesAgo = renderLastActive({ status: 'done', settledSince: 1792600000000 - 660000, updatedAt: null })
+  assert(elevenMinutesAgo === 'Settled 11m ago', 'a settled row over a minute shows minutes')
+  assert(
+    renderLastActive({ status: 'done', settledSince: null, updatedAt: null }) === '—',
+    'a settled row with no recorded time shows a dash'
+  )
+  assert(renderLastActive({ status: 'working', settledSince: null, updatedAt: null }) === 'Active now',
+    'a running row says it is active now')
+
+  // ── The transition store the adapter writes and the catalog reads ─────────
+  // Entries were bare status strings; an existing file holds hundreds of them.
+  // A reader that dropped the old shape would silence every notification until
+  // each pane transitioned again, so both shapes are read deliberately.
+  assert(entryStatus('working') === 'working', 'entryStatus reads the pre-timestamp shape')
+  assert(entryStatus({ status: 'done', at: 1 }) === 'done', 'entryStatus reads the object shape')
+  assert(entryStatus({ at: 1 }) === undefined, 'entryStatus reports no status for an object without one')
+  assert(entryStatus(null) === undefined, 'entryStatus survives a null entry')
+  assert(entryStatus(42) === undefined, 'entryStatus rejects a number')
+
+  // An old string entry has no time, and inventing one would date a run to 1970.
+  assert(entryStartedAt('working') === null, 'entryStartedAt reports no time for the old shape')
+  assert(entryStartedAt({ status: 'working', at: 1234 }) === 1234, 'entryStartedAt reads a recorded time')
+  assert(entryStartedAt({ status: 'w', at: '1234' }) === null, 'entryStartedAt rejects a string timestamp')
+  assert(entryStartedAt({ status: 'w', at: NaN }) === null, 'entryStartedAt rejects NaN')
+  assert(entryStartedAt({ status: 'w', at: -5 }) === null, 'entryStartedAt rejects a negative time')
+  assert(entryStartedAt({ status: 'w' }) === null, 'entryStartedAt reports no time when absent')
+
+  // Round trip through the file the adapter and dashboard share, including the
+  // atomic write: a reader must never observe a half-written file.
+  const storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-timings-'))
+  try {
+    assert(statePath(storeDir).endsWith('agent-notify-state.json'), 'statePath names the shared state file')
+    assert(
+      JSON.stringify(readStateFile(storeDir)) === '{}',
+      'readStateFile reads a missing file as an empty store'
+    )
+    writeStateFile(storeDir, { 'w1:p1': { status: 'working', at: 5000 } })
+    const reread = readStateFile(storeDir)
+    assert(reread['w1:p1'].at === 5000, 'writeStateFile survives a round trip')
+    // No temporary file is left behind for a reader to see.
+    assert(
+      fs.readdirSync(storeDir).filter((name) => name.endsWith('.tmp')).length === 0,
+      'writeStateFile leaves no temporary file behind'
+    )
+    // A corrupt file reads as empty rather than throwing into the dashboard.
+    fs.writeFileSync(statePath(storeDir), '{ truncated')
+    assert(Object.keys(readStateFile(storeDir)).length === 0, 'readStateFile treats corrupt JSON as empty')
+
+    // Valid JSON that is not a store: `null`, an array and a string all parse
+    // without error. Returning them would have the caller index a non-object,
+    // which threw for a Herdr row and took the whole snapshot down.
+    fs.writeFileSync(statePath(storeDir), 'null')
+    assert(
+      JSON.stringify(readStateFile(storeDir)) === '{}',
+      'readStateFile reads null as an empty store'
+    )
+    for (const body of ['[]', '"text"', '42']) {
+      fs.writeFileSync(statePath(storeDir), body)
+      assert(
+        JSON.stringify(readStateFile(storeDir)) === '{}',
+        `readStateFile reads ${body} as an empty store`
+      )
+    }
+
+    const transitions = readTransitions({ a: { status: 'w', at: 100 }, b: 'old' })
+    assert(transitions.get('a') === 100, 'readTransitions returns a recorded time')
+    assert(!transitions.has('b'), 'readTransitions omits an entry with no time')
+  } finally {
+    fs.rmSync(storeDir, { recursive: true, force: true })
+  }
+
+  // ── A recorded time reaching the row ──────────────────────────────────────
+  // Mapping the store onto a row is where a right key and a wrong key look
+  // identical, so it is asserted directly.
+  const rows = applyRecordedTransitions(
+    [
+      { id: 'herdr-w1:p1', source: 'herdr', status: 'done', stateSince: 5, stateSinceExact: false, settledSince: null },
+      { id: 'herdr-w1:p2', source: 'herdr', status: 'done', stateSince: 5, stateSinceExact: false, settledSince: null },
+      { id: 'orca-k', source: 'orca', status: 'done', stateSince: 5, stateSinceExact: false, settledSince: null },
+    ],
+    { 'w1:p1': { status: 'done', at: 9000 } }
+  )
+  assert(rows[0].stateSince === 9000, 'a recorded time reaches the matching Herdr row')
+  assert(rows[0].stateSinceExact === true, 'a recorded time is exact, so the page may print it')
+  assert(rows[0].settledSince === 9000, 'a recorded time doubles as the settle time')
+  assert(rows[1].stateSince === 5, 'a pane with no recorded time keeps the observed value')
+  assert(rows[1].stateSinceExact === false, 'a pane with no recorded time stays inexact')
+  assert(rows[2].stateSince === 5, 'an Orca row is not touched by the Herdr store')
+
+  // The adapter stores the status it translated, so a settled pane is stored as
+  // `done` while its row keeps Herdr's own `idle`. Comparing those literally
+  // would drop every settled row's duration, which is most of them.
+  const settledSpelling = applyRecordedTransitions(
+    [{ id: 'herdr-w3:p1', source: 'herdr', status: 'idle', stateSince: 5, stateSinceExact: false, settledSince: null }],
+    { 'w3:p1': { status: 'done', at: 7000 } }
+  )
+  assert(settledSpelling[0].stateSince === 7000, 'a settled pane matches across the idle/done spelling')
+
+  // The recorded time describes the status it was recorded for. A missed or
+  // delayed transition leaves the row on a newer status, and that clock belongs
+  // to the previous state, so it must not be applied.
+  const staleStatus = applyRecordedTransitions(
+    [{ id: 'herdr-w4:p1', source: 'herdr', status: 'done', stateSince: 5, stateSinceExact: false, settledSince: null }],
+    { 'w4:p1': { status: 'working', at: 9000 } }
+  )
+  assert(staleStatus[0].stateSinceExact === false, 'a timestamp for a different status is not applied')
+  assert(staleStatus[0].settledSince === null, 'a timestamp for a different status does not settle the row')
+
+  // The old string shape must not become a duration, and a null store must not throw.
+  const legacyRows = applyRecordedTransitions(
+    [{ id: 'herdr-w2:p1', source: 'herdr', status: 'done', stateSince: 5, stateSinceExact: false }],
+    { 'w2:p1': 'done' }
+  )
+  assert(legacyRows[0].stateSinceExact === false, 'a legacy string entry yields no duration')
+  assert(applyRecordedTransitions([], null).length === 0, 'applyRecordedTransitions survives a null store')
 }
 
 async function runDashboardUnitTests() {
@@ -2859,6 +3137,7 @@ async function main() {
   await runHerdrUnitTests()
   runOrcaMainUnitTests()
   await runDashboardUnitTests()
+  await runTimingTests()
   runAllowedHostTests()
   runPwaTests()
   await runTailscaleTests()
