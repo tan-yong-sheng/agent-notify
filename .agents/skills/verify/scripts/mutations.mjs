@@ -236,4 +236,28 @@ export const MUTATIONS = [
     replace: '      tbody td:nth-child(2) { display: none; }',
     expectTest: 'the narrow-screen block does not hide the Host cell',
   },
+  {
+    id: 'path-chip-back-to-span',
+    file: 'dashboard.mjs',
+    description: 'the workspace path is a span again, so it cannot be reached by keyboard',
+    find: "'<button type=\"button\" class=\"path-chip path-full\" data-copy-path=\"' + escapeHTML(a.cwd) + '\" title=\"Copy the full path\">' + escapeHTML(a.cwd) + '</button>'",
+    replace: "'<span class=\"path-chip path-full\" data-copy-path=\"' + escapeHTML(a.cwd) + '\" title=\"Copy the full path\">' + escapeHTML(a.cwd) + '</span>'",
+    expectTest: 'the workspace path is a button, so it can be copied from a keyboard',
+  },
+  {
+    id: 'focus-ring-suppressed',
+    file: 'dashboard.mjs',
+    description: 'the search box suppresses the focus ring again',
+    find: '      width: 320px;\n    }\n    .search-box:focus { border-color: var(--accent); }',
+    replace: '      width: 320px;\n      outline: none;\n    }\n    .search-box:focus { border-color: var(--accent); }',
+    expectTest: 'nothing suppresses the focus ring',
+  },
+  {
+    id: 'focus-restore-dropped',
+    file: 'dashboard.mjs',
+    description: 'the table drops keyboard focus on every poll again',
+    find: '      restoreRowFocus(focused);',
+    replace: '      void focused;',
+    expectTest: 'the page puts keyboard focus back on the same row control after a poll',
+  },
 ]

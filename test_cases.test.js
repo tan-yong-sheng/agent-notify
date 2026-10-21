@@ -867,6 +867,82 @@ async function assertUpdateFailureAndBanner() {
     dashboardHtml.includes('tag-source tag-orca') && dashboardHtml.includes('tag-source tag-herdr'),
     'a row renders a source tag for each runtime'
   )
+
+  // The two affordances that carry the primary task — copy a path, expand a
+  // prompt — were a span and a div with click handlers, so neither could be
+  // reached from a keyboard. They are buttons now, with the behaviour still
+  // read from the data attribute by the delegated listener.
+  assert(
+    dashboardHtml.includes('<button type="button" class="path-chip path-full"'),
+    'the workspace path is a button, so it can be copied from a keyboard'
+  )
+  assert(
+    dashboardHtml.includes('class="action-text" data-agent-id='),
+    'the prompt cell is a button, so it can be expanded from a keyboard'
+  )
+  // The row with nothing to expand must not announce a control that does
+  // nothing, so its variant stays a plain div with no id to dispatch on.
+  assert(
+    dashboardHtml.includes('<div class="action-text action-plain">'),
+    'the row with nothing to expand is not a button'
+  )
+  assert(
+    /action-plain[^>]*data-agent-id/.test(dashboardHtml) === false,
+    'the inert variant carries no agent id, so no handler can open it'
+  )
+  // type="button" is what keeps a future form wrapper from turning these into
+  // submit buttons; both elements must carry it.
+  assert(
+    (dashboardHtml.match(/<button type="button"/g) || []).length >= 2,
+    'both row affordances declare type="button" explicitly'
+  )
+
+  // One focus convention for the whole page: :focus-visible with the accent
+  // token. The search box used to suppress the browser's ring with
+  // `outline: none` and replace it with a 1px border recolour, and the buttons
+  // had no focus rule at all, which left a keyboard user unable to see focus.
+  assert(
+    dashboardHtml.includes(':focus-visible'),
+    'the page declares a focus-visible indicator'
+  )
+  const focusBlock = dashboardHtml.slice(
+    dashboardHtml.indexOf('.search-box:focus-visible'),
+    dashboardHtml.indexOf('.search-box:focus-visible') + 700
+  )
+  for (const selector of ['.search-box', '.filter-tab', '.modal-close', '.path-chip', '.action-text']) {
+    assert(
+      focusBlock.includes(`${selector}:focus-visible`),
+      `the focus ring reaches ${selector}`
+    )
+  }
+  assert(
+    /:focus-visible[^{]*\{[^}]*outline:\s*2px solid var\(--accent\)/s.test(dashboardHtml),
+    'the focus ring is a 2px accent outline'
+  )
+  // Match the declaration, not the prose: the comment above the rule names
+  // `outline:none` while explaining that it is gone.
+  assert(
+    /outline:\s*none\s*;/i.test(dashboardHtml) === false,
+    'nothing suppresses the focus ring'
+  )
+
+  // The table is rebuilt from a string on every poll, which throws away the
+  // focused element. For a mouse that is invisible; for a keyboard the row
+  // control you were on disappears mid-use, so renderRows has to put focus back
+  // on the same control. The attribute is what both dispatches the behaviour and
+  // identifies the row, so it is what the focus is restored by.
+  assert(
+    dashboardHtml.includes('const focused = focusedRowControl()'),
+    'the page records which row control has focus before rebuilding the table'
+  )
+  assert(
+    dashboardHtml.includes('restoreRowFocus(focused)'),
+    'the page puts keyboard focus back on the same row control after a poll'
+  )
+  assert(
+    /focusedRowControl[\s\S]{0,600}dataset\.copyPath[\s\S]{0,200}dataset\.agentId/.test(dashboardHtml),
+    'the recorded focus is identified by the data attribute that also drives the action'
+  )
 }
 
 // The files that make the page installable. Chrome refuses to offer

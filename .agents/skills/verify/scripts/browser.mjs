@@ -12,6 +12,7 @@
 //   aria [--path FILE]           print the accessibility tree as 'role "name"' lines
 //   wait --selector CSS [--timeout MS]
 //   viewport --width N [--height N] [--mobile]
+//   key <Tab|Enter|Space|Escape|ArrowDown|...> [--shift]
 //   click --selector CSS
 //   type --selector CSS --value TEXT
 //   screenshot --path FILE
@@ -487,8 +488,39 @@ async function aria() {
   }
 }
 
-async function click() {
-  const selector = String(flags.selector)
+// A real key event, so a journey can be proved from the keyboard rather than by
+// calling the page's handlers directly. Tab is the interesting one: it is what
+// makes the browser move focus and what makes :focus-visible match.
+const KEYS = {
+  tab: { key: 'Tab', code: 'Tab', keyCode: 9, text: undefined },
+  enter: { key: 'Enter', code: 'Enter', keyCode: 13, text: '\r' },
+  space: { key: ' ', code: 'Space', keyCode: 32, text: ' ' },
+  escape: { key: 'Escape', code: 'Escape', keyCode: 27, text: undefined },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, text: undefined },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38, text: undefined },
+}
+
+async function key() {
+  const name = String(flags.key || positional[1] || '').toLowerCase()
+  const spec = KEYS[name]
+  if (!spec) throw new Error(`unknown key: ${name}; known: ${Object.keys(KEYS).join(', ')}`)
+  const { cdp, sessionId } = await pageSession()
+  try {
+    const modifiers = flags.shift ? 8 : 0
+    const base = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode, modifiers }
+    await cdp.send('Input.dispatchKeyEvent', { ...base, type: spec.text ? 'keyDown' : 'rawKeyDown', text: spec.text }, sessionId)
+    await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, sessionId)
+    const { result } = await cdp.send('Runtime.evaluate', {
+      expression: `(() => { const el = document.activeElement; return el ? (el.id || el.className || el.tagName) : 'none'; })()`,
+      returnByValue: true,
+    }, sessionId)
+    console.log(`pressed ${name}; focus is now ${result.value}`)
+  } finally {
+    cdp.close()
+  }
+}
+
+async function click() {  const selector = String(flags.selector)
   const { cdp, sessionId } = await pageSession()
   try {
     const { result } = await cdp.send(
@@ -615,6 +647,7 @@ const COMMANDS = {
   click,
   type,
   viewport,
+  key,
   screenshot,
   close,
 }

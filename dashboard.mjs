@@ -250,6 +250,14 @@ export function renderDashboardHtml() {
     .tag-herdr { background: rgba(163, 113, 247, 0.2); color: #c297ff; border: 1px solid rgba(163, 113, 247, 0.4); }
 
     .path-chip {
+      /* A button, so the chip is reachable and operable from a keyboard. Only
+         what the user agent's button style would otherwise impose is undone;
+         everything that gives the chip its appearance is kept as it was. */
+      appearance: none;
+      -webkit-appearance: none;
+      border: none;
+      margin: 0;
+      text-align: left;
       font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, monospace;
       font-size: 12px;
       color: #79c0ff;
@@ -259,6 +267,10 @@ export function renderDashboardHtml() {
       cursor: pointer;
       display: inline-block;
       max-width: 360px;
+      /* The underline that made the chip read as copyable, kept after the reset
+         above cleared every border. */
+      border-bottom: 1px solid rgba(48, 54, 61, 0.6);
+      vertical-align: middle;
       /* The directory is the field that says which project a row belongs to, so
          a long one wraps instead of being cut: an ellipsis here would hide the
          part that tells two rows apart. */
@@ -289,9 +301,21 @@ export function renderDashboardHtml() {
       border-radius: 6px;
       font-size: 13px;
       width: 320px;
-      outline: none;
     }
     .search-box:focus { border-color: var(--accent); }
+    /* Every control on this page shows the same ring, and only when the focus
+       came from the keyboard. The ring is the one thing the page had
+       suppressed: an outline:none on the search box, and no focus rule at all
+       for its buttons. */
+    .search-box:focus-visible,
+    .filter-tab:focus-visible,
+    .modal-close:focus-visible,
+    .update-banner button:focus-visible,
+    .path-chip:focus-visible,
+    .action-text:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
     .filter-tabs {
       display: flex;
       gap: 6px;
@@ -344,6 +368,18 @@ export function renderDashboardHtml() {
     tr:hover td { background: rgba(110, 118, 129, 0.05); }
 
     .action-text {
+      /* A button, so the cell can be reached and opened from a keyboard. The
+         reset below undoes the user agent's button chrome; the clamp and the
+         colours are unchanged. */
+      appearance: none;
+      -webkit-appearance: none;
+      border: none;
+      background: transparent;
+      font: inherit;
+      text-align: left;
+      padding: 0;
+      margin: 0;
+      width: 100%;
       color: #c9d1d9;
       cursor: pointer;
       display: -webkit-box;
@@ -741,8 +777,30 @@ export function renderDashboardHtml() {
         : '<span class="tag-source tag-herdr">Herdr</span>';
     }
 
+    // Which row control holds focus, identified by the data attribute that also
+    // drives its behaviour. Rebuilding the table every poll would otherwise drop
+    // focus to the body, which made a row control impossible to use from the
+    // keyboard: the page replaces the row out from under the key press.
+    function focusedRowControl() {
+      const el = document.activeElement;
+      if (!el || !el.matches || !el.matches('button')) return null;
+      if (el.dataset.copyPath) return { attribute: 'copyPath', value: el.dataset.copyPath };
+      if (el.dataset.agentId) return { attribute: 'agentId', value: el.dataset.agentId };
+      return null;
+    }
+
+    function restoreRowFocus(control) {
+      if (!control) return;
+      const match = Array.from(document.querySelectorAll('#agent-table-body button'))
+        .find((el) => el.dataset[control.attribute] === control.value);
+      // A control whose row is gone has nothing to focus; the alternative is
+      // focusing an unrelated row and acting on it from the keyboard.
+      if (match) match.focus();
+    }
+
     function renderRows() {
       const tbody = document.getElementById('agent-table-body');
+      const focused = focusedRowControl();
       // Sort by first-seen position before filtering so the visible order is
       // stable across polls regardless of the server's payload order.
       const byId = new Map(allAgents.map(a => [a.id, a]));
@@ -790,7 +848,7 @@ export function renderDashboardHtml() {
                 // on a narrow screen. The column stays for the table.
                 const branch = a.branch ? '<span class="branch-inline">(' + escapeHTML(a.branch) + ')</span>' : '';
                 return (label ? '<div class="ws-label">' + escapeHTML(label) + '</div>' : '') +
-                  '<span class="path-chip path-full" data-copy-path="' + escapeHTML(a.cwd) + '" title="Click to copy full path">' + escapeHTML(a.cwd) + '</span>' +
+                  '<button type="button" class="path-chip path-full" data-copy-path="' + escapeHTML(a.cwd) + '" title="Copy the full path">' + escapeHTML(a.cwd) + '</button>' +
                   branch;
               })()}
             </td>
@@ -805,7 +863,7 @@ export function renderDashboardHtml() {
                 const body = (a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : '') +
                   '<span>' + escapeHTML(label) + '</span>';
                 return detail
-                  ? '<div class="action-text" data-agent-id="' + escapeHTML(a.id) + '" title="Click to expand prompt">' + body + '</div>'
+                  ? '<button type="button" class="action-text" data-agent-id="' + escapeHTML(a.id) + '" title="Expand the prompt">' + body + '</button>'
                   : '<div class="action-text action-plain">' + body + '</div>';
               })()}
             </td>
@@ -813,6 +871,8 @@ export function renderDashboardHtml() {
           </tr>
         \`;
       }).join('');
+
+      restoreRowFocus(focused);
     }
 
     function showModalById(id) {
