@@ -19,6 +19,7 @@ import {
 } from './utils.mjs'
 import { resolveWorkspaceFromSnapshot } from './snapshot.mjs'
 import { readState, writeState, shouldNotify, updateState } from './state.mjs'
+import { entryStatus } from '../shared/timings.mjs'
 
 const NOTIFY_STATES = ['done', 'blocked']
 
@@ -152,7 +153,9 @@ async function handleAgentEvent(config) {
   const { workspace, tab, paneId } = extractWorkspaceContext(event, context)
   const configDir = getConfigDir()
   const state = readState(configDir)
-  const lastStatus = state[paneId]
+  // An entry may be the pre-timestamp string or the current object, so the log
+  // reads the status out of it rather than printing the raw value.
+  const lastStatus = entryStatus(state[paneId])
 
   writeLog({
     type: 'parsed',

@@ -111,6 +111,51 @@ export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' 
   return seen.includes(label.toLowerCase()) ? '' : label
 }
 
+// A duration is shown only where it is measured, not inferred. Orca reports
+// when a run began; Herdr reports no wall clock at all, so its only available
+// duration would count from when this dashboard started looking, and an agent
+// four hours into a run showed "32m+" on a page started 32 minutes earlier.
+// Rather than qualify a number that wrong, Herdr rows carry no duration.
+export function showsDuration(agent) {
+  return Boolean(agent?.stateSinceExact) && Number.isFinite(agent?.stateSince)
+}
+
+// A compact age: 12m, 5h, 3d. Pure, so the page and the tests share one rule and
+// a test can assert it without compiling page source.
+export function shortAge(seconds) {
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+// The duration suffix for a running row's badge, or '' when the start is not
+// measured. The span keeps it out of the badge's uppercase transform, which
+// turned "12m" into "12M" — a month.
+export function durationLabel(agent, now = Date.now()) {
+  if (!showsDuration(agent)) return ''
+  const seconds = Math.floor((now - agent.stateSince) / 1000)
+  if (seconds < 0) return ''
+  const text = seconds < 60 ? `${seconds}s` : shortAge(seconds)
+  return `<span class="badge-duration"> · ${text}</span>`
+}
+
+// The Last Active cell, in one wording for both runtimes: a running row is
+// active right now whichever adapter found it. Under a minute reports seconds,
+// because shortAge() floors to minutes and a row six seconds old would otherwise
+// claim "Settled 0m ago".
+export function lastActiveLabel(agent, now = Date.now()) {
+  if (agent.status === 'working' || agent.status === 'blocked') return 'Active now'
+  const hasSettled = agent.settledSince !== null && agent.settledSince !== undefined
+  const since = hasSettled ? agent.settledSince : agent.updatedAt
+  if (since === null || since === undefined) return '—'
+  const seconds = Math.floor((now - since) / 1000)
+  if (seconds < 5) return 'Settled just now'
+  if (seconds < 60) return `Settled ${seconds}s ago`
+  return `Settled ${shortAge(seconds)} ago`
+}
+
 // What a search term is matched against. The host is in the list because it is
 // the one field the header's health tags do not filter: they say whether a
 // runtime answers, not which rows came from it, and the row tag that does say so
@@ -243,6 +288,14 @@ export function renderDashboardHtml() {
     .badge-working { background: var(--green-bg); color: var(--green); border: 1px solid rgba(63, 185, 80, 0.4); }
     .badge-blocked { background: var(--red-bg); color: var(--red); border: 1px solid rgba(248, 81, 73, 0.4); }
     .badge-done, .badge-idle { background: var(--gray-bg); color: var(--gray); border: 1px solid rgba(139, 148, 158, 0.4); }
+    /* The badge shouts its state in caps, but a duration is a unit: uppercased,
+       "12m" reads as "12M", which is a month or a megabyte, not minutes. */
+    .badge-duration {
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 500;
+      opacity: 0.85;
+    }
     .pulse-dot {
       width: 7px;
       height: 7px;
@@ -703,6 +756,9 @@ export function renderDashboardHtml() {
     // function the unit tests exercise, so a field dropped from the list here is
     // a field the tests notice.
     const agentMatchesQuery = ${agentMatchesQuery.toString()};
+    // Whether a row's duration may be printed at all, embedded so the browser
+    // applies the same rule the unit tests assert.
+    const showsDuration = ${showsDuration.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
     // A two-line row instead of three, for comparing density on a real phone.
@@ -781,9 +837,19 @@ export function renderDashboardHtml() {
       document.getElementById('last-updated').innerText = 'Synced ' + new Date().toLocaleTimeString();
     }
 
-    function badgeHTML(status) {
-      if (status === 'working') return '<span class="badge badge-working"><span class="pulse-dot"></span> Working</span>';
-      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Blocked</span>';
+    // The timing formatters are exported and embedded, so the browser runs the
+    // same code the unit tests exercise rather than a copy that can drift.
+    const shortAge = ${shortAge.toString()};
+    const durationLabel = ${durationLabel.toString()};
+    const lastActiveHTML = ${lastActiveLabel.toString()};
+
+    function badgeHTML(status, agent) {
+      // The duration is its own span so the badge's uppercase transform does not
+      // turn "12m" into "12M"; the separator rides along so the spacing is the
+      // badge's and not two elements' worth of guesswork.
+      const duration = durationLabel(agent);
+      if (status === 'working') return '<span class="badge badge-working"><span class="pulse-dot"></span> Working' + duration + '</span>';
+      if (status === 'blocked') return '<span class="badge badge-blocked"><span class="pulse-dot"></span> Blocked' + duration + '</span>';
       return '<span class="badge badge-done">Done / Idle</span>';
     }
 
@@ -843,7 +909,7 @@ export function renderDashboardHtml() {
       tbody.innerHTML = filtered.map((a) => {
         return \`
           <tr>
-            <td>\${badgeHTML(a.status)}</td>
+            <td>\${badgeHTML(a.status, a)}</td>
             <td>\${sourceTagHTML(a.source)}</td>
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
@@ -877,7 +943,7 @@ export function renderDashboardHtml() {
                   : '<div class="action-text action-plain">' + body + '</div>';
               })()}
             </td>
-            <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${timeSince(a.updatedAt)}</td>
+            <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${lastActiveHTML(a)}</td>
           </tr>
         \`;
       }).join('');
@@ -905,17 +971,6 @@ export function renderDashboardHtml() {
     function escapeHTML(str) {
       if (!str) return '';
       return String(str).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[m]);
-    }
-
-    function timeSince(date) {
-      if (!date) return '—';
-      const seconds = Math.floor((new Date() - date) / 1000);
-      if (seconds < 5) return 'just now';
-      if (seconds < 60) return seconds + 's ago';
-      const minutes = Math.floor(seconds / 60);
-      if (minutes < 60) return minutes + 'm ago';
-      const hours = Math.floor(minutes / 60);
-      return hours + 'h ago';
     }
 
     // Polling
