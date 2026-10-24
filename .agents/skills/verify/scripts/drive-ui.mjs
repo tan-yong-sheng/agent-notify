@@ -133,6 +133,18 @@ try {
   browser(['type', '--selector', '#search-box', '--value', ''])
   report.check('clearing the query restores every row', rowsText().length === 3)
 
+  // Typing a host name is the filter the header's health tags do not provide:
+  // the tags report whether a runtime answers, not which rows came from it. The
+  // cancel is the one the page already has — clearing the box.
+  browser(['type', '--selector', '#search-box', '--value', 'herdr'])
+  const herdrRows = rowsText()
+  report.check('searching a host name narrows to that runtime', herdrRows.length === 1 && herdrRows[0].includes('charlie-docs'), `${herdrRows.length} rows`)
+  browser(['type', '--selector', '#search-box', '--value', 'orca'])
+  const orcaRows = rowsText()
+  report.check('searching the other host name narrows to its rows', orcaRows.length === 2 && orcaRows.every((r) => r.includes('orca') === false) && orcaRows.every((r) => /alpha-service|bravo-web/.test(r)), `${orcaRows.length} rows`)
+  browser(['type', '--selector', '#search-box', '--value', ''])
+  report.check('clearing the host query is the cancel', rowsText().length === 3)
+
   // ── filter tabs ───────────────────────────────────────────────────────────
   browser(['click', '--selector', '.filter-tab[data-filter="blocked"]'])
   report.check('the Blocked tab shows only blocked agents', rowsText().length === 1 && rowsText()[0].includes('bravo-web'))
@@ -153,6 +165,56 @@ try {
   report.check('the update banner is visible', evalIn('document.getElementById("update-banner").style.display') !== 'none')
   const banner = evalIn('document.getElementById("update-commit").innerText')
   report.check('a stale update status is labelled as last known', banner.endsWith('(last known, the update check could not run)'), banner)
+
+  // ── keyboard operation ────────────────────────────────────────────────────
+  // The row affordances were a span and a div, unreachable without a mouse. They
+  // are buttons now, so the journey is driven with real key events: Tab to one,
+  // press it, and check the effect the user would see. Focus also has to survive
+  // the 3 s poll, which rebuilds these rows out from under the keyboard.
+  browser(['eval', 'document.activeElement.blur()'])
+  const tabTargets = []
+  for (let i = 0; i < 8; i++) {
+    browser(['key', 'tab'])
+    tabTargets.push(evalIn('document.activeElement.className'))
+  }
+  report.check('the filter tabs are reachable by keyboard', tabTargets.some((c) => /filter-tab/.test(c)), tabTargets.join(' → '))
+  report.check('a row affordance is reachable by keyboard', tabTargets.some((c) => /path-chip/.test(c)), tabTargets.join(' → '))
+
+  const ringShown = evalIn(`(() => {
+    const el = document.querySelector('.path-chip');
+    el.focus();
+    const cs = getComputedStyle(el);
+    return { width: cs.outlineWidth, style: cs.outlineStyle, offset: cs.outlineOffset, accent: cs.outlineColor };
+  })()`)
+  report.check('a keyboard-focused row control shows a ring', ringShown.style === 'solid' && ringShown.width === '2px', `${ringShown.style} ${ringShown.width} ${ringShown.accent}`)
+  report.check('the ring does not sit on the element itself', ringShown.offset === '2px', ringShown.offset)
+
+  const focusSurvivesPoll = evalIn(`new Promise((resolve) => {
+    const el = document.querySelector('.path-chip');
+    el.focus();
+    const before = el.dataset.copyPath;
+    setTimeout(() => resolve({ before, after: document.activeElement.dataset?.copyPath ?? null, tag: document.activeElement.tagName }), 4500);
+  })`)
+  report.check(
+    'focus survives a poll that rebuilds the row',
+    focusSurvivesPoll.after === focusSurvivesPoll.before && focusSurvivesPoll.tag === 'BUTTON',
+    `before ${focusSurvivesPoll.before} → after ${focusSurvivesPoll.after}`
+  )
+  browser(['key', 'enter'])
+  const toastAfterEnter = evalIn('document.getElementById("toast").innerText')
+  report.check('Enter on a focused path copies it', toastAfterEnter === 'Copied to clipboard!', toastAfterEnter)
+
+  browser(['eval', `document.querySelector('.action-text[data-agent-id="orca:alpha"]').focus()`])
+  browser(['key', 'enter'])
+  const keyboardModal = evalIn('getComputedStyle(document.getElementById("modal-backdrop")).display')
+  report.check('Enter on a focused prompt opens the panel', keyboardModal === 'flex', `display: ${keyboardModal}`)
+  browser(['click', '--selector', '.modal-close'])
+
+  const inert = evalIn(`(() => {
+    const plain = document.querySelector('.action-text.action-plain');
+    return { tag: plain?.tagName ?? null, hasId: plain?.hasAttribute('data-agent-id') ?? null, tabIndex: plain?.tabIndex ?? null };
+  })()`)
+  report.check('the row with nothing to expand is not a button', inert.tag === 'DIV' && inert.hasId === false && inert.tabIndex === -1, JSON.stringify(inert))
 
   // ── evidence before the order journey mutates the fixture ─────────────────
   browser(['aria', '--path', path.join(outDir, 'mixed.aria.txt')])
@@ -183,6 +245,37 @@ try {
     `before [${orderBefore.join(', ')}] after [${orderAfter.join(', ')}]` +
       (JSON.stringify(orderBefore) === JSON.stringify(orderAfter) ? '' : ' — known defect: the table is rebuilt from the payload order on every poll')
   )
+
+  // ── the same table on a phone ─────────────────────────────────────────────
+  // The narrow layout reshapes each row into a card with flex order, so a cell
+  // can be dropped without any markup change. The host tag went missing on a
+  // phone through a `display: none` in the media query, which every check above
+  // missed because they all run at the desktop width.
+  browser(['viewport', '--width', '320', '--height', '568', '--mobile'])
+  browser(['open', `http://127.0.0.1:${port}/`])
+  const phone = evalIn(`(() => {
+    const rows = [...document.querySelectorAll('#agent-table-body tr')];
+    const row = rows[0];
+    const tag = row.querySelector('.tag-source');
+    return {
+      width: innerWidth,
+      rows: rows.length,
+      header: getComputedStyle(document.querySelector('thead')).display,
+      card: getComputedStyle(row).display,
+      hostVisible: tag ? tag.getBoundingClientRect().width > 0 : false,
+      hostText: tag ? tag.innerText : '',
+      agent: row.children[2].innerText.trim(),
+      offsetWidth: document.documentElement.scrollWidth,
+    };
+  })()`)
+  report.check('the phone viewport is the width the run asked for', phone.width === 320, `${phone.width}px`)
+  report.check('every row is still rendered on a phone', phone.rows === 3, `${phone.rows} rows`)
+  report.check('the table becomes cards below 900px', phone.header === 'none' && phone.card === 'flex', `thead ${phone.header}, row ${phone.card}`)
+  report.check('a card still says which runtime found the row', phone.hostVisible && /Orca|Herdr/.test(phone.hostText), phone.hostText || 'no host tag')
+  report.check('the card still names the agent', Boolean(phone.agent), phone.agent)
+  report.check('a phone card does not scroll sideways', phone.offsetWidth <= 320, `document ${phone.offsetWidth}px`)
+  browser(['screenshot', '--path', path.join(outDir, 'phone.png')])
+  report.check('the phone screenshot is captured', fs.statSync(path.join(outDir, 'phone.png')).size > 1000, path.join(outDir, 'phone.png'))
 
   report.writeEvidence('drive-ui.json')
 } finally {

@@ -38,7 +38,10 @@ import {
   renderDashboardHtml,
   updateBannerLabel,
   nextAgentOrder,
+  workspaceLabel,
+  agentMatchesQuery,
 } from './dashboard.mjs'
+import { insideTile, insidePolygon, renderRgba, encodePng } from './tools/make-icons.mjs'
 import { resolveDashboardPort } from './shared/config.mjs'
 
 // The driver's recovery modules are loaded on demand. A syntax error in one of
@@ -71,6 +74,7 @@ import {
   getLiveAgents,
   resolveBranch,
   mapWithConcurrency,
+  canonicalAgentName,
 } from './shared/catalog.mjs'
 import {
   buildSystemdUnit,
@@ -114,22 +118,43 @@ function captureConsole(fn) {
 // Function.prototype.toString() is re-serialized by some runtimes (Bun emits its
 // own formatting, semicolons included), so the function embedded in the page is
 // sliced by matching braces instead of by a regex over its source.
+// The index just past the `)` that closes the parameter list starting at `open`.
+function endOfParams(source, open) {
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '(') depth++
+    else if (source[i] === ')' && --depth === 0) return i + 1
+  }
+  return -1
+}
+
+// The index of the `}` that closes the body starting at `from`.
+function endOfBody(source, from) {
+  let depth = 0
+  for (let i = from; i < source.length; i++) {
+    if (source[i] === '{') depth++
+    else if (source[i] === '}' && --depth === 0) return i + 1
+  }
+  return -1
+}
+
+// The source of an embedded function, from its declaration to its closing brace.
+//
+// The parameter list is skipped before the body is measured: a destructured
+// parameter has braces of its own, so counting from the first `{` would end the
+// slice at the end of the parameters instead of the end of the body.
 function sliceEmbeddedFunction(source, prelude) {
   const start = source.indexOf(prelude)
   if (start === -1) return null
-  const from = start + prelude.length
-  let depth = 0
-  let seenBrace = false
-  for (let i = from; i < source.length; i++) {
-    if (source[i] === '{') {
-      depth++
-      seenBrace = true
-    } else if (source[i] === '}') {
-      depth--
-      if (seenBrace && depth === 0) return source.slice(from, i + 1)
-    }
-  }
-  return null
+  const open = source.indexOf('(', start + prelude.length)
+  if (open === -1) return null
+  const bodyStart = endOfParams(source, open)
+  if (bodyStart === -1) return null
+  const bodyFrom = source.indexOf('{', bodyStart)
+  if (bodyFrom === -1) return null
+  const bodyEnd = endOfBody(source, bodyFrom)
+  if (bodyEnd === -1) return null
+  return source.slice(start + prelude.length, bodyEnd)
 }
 
 function assert(condition, label) {
@@ -755,6 +780,275 @@ async function assertUpdateFailureAndBanner() {
     dashboardHtml.includes('agentOrder = nextAgentOrder(agentOrder,'),
     'the page rebuilds the order through it on every poll'
   )
+
+  // The page calls workspaceLabel while rendering a row, so the page has to have
+  // it. It was exported and unit-tested but never embedded, which left the table
+  // on its "Loading running agents..." placeholder for ever while the counts
+  // above it updated: the fetch worked, renderRows() threw a ReferenceError, and
+  // the catch swallowed it. Assert the embed, not just the function.
+  const embeddedWorkspaceLabel = sliceEmbeddedFunction(dashboardHtml, 'const workspaceLabel = ')
+  assert(embeddedWorkspaceLabel !== null, 'the dashboard embeds the workspace label function')
+  const pageWorkspaceLabel = new Function(`return ${embeddedWorkspaceLabel}`)()
+  const labelCases = [
+    ['π - extensions', { agent: 'pi', branch: '', cwd: '/h/.pi/agent/extensions' }],
+    ['main', { agent: 'dsh-tui', branch: 'main', cwd: '/h/c/agent-notify' }],
+    ['', { agent: 'pi', branch: 'main', cwd: '/h/c/x' }],
+  ]
+  for (const [name, row] of labelCases) {
+    assert(
+      pageWorkspaceLabel(name, row) === workspaceLabel(name, row),
+      `the embedded workspace label matches the tested one for ${JSON.stringify(name)}`
+    )
+  }
+
+  // The general form of that bug: anything the page calls must be defined in the
+  // page. The two helpers above are embedded by name, so a third added without
+  // its embed would fail here rather than on someone's screen.
+  const pageScript = dashboardHtml.slice(dashboardHtml.indexOf('<script>'), dashboardHtml.lastIndexOf('</script>'))
+  for (const [name, fn] of [
+    ['nextAgentOrder', nextAgentOrder],
+    ['workspaceLabel', workspaceLabel],
+    ['updateBannerLabel', updateBannerLabel],
+  ]) {
+    assert(
+      pageScript.includes(`function ${name}(`),
+      `the page defines ${name} before it calls it`
+    )
+  }
+
+  // The label above the path is only worth a line when it says something the
+  // row does not already say. Orca puts the branch in this field, so every Orca
+  // row read "main" above a path whose branch column also read "main".
+  assert(workspaceLabel('π - extensions', { agent: 'pi', branch: '', cwd: '/h/.pi/agent/extensions' }) === 'π - extensions', 'workspaceLabel keeps a title that says something new')
+  assert(workspaceLabel('main', { agent: 'dsh-tui', branch: 'main', cwd: '/h/c/agent-notify' }) === '', 'workspaceLabel drops a label that only repeats the branch')
+  assert(workspaceLabel('pi', { agent: 'pi', branch: 'main', cwd: '/h/c/proj' }) === '', 'workspaceLabel drops a label that only repeats the agent')
+  assert(workspaceLabel('agent-notify', { agent: 'dsh', branch: 'main', cwd: '/h/c/agent-notify' }) === '', 'workspaceLabel drops a label that only repeats the directory name')
+  assert(workspaceLabel('MAIN', { agent: 'dsh', branch: 'main', cwd: '/h/c/x' }) === '', 'workspaceLabel folds case when comparing')
+  assert(workspaceLabel('', {}) === '', 'workspaceLabel returns empty for an empty label')
+  assert(workspaceLabel(undefined, {}) === '', 'workspaceLabel does not throw on a missing label')
+  assert(workspaceLabel('feat/pwa-responsive', { agent: 'dsh', branch: 'main', cwd: '/h/c/x' }) === 'feat/pwa-responsive', 'workspaceLabel keeps a label that differs from everything on the row')
+
+  // The branch sits beside the path on a narrow screen, where it has no column.
+  assert(dashboardHtml.includes('branch-inline'), 'the page renders the branch beside the path')
+  assert(dashboardHtml.includes('ws-label'), 'the page renders the workspace label through a class')
+
+  // The workspace directory is the field that says which project a row belongs
+  // to, so it is rendered in full at every width. A narrow screen wraps it onto
+  // another line rather than cutting it, and nothing may clip it to nothing.
+  assert(dashboardHtml.includes('path-full'), 'the page renders the workspace path in full')
+  assert(!dashboardHtml.includes('path-short'), 'the page does not render a shortened workspace path')
+  assert(
+    !dashboardHtml.includes("'…/' +"),
+    'the page does not abbreviate a path with an ellipsis'
+  )
+  assert(
+    /max-width: 100%[^}]*overflow-wrap: anywhere/s.test(dashboardHtml),
+    'the workspace path wraps instead of overflowing on a narrow screen'
+  )
+
+  // The host tag is the only thing on a card that says which runtime found the
+  // row: after the dsh -> dsh-tui rename both runtimes report the same agent
+  // name, so the column cannot be dropped on the grounds that the name implies
+  // it. Below 900px the cell used to be display:none, which cost every phone
+  // the one field a reader cannot infer.
+  const narrowBlock = dashboardHtml.slice(
+    dashboardHtml.indexOf('@media (max-width: 900px)'),
+    dashboardHtml.indexOf('@media (max-width: 900px)') + 6000
+  )
+  assert(narrowBlock.length > 100, 'the page has a narrow-screen block to check')
+  assert(
+    !/nth-child\(2\)\s*\{[^}]*display:\s*none/s.test(narrowBlock),
+    'the narrow-screen block does not hide the Host cell'
+  )
+  assert(
+    /nth-child\(2\)\s*\{[^}]*order:\s*\d/s.test(narrowBlock),
+    'the Host cell is ordered onto the card rather than dropped'
+  )
+  assert(
+    dashboardHtml.includes('tag-source tag-orca') && dashboardHtml.includes('tag-source tag-herdr'),
+    'a row renders a source tag for each runtime'
+  )
+
+  // The two affordances that carry the primary task — copy a path, expand a
+  // prompt — were a span and a div with click handlers, so neither could be
+  // reached from a keyboard. They are buttons now, with the behaviour still
+  // read from the data attribute by the delegated listener.
+  assert(
+    dashboardHtml.includes('<button type="button" class="path-chip path-full"'),
+    'the workspace path is a button, so it can be copied from a keyboard'
+  )
+  assert(
+    dashboardHtml.includes('class="action-text" data-agent-id='),
+    'the prompt cell is a button, so it can be expanded from a keyboard'
+  )
+  // The row with nothing to expand must not announce a control that does
+  // nothing, so its variant stays a plain div with no id to dispatch on.
+  assert(
+    dashboardHtml.includes('<div class="action-text action-plain">'),
+    'the row with nothing to expand is not a button'
+  )
+  assert(
+    /action-plain[^>]*data-agent-id/.test(dashboardHtml) === false,
+    'the inert variant carries no agent id, so no handler can open it'
+  )
+  // type="button" is what keeps a future form wrapper from turning these into
+  // submit buttons; both elements must carry it.
+  assert(
+    (dashboardHtml.match(/<button type="button"/g) || []).length >= 2,
+    'both row affordances declare type="button" explicitly'
+  )
+
+  // One focus convention for the whole page: :focus-visible with the accent
+  // token. The search box used to suppress the browser's ring with
+  // `outline: none` and replace it with a 1px border recolour, and the buttons
+  // had no focus rule at all, which left a keyboard user unable to see focus.
+  assert(
+    dashboardHtml.includes(':focus-visible'),
+    'the page declares a focus-visible indicator'
+  )
+  const focusBlock = dashboardHtml.slice(
+    dashboardHtml.indexOf('.search-box:focus-visible'),
+    dashboardHtml.indexOf('.search-box:focus-visible') + 700
+  )
+  for (const selector of ['.search-box', '.filter-tab', '.modal-close', '.path-chip', '.action-text']) {
+    assert(
+      focusBlock.includes(`${selector}:focus-visible`),
+      `the focus ring reaches ${selector}`
+    )
+  }
+  assert(
+    /:focus-visible[^{]*\{[^}]*outline:\s*2px solid var\(--accent\)/s.test(dashboardHtml),
+    'the focus ring is a 2px accent outline'
+  )
+  // Match the declaration, not the prose: the comment above the rule names
+  // `outline:none` while explaining that it is gone.
+  assert(
+    /outline:\s*none\s*;/i.test(dashboardHtml) === false,
+    'nothing suppresses the focus ring'
+  )
+
+  // The table is rebuilt from a string on every poll, which throws away the
+  // focused element. For a mouse that is invisible; for a keyboard the row
+  // control you were on disappears mid-use, so renderRows has to put focus back
+  // on the same control. The attribute is what both dispatches the behaviour and
+  // identifies the row, so it is what the focus is restored by.
+  assert(
+    dashboardHtml.includes('const focused = focusedRowControl()'),
+    'the page records which row control has focus before rebuilding the table'
+  )
+  assert(
+    dashboardHtml.includes('restoreRowFocus(focused)'),
+    'the page puts keyboard focus back on the same row control after a poll'
+  )
+  assert(
+    /focusedRowControl[\s\S]{0,600}dataset\.copyPath[\s\S]{0,200}dataset\.agentId/.test(dashboardHtml),
+    'the recorded focus is identified by the data attribute that also drives the action'
+  )
+
+  // The search covers the host, so typing a runtime's name narrows the table to
+  // its rows. That is the filter the header tags do not offer: they report
+  // whether a runtime answers, not which rows came from it.
+  const herdrRow = { id: 'h1', source: 'herdr', agent: 'pi', cwd: '/h/.pi/x', displayName: 'π - x', branch: 'main', prompt: null }
+  const orcaRow = { id: 'o1', source: 'orca', agent: 'dsh-tui', cwd: '/h/c/agent-notify', displayName: 'main', branch: 'main', prompt: 'Run the suite' }
+  assert(agentMatchesQuery(herdrRow, 'herdr') === true, 'the search matches a row by its host')
+  assert(agentMatchesQuery(orcaRow, 'herdr') === false, 'the search excludes the other host')
+  assert(agentMatchesQuery(orcaRow, 'ORCA') === true, 'the host match folds case')
+  assert(agentMatchesQuery(orcaRow, '') === true, 'an empty query keeps every row, which is the cancel')
+  assert(agentMatchesQuery(herdrRow, 'run the suite') === false, 'a prompt match does not cross rows')
+  assert(agentMatchesQuery(orcaRow, 'run the suite') === true, 'the search still matches a prompt')
+  assert(agentMatchesQuery({ id: 'x' }, 'anything') === false, 'a row with no fields matches nothing')
+  assert(agentMatchesQuery({ id: 'x' }, '') === true, 'a row with no fields still survives an empty query')
+
+  // Same rule as the helpers above: the browser must run this function, not a
+  // second copy of the field list that the tests never see.
+  const embeddedMatch = sliceEmbeddedFunction(dashboardHtml, 'const agentMatchesQuery = ')
+  assert(embeddedMatch !== null, 'the dashboard embeds the search predicate')
+  assert(dashboardHtml.includes('filter(a => agentMatchesQuery(a, searchQuery))'), 'the table filters through it')
+  assert(dashboardHtml.includes('host, prompt'), 'the search box says it filters by host')
+}
+
+// The files that make the page installable. Chrome refuses to offer
+// installation without a manifest, a worker and the icons the manifest names,
+// so each of those is checked here rather than discovered on a phone.
+function runPwaTests() {
+  console.log('\nRunning PWA tests...\n')
+
+  // The drawing that makes the icons, exercised directly: a committed PNG
+  // nobody can regenerate is a binary, and these are what proves the glyph is
+  // where the artwork says it is.
+  assert(insideTile(0.5, 0.5, 0.22) === true, 'the middle of the icon tile is inside it')
+  assert(insideTile(0.02, 0.02, 0.22) === false, 'the corner of the icon is outside the rounded tile')
+  assert(insideTile(0.5, 0.02, 0.22) === true, 'the middle of an edge is inside the tile')
+  assert(insidePolygon(0.5, 0.5, [[0, 0], [1, 0], [1, 1], [0, 1]]) === true, 'a point inside a square is inside it')
+  assert(insidePolygon(1.5, 0.5, [[0, 0], [1, 0], [1, 1], [0, 1]]) === false, 'a point outside a square is outside it')
+  // The bolt is drawn over the tile, so the centre pixel must be the accent
+  // colour rather than the background, and the corner must stay transparent.
+  const tiny = renderRgba(16)
+  const pixel = (buf, size, x, y) => [...buf.subarray(1 + y * (1 + size * 4) + 1 + x * 4, 1 + y * (1 + size * 4) + 1 + x * 4 + 4)]
+  assert(pixel(tiny, 16, 0, 0)[3] === 0, 'the icon corner is transparent')
+  assert(pixel(tiny, 16, 8, 8).join() !== '0,0,0,0', 'the icon centre is drawn')
+  const png = encodePng(8)
+  assert(png.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), 'encodePng writes a PNG signature')
+  assert(png.readUInt32BE(16) === 8 && png.readUInt32BE(20) === 8, 'encodePng writes the size it was given')
+
+  const repoRoot = path.dirname(fileURLToPath(import.meta.url))
+  const publicDir = path.join(repoRoot, 'public')
+  // The nested-suite fixture copies only the files git tracks, and this group
+  // reads files that live beside the suite. When the copy does not carry them,
+  // say so and leave the assertions to the run that does, rather than throwing
+  // and taking the suite's summary down with it.
+  if (!fs.existsSync(path.join(publicDir, 'manifest.webmanifest'))) {
+    console.log('  (PWA tests skipped: this copy of the repository has no public/ directory)')
+    return
+  }
+  const dashboardHtml = renderDashboardHtml()
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(publicDir, 'manifest.webmanifest'), 'utf8'))
+  assert(manifest.name === 'Agent Monitor', 'the manifest names the app')
+  assert(manifest.short_name, 'the manifest has a short name for a launcher')
+  assert(manifest.start_url === '/', 'the manifest starts at the dashboard')
+  assert(manifest.display === 'standalone', 'the manifest asks for a standalone window')
+  assert(manifest.theme_color, 'the manifest declares a theme colour')
+  assert(Array.isArray(manifest.icons) && manifest.icons.length >= 2, 'the manifest names icons')
+
+  // Chrome will not offer installation without a 192 and a 512 icon, and the
+  // maskable one is what stops Android cropping the glyph to its own shape.
+  const sizes = manifest.icons.map((i) => i.sizes)
+  assert(sizes.includes('192x192'), 'the manifest has a 192x192 icon')
+  assert(sizes.includes('512x512'), 'the manifest has a 512x512 icon')
+  assert(
+    manifest.icons.some((i) => i.purpose === 'maskable'),
+    'the manifest has a maskable icon for Android launchers'
+  )
+
+  // The icons are real PNGs of the size the manifest claims, not placeholders
+  // that happen to have the right filename.
+  for (const icon of manifest.icons) {
+    const bytes = fs.readFileSync(path.join(publicDir, path.basename(icon.src)))
+    const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    assert(bytes.subarray(0, 8).equals(signature), `${icon.src} is a PNG`)
+    const [wantW, wantH] = icon.sizes.split('x').map(Number)
+    assert(bytes.readUInt32BE(16) === wantW && bytes.readUInt32BE(20) === wantH, `${icon.src} is ${icon.sizes}`)
+  }
+
+  assert(dashboardHtml.includes('rel="manifest"'), 'the page links the manifest')
+  assert(dashboardHtml.includes('name="theme-color"'), 'the page declares a theme colour')
+  assert(dashboardHtml.includes('rel="apple-touch-icon"'), 'the page gives iOS an icon')
+  assert(dashboardHtml.includes("serviceWorker.register('/sw.js')"), 'the page registers the worker')
+
+  // The worker must never serve live state from a cache: a stale table would
+  // show agents that have already exited, with nothing to tell them from ones
+  // that are still running.
+  const worker = fs.readFileSync(path.join(publicDir, 'sw.js'), 'utf8')
+  assert(worker.includes("startsWith('/api/')"), 'the worker leaves the live API alone')
+  assert(
+    !worker.includes("'/api/agents'") && !worker.includes('"/api/agents"'),
+    'the worker does not name an API path in its precache list'
+  )
+  assert(
+    worker.indexOf("startsWith('/api/')") < worker.indexOf('caches.match'),
+    'the worker returns for an API path before it considers a cache'
+  )
 }
 
 // The Host allowlist is its own unit: `tailscale serve` forwards the tailnet
@@ -1094,6 +1388,28 @@ async function runDashboardUnitTests() {
   assert(orcaAgent.cwd === '/path/to/orca', 'parseOrcaAgent cwd')
   assert(orcaAgent.branch === 'feature', 'parseOrcaAgent branch stripped')
   assert(orcaAgent.prompt === 'hi', 'parseOrcaAgent prompt')
+
+  // The same tool is reported as `dsh` by Orca and `dsh-tui` by Herdr, so a row
+  // would otherwise be named after the adapter that found it. Both come out
+  // under one name; everything else passes through untouched.
+  assert(canonicalAgentName('dsh') === 'dsh-tui', 'canonicalAgentName renames the short spelling')
+  assert(canonicalAgentName('dsh-tui') === 'dsh-tui', 'canonicalAgentName leaves the long spelling alone')
+  assert(canonicalAgentName('DSH') === 'dsh-tui', 'canonicalAgentName folds case')
+  assert(canonicalAgentName('pi') === 'pi', 'canonicalAgentName leaves another agent alone')
+  assert(canonicalAgentName('') === '', 'canonicalAgentName leaves an empty name empty')
+  assert(canonicalAgentName(undefined) === '', 'canonicalAgentName does not throw on a missing name')
+  assert(
+    parseOrcaAgent({ path: '/p' }, { paneKey: 'k', agentType: 'dsh', state: 'idle' }).agent === 'dsh-tui',
+    'an Orca row is named the same as the Herdr row for this tool'
+  )
+  assert(
+    parseHerdrAgent({ pane_id: 'p', agent: 'dsh-tui', agent_status: 'idle' }).agent === 'dsh-tui',
+    'the Herdr name for this tool is already the canonical one'
+  )
+  assert(
+    parseHerdrAgent({ pane_id: 'p', agent: 'dsh', agent_status: 'idle' }).agent === 'dsh-tui',
+    'a Herdr row using the short spelling is renamed too'
+  )
 
   // Untrusted CLI payloads: wrong-typed or missing fields must degrade, not throw.
   const malformedHerdr = parseHerdrAgent({ agent_status: { nope: true }, pane_id: 42, cwd: null, terminal_title: 7 })
@@ -2009,6 +2325,9 @@ async function runMutationRestoreCommandTests() {
     }
     fs.copyFileSync(path.join(repoRoot, 'test_cases.test.js'), path.join(root, 'test_cases.test.js'))
     fs.writeFileSync(path.join(root, 'shared/service.mjs'), source)
+    // The PWA tests read these from beside the suite, and this fixture runs the
+    // suite in a repository of its own, so the copy has to carry them too.
+    fs.cpSync(path.join(repoRoot, 'public'), path.join(root, 'public'), { recursive: true })
     if (git) {
       execSync('git init', { cwd: root, stdio: 'ignore', env: gitEnv })
       execSync('git add .', { cwd: root, stdio: 'ignore', env: gitEnv })
@@ -2541,6 +2860,7 @@ async function main() {
   runOrcaMainUnitTests()
   await runDashboardUnitTests()
   runAllowedHostTests()
+  runPwaTests()
   await runTailscaleTests()
   await runOrcaDiscoveryTests()
   await runStatusCommandTimeoutTests()

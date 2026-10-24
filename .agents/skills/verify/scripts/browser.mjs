@@ -11,6 +11,8 @@
 //   text                         print document.body.innerText
 //   aria [--path FILE]           print the accessibility tree as 'role "name"' lines
 //   wait --selector CSS [--timeout MS]
+//   viewport --width N [--height N] [--mobile]
+//   key <Tab|Enter|Space|Escape|ArrowDown|...> [--shift]
 //   click --selector CSS
 //   type --selector CSS --value TEXT
 //   screenshot --path FILE
@@ -267,7 +269,24 @@ async function pageSession() {
     )
   }
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true })
+  // A device-metrics override belongs to the session that set it, and every
+  // command here attaches a fresh one, so the recorded viewport is re-applied
+  // rather than lost between commands.
+  if (state.viewport) await applyViewport(cdp, sessionId, state.viewport)
   return { cdp, sessionId, state }
+}
+
+function applyViewport(cdp, sessionId, viewport) {
+  return cdp.send(
+    'Emulation.setDeviceMetricsOverride',
+    {
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor ?? 2,
+      mobile: Boolean(viewport.mobile),
+    },
+    sessionId
+  )
 }
 
 // ─── Commands ───────────────────────────────────────────────────────────────
@@ -391,9 +410,34 @@ async function open(url) {
     writeState({ ...state, targetId })
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
     await cdp.send('Page.enable', {}, sessionId)
+    // A viewport set before the navigation is how a run drives a phone-size
+    // layout: the width has to hold while the page lays out, not after.
+    if (state.viewport) await applyViewport(cdp, sessionId, state.viewport)
     await waitFor(sessionId, 'document.readyState === "complete"', 15000, cdp).catch(() => {})
     const { result } = await cdp.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true }, sessionId)
     console.log(result.value)
+  } finally {
+    cdp.close()
+  }
+}
+
+async function viewport() {
+  const width = Number(flags.width)
+  if (!Number.isInteger(width) || width < 1) throw new Error('viewport needs --width N')
+  const height = flags.height && flags.height !== true ? Number(flags.height) : 800
+  const viewport = { width, height, mobile: Boolean(flags.mobile), deviceScaleFactor: 2 }
+  const state = readState()
+  // Recorded before the override is attempted so a session that has not opened
+  // a page yet still gets the width when it does.
+  writeState({ ...state, viewport })
+  if (!state.targetId) {
+    console.log(`viewport ${width}x${height} recorded; it applies when the page opens`)
+    return
+  }
+  const { cdp, sessionId } = await pageSession()
+  try {
+    const { result } = await cdp.send('Runtime.evaluate', { expression: 'innerWidth + "x" + innerHeight', returnByValue: true }, sessionId)
+    console.log(`viewport ${width}x${height}; page now reports ${result.value}`)
   } finally {
     cdp.close()
   }
@@ -444,8 +488,39 @@ async function aria() {
   }
 }
 
-async function click() {
-  const selector = String(flags.selector)
+// A real key event, so a journey can be proved from the keyboard rather than by
+// calling the page's handlers directly. Tab is the interesting one: it is what
+// makes the browser move focus and what makes :focus-visible match.
+const KEYS = {
+  tab: { key: 'Tab', code: 'Tab', keyCode: 9, text: undefined },
+  enter: { key: 'Enter', code: 'Enter', keyCode: 13, text: '\r' },
+  space: { key: ' ', code: 'Space', keyCode: 32, text: ' ' },
+  escape: { key: 'Escape', code: 'Escape', keyCode: 27, text: undefined },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, text: undefined },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38, text: undefined },
+}
+
+async function key() {
+  const name = String(flags.key || positional[1] || '').toLowerCase()
+  const spec = KEYS[name]
+  if (!spec) throw new Error(`unknown key: ${name}; known: ${Object.keys(KEYS).join(', ')}`)
+  const { cdp, sessionId } = await pageSession()
+  try {
+    const modifiers = flags.shift ? 8 : 0
+    const base = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode, modifiers }
+    await cdp.send('Input.dispatchKeyEvent', { ...base, type: spec.text ? 'keyDown' : 'rawKeyDown', text: spec.text }, sessionId)
+    await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, sessionId)
+    const { result } = await cdp.send('Runtime.evaluate', {
+      expression: `(() => { const el = document.activeElement; return el ? (el.id || el.className || el.tagName) : 'none'; })()`,
+      returnByValue: true,
+    }, sessionId)
+    console.log(`pressed ${name}; focus is now ${result.value}`)
+  } finally {
+    cdp.close()
+  }
+}
+
+async function click() {  const selector = String(flags.selector)
   const { cdp, sessionId } = await pageSession()
   try {
     const { result } = await cdp.send(
@@ -571,6 +646,8 @@ const COMMANDS = {
   },
   click,
   type,
+  viewport,
+  key,
   screenshot,
   close,
 }

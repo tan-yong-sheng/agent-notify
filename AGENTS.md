@@ -21,6 +21,31 @@ This file gives coding agents project-specific context. Keep it short and update
 - Test:
 - Typecheck or lint:
 
+## Dashboard UI
+
+Rules the dashboard's page follows. Each one exists because its absence shipped a
+defect the unit suite could not see.
+
+- Interactive elements inside the agent table are native `<button type="button">`
+  and carry their behaviour in a data attribute (`data-copy-path`,
+  `data-agent-id`), which the one delegated listener reads. A variant that does
+  nothing (`action-plain`) is a plain element with neither the attribute nor a
+  place in the tab order, so it never announces a control.
+- `renderRows()` rebuilds the table from a string on every poll. It records which
+  row control has focus and restores it afterwards, because otherwise a keyboard
+  user loses the control mid-use every 3 s.
+- Focus is shown one way: `:focus-visible` with `outline: 2px solid var(--accent)`
+  and `outline-offset: 2px`, in one rule listing every control. `outline: none`
+  must not come back without an equivalent indicator.
+- Every row shows its host tag at every width. The agent name does not imply the
+  runtime: both adapters emit the same canonical name through
+  `canonicalAgentName` in `shared/catalog.mjs`. The host is also a search field,
+  which is the only host filter the page has — the header tags report health.
+- The narrow-screen layout is CSS over the same markup, so a cell can vanish
+  without any markup change. `.agents/skills/verify/scripts/drive-ui.mjs` opens
+  the page at 320 px for that reason; a media-query regression is invisible to
+  every check that runs at one width.
+
 ## Fallow
 
 - Use `fallow audit --format json --quiet` before committing AI-generated changes.

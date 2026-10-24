@@ -52,6 +52,19 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const PROBE_ARGV = [SCRIPT_PATH]
 const REPO_DIR = path.dirname(SCRIPT_PATH)
 
+// The files the page needs to be installable. They are served from a fixed
+// allowlist rather than by joining the request path onto a directory: the
+// request path is attacker-controlled, and a join would let `..` reach any file
+// the dashboard can read.
+const PUBLIC_DIR = path.join(REPO_DIR, 'public')
+const STATIC_FILES = new Map([
+  ['/manifest.webmanifest', { file: 'manifest.webmanifest', type: 'application/manifest+json; charset=utf-8' }],
+  ['/sw.js', { file: 'sw.js', type: 'text/javascript; charset=utf-8' }],
+  ['/icon-192.png', { file: 'icon-192.png', type: 'image/png' }],
+  ['/icon-512.png', { file: 'icon-512.png', type: 'image/png' }],
+  ['/icon-maskable-512.png', { file: 'icon-maskable-512.png', type: 'image/png' }],
+])
+
 export { normalizeAgentStatus, parseHerdrAgent, parseOrcaAgent, collectLiveState }
 
 // The banner label for an update status. Exported and embedded into the page, so
@@ -83,6 +96,33 @@ export function nextAgentOrder(knownIds, incomingIds) {
   return kept
 }
 
+// The workspace label a row shows above its path, or an empty string when the
+// label would say nothing new. The two runtimes disagree about what this field
+// means: Herdr puts the terminal title there (`π - extensions`), which tells the
+// operator what the session is for, while Orca puts the worktree's display name
+// there, which is the branch — and the branch already has a column. A label that
+// only repeats the agent, the branch, or the directory's own name is dropped, so
+// a row never shows the same word twice.
+export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' } = {}) {
+  const label = typeof displayName === 'string' ? displayName.trim() : ''
+  if (!label) return ''
+  const base = String(cwd).replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || ''
+  const seen = [String(agent || ''), String(branch || ''), base].map((v) => v.trim().toLowerCase()).filter(Boolean)
+  return seen.includes(label.toLowerCase()) ? '' : label
+}
+
+// What a search term is matched against. The host is in the list because it is
+// the one field the header's health tags do not filter: they say whether a
+// runtime answers, not which rows came from it, and the row tag that does say so
+// is the only place the runtime appears. A term matches case-insensitively in
+// any of these fields.
+export function agentMatchesQuery(agent, query) {
+  const q = String(query || '').toLowerCase().trim()
+  if (!q) return true
+  return ['cwd', 'displayName', 'branch', 'agent', 'source', 'prompt']
+    .some((field) => String(agent?.[field] ?? '').toLowerCase().includes(q))
+}
+
 // ─── HTML Page Template (Variant B: Compact Dense Table) ─────────────────────
 
 export function renderDashboardHtml() {
@@ -92,6 +132,14 @@ export function renderDashboardHtml() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Agent Monitor</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#161b22">
+  <!-- iOS ignores the manifest's icons and reads this one, and it is the only
+       way to launch full screen on an iPhone. -->
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agents">
   <style>
     :root {
       --bg: #0d1117;
@@ -214,6 +262,14 @@ export function renderDashboardHtml() {
     .tag-herdr { background: rgba(163, 113, 247, 0.2); color: #c297ff; border: 1px solid rgba(163, 113, 247, 0.4); }
 
     .path-chip {
+      /* A button, so the chip is reachable and operable from a keyboard. Only
+         what the user agent's button style would otherwise impose is undone;
+         everything that gives the chip its appearance is kept as it was. */
+      appearance: none;
+      -webkit-appearance: none;
+      border: none;
+      margin: 0;
+      text-align: left;
       font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, monospace;
       font-size: 12px;
       color: #79c0ff;
@@ -223,9 +279,16 @@ export function renderDashboardHtml() {
       cursor: pointer;
       display: inline-block;
       max-width: 360px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      /* The underline that made the chip read as copyable, kept after the reset
+         above cleared every border. */
+      border-bottom: 1px solid rgba(48, 54, 61, 0.6);
+      vertical-align: middle;
+      /* The directory is the field that says which project a row belongs to, so
+         a long one wraps instead of being cut: an ellipsis here would hide the
+         part that tells two rows apart. */
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
       transition: background 0.1s ease;
     }
     .path-chip:hover {
@@ -250,9 +313,21 @@ export function renderDashboardHtml() {
       border-radius: 6px;
       font-size: 13px;
       width: 320px;
-      outline: none;
     }
     .search-box:focus { border-color: var(--accent); }
+    /* Every control on this page shows the same ring, and only when the focus
+       came from the keyboard. The ring is the one thing the page had
+       suppressed: an outline:none on the search box, and no focus rule at all
+       for its buttons. */
+    .search-box:focus-visible,
+    .filter-tab:focus-visible,
+    .modal-close:focus-visible,
+    .update-banner button:focus-visible,
+    .path-chip:focus-visible,
+    .action-text:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
     .filter-tabs {
       display: flex;
       gap: 6px;
@@ -305,6 +380,18 @@ export function renderDashboardHtml() {
     tr:hover td { background: rgba(110, 118, 129, 0.05); }
 
     .action-text {
+      /* A button, so the cell can be reached and opened from a keyboard. The
+         reset below undoes the user agent's button chrome; the clamp and the
+         colours are unchanged. */
+      appearance: none;
+      -webkit-appearance: none;
+      border: none;
+      background: transparent;
+      font: inherit;
+      text-align: left;
+      padding: 0;
+      margin: 0;
+      width: 100%;
       color: #c9d1d9;
       cursor: pointer;
       display: -webkit-box;
@@ -314,6 +401,14 @@ export function renderDashboardHtml() {
       line-height: 1.4;
     }
     .action-text:hover { color: #fff; }
+    /* A row with no tool and no prompt has nothing to expand, so it does not
+       offer the hand cursor that promises a panel. */
+    .action-plain { cursor: default; }
+    .action-plain:hover { color: #c9d1d9; }
+    .ws-label { font-weight: 600; margin-bottom: 2px; }
+    /* The inline branch sits beside the path on a narrow screen, where the
+       branch has no column of its own; at width the column shows it. */
+    .branch-inline { display: none; color: var(--accent); margin-left: 6px; font-size: 11px; }
 
     /* Modal / Drawer for Full Prompt */
     .modal-backdrop {
@@ -378,6 +473,127 @@ export function renderDashboardHtml() {
       pointer-events: none;
       z-index: 2000;
     }
+
+    /* Narrow screens: the seven columns need about 1020px, so on a phone or a
+       tablet held upright the table scrolls sideways with most of it off
+       screen. Each row becomes a short card instead, and the column headers
+       stop earning their place because every cell is labelled by its content.
+
+       The row is reordered with flex order rather than restructured, so the
+       markup stays one shape for every screen and the desktop table is
+       unaffected. A card is then two or three tight lines instead of seven
+       stacked ones: measured at 375x667 the stacked version was 218px a card
+       and showed one card per screen. */
+    @media (max-width: 900px) {
+      body { padding: 10px; }
+
+      /* Three bars' worth of chrome was 253px of a 667px screen before any
+         content. The counts move onto the title line and the rest folds. */
+      .header {
+        flex-direction: row;
+        align-items: baseline;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 2px 8px;
+        margin-bottom: 8px;
+      }
+      .header h1 { font-size: 16px; }
+      .header-info { font-size: 11px; gap: 6px; }
+
+      .stats-bar { gap: 10px; margin-bottom: 8px; flex-wrap: nowrap; overflow-x: auto; }
+      .stat-pill { padding: 0; border: none; background: none; gap: 5px; font-size: 12px; }
+      .stat-pill .count { font-size: 13px; }
+      .stat-pill .stat-label { display: none; }
+
+      .controls-bar { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .search-box { width: auto; flex: 1 1 40%; min-width: 0; padding: 5px 8px; font-size: 12px; }
+      .filter-tabs { overflow-x: auto; flex-wrap: nowrap; }
+      .filter-tab { padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+
+      .table-container { border: none; background: transparent; overflow-x: visible; }
+      table, thead, tbody { display: block; width: 100%; }
+      thead { display: none; }
+
+      /* Each row is a card of two or three lines, ordered by content rather
+         than by column, and it wraps instead of stacking a cell per line. */
+      tbody tr {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 2px 8px;
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin-bottom: 8px;
+      }
+      tbody td { border: none; padding: 0; max-width: none; }
+
+      /* line 1: state, host, agent, and how long ago it moved. The host tag
+         stays: after the dsh -> dsh-tui rename both runtimes report the same
+         agent name, so the tag is the only thing on the card that says which
+         one found the row. */
+      tbody td:nth-child(1) { order: 1; flex: 0 0 auto; }
+      tbody td:nth-child(2) { order: 2; flex: 0 0 auto; }
+      tbody td:nth-child(3) { order: 3; flex: 0 1 auto; font-size: 14px; min-width: 0; }
+      tbody td:nth-child(7) { order: 4; flex: 0 0 auto; margin-left: auto; font-size: 11px; }
+
+      /* line 2: where it is and which branch. The path chip is dropped here and
+         kept in the modal, because it was the single tallest cell on the card. */
+      /* The name and the directory share one line: the directory is what
+         identifies the project, and the name alone repeats the agent. */
+      tbody td:nth-child(4) { order: 5; flex: 1 1 auto; font-size: 12px; min-width: 0; display: flex; align-items: center; gap: 6px; }
+      tbody td:nth-child(4) > div {
+        margin-bottom: 0;
+        font-weight: 500;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      /* The branch moves beside the path, which is where the operator reads it
+         anyway: a column of its own costs a whole line on a card. */
+      tbody td:nth-child(5) { display: none; }
+      tbody td:nth-child(4) .branch-inline { display: inline; }
+      /* The whole directory, at every width. It is the field that says which
+         project a row belongs to, so it is never shortened or clipped: a narrow
+         screen wraps it onto another line instead, which costs a line and keeps
+         the information. */
+      tbody td:nth-child(4) .path-chip {
+        display: inline-block;
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        overflow: visible;
+        text-overflow: clip;
+        font-size: 11px;
+      }
+      tbody td:nth-child(4) > div { margin-bottom: 0; font-weight: 500; }
+
+      /* line 3: what it is doing, truncated to one line */
+      tbody td:nth-child(6) { order: 7; flex: 1 1 100%; font-size: 12px; min-width: 0; }
+      tbody td:nth-child(6) .action-text {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: none;
+        color: var(--text-muted);
+      }
+
+      tbody td:empty { display: none; }
+    }
+
+    /* The same cards without the third line: ?layout=dense, for comparing a
+       two-line row against the three-line one on a real phone. */
+    body.layout-dense tbody td:nth-child(6) { display: none; }
+
+    @media (max-width: 600px) {
+      body { padding: 8px; }
+      .header h1 { font-size: 15px; }
+      tbody tr { padding: 7px 9px; }
+    }
   </style>
 </head>
 <body>
@@ -405,27 +621,27 @@ export function renderDashboardHtml() {
       <div class="pulse-dot" style="color: var(--green);"></div>
       <div>
         <div class="count" id="count-working">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Working / Running</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Working / Running</div>
       </div>
     </div>
     <div class="stat-pill">
       <div class="pulse-dot" style="color: var(--red);"></div>
       <div>
         <div class="count" id="count-blocked">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Blocked</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Blocked</div>
       </div>
     </div>
     <div class="stat-pill">
       <div class="pulse-dot" style="color: var(--gray);"></div>
       <div>
         <div class="count" id="count-idle">0</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Settled / Idle</div>
+        <div class="stat-label" style="font-size: 11px; color: var(--text-muted);">Settled / Idle</div>
       </div>
     </div>
   </div>
 
   <div class="controls-bar">
-    <input type="text" id="search-box" class="search-box" placeholder="Filter by directory, branch, agent, prompt..." />
+    <input type="text" id="search-box" class="search-box" placeholder="Filter by directory, branch, agent, host, prompt..." />
     <div class="filter-tabs">
       <button class="filter-tab active" data-filter="all" onclick="setFilter('all')">All (<span id="tab-count-all">0</span>)</button>
       <button class="filter-tab" data-filter="working" onclick="setFilter('working')">Working (<span id="tab-count-working">0</span>)</button>
@@ -478,8 +694,21 @@ export function renderDashboardHtml() {
     // An agent that has gone must not stay in the order, or a long-lived page
     // keeps sorting rows for agents that no longer exist.
     const nextAgentOrder = ${nextAgentOrder.toString()};
+    // The row renderer calls this to decide whether the workspace label says
+    // anything the row does not already say, so the page needs the function
+    // itself. Exported and embedded the same way as the order above, so the
+    // browser runs the code the tests exercise.
+    const workspaceLabel = ${workspaceLabel.toString()};
+    // The search predicate is embedded for the same reason: the browser runs the
+    // function the unit tests exercise, so a field dropped from the list here is
+    // a field the tests notice.
+    const agentMatchesQuery = ${agentMatchesQuery.toString()};
     let currentFilter = 'all';
     let searchQuery = '';
+    // A two-line row instead of three, for comparing density on a real phone.
+    if (new URLSearchParams(location.search).get('layout') === 'dense') {
+      document.body.classList.add('layout-dense');
+    }
 
     function copyPath(text) {
       navigator.clipboard.writeText(text);
@@ -564,8 +793,30 @@ export function renderDashboardHtml() {
         : '<span class="tag-source tag-herdr">Herdr</span>';
     }
 
+    // Which row control holds focus, identified by the data attribute that also
+    // drives its behaviour. Rebuilding the table every poll would otherwise drop
+    // focus to the body, which made a row control impossible to use from the
+    // keyboard: the page replaces the row out from under the key press.
+    function focusedRowControl() {
+      const el = document.activeElement;
+      if (!el || !el.matches || !el.matches('button')) return null;
+      if (el.dataset.copyPath) return { attribute: 'copyPath', value: el.dataset.copyPath };
+      if (el.dataset.agentId) return { attribute: 'agentId', value: el.dataset.agentId };
+      return null;
+    }
+
+    function restoreRowFocus(control) {
+      if (!control) return;
+      const match = Array.from(document.querySelectorAll('#agent-table-body button'))
+        .find((el) => el.dataset[control.attribute] === control.value);
+      // A control whose row is gone has nothing to focus; the alternative is
+      // focusing an unrelated row and acting on it from the keyboard.
+      if (match) match.focus();
+    }
+
     function renderRows() {
       const tbody = document.getElementById('agent-table-body');
+      const focused = focusedRowControl();
       // Sort by first-seen position before filtering so the visible order is
       // stable across polls regardless of the server's payload order.
       const byId = new Map(allAgents.map(a => [a.id, a]));
@@ -581,13 +832,7 @@ export function renderDashboardHtml() {
       }
 
       if (searchQuery) {
-        filtered = filtered.filter(a => {
-          return (a.cwd && a.cwd.toLowerCase().includes(searchQuery)) ||
-                 (a.displayName && a.displayName.toLowerCase().includes(searchQuery)) ||
-                 (a.branch && a.branch.toLowerCase().includes(searchQuery)) ||
-                 (a.agent && a.agent.toLowerCase().includes(searchQuery)) ||
-                 (a.prompt && a.prompt.toLowerCase().includes(searchQuery));
-        });
+        filtered = filtered.filter(a => agentMatchesQuery(a, searchQuery));
       }
 
       if (filtered.length === 0) {
@@ -602,20 +847,42 @@ export function renderDashboardHtml() {
             <td>\${sourceTagHTML(a.source)}</td>
             <td><strong>\${escapeHTML(a.agent)}</strong></td>
             <td>
-              <div style="font-weight:600; margin-bottom:2px;">\${escapeHTML(a.displayName)}</div>
-              <span class="path-chip" data-copy-path="\${escapeHTML(a.cwd)}" title="Click to copy full path">\${escapeHTML(a.cwd)}</span>
+              \${(() => {
+                // The label is dropped when it would only repeat the agent, the
+                // branch or the directory: Orca puts the branch in this field,
+                // so every Orca row said "main" above a path whose branch
+                // column already said "main".
+                const label = workspaceLabel(a.displayName, { agent: a.agent, branch: a.branch, cwd: a.cwd });
+                // The branch belongs with the path it is checked out on, so it
+                // sits beside it in brackets instead of in a column of its own
+                // on a narrow screen. The column stays for the table.
+                const branch = a.branch ? '<span class="branch-inline">(' + escapeHTML(a.branch) + ')</span>' : '';
+                return (label ? '<div class="ws-label">' + escapeHTML(label) + '</div>' : '') +
+                  '<button type="button" class="path-chip path-full" data-copy-path="' + escapeHTML(a.cwd) + '" title="Copy the full path">' + escapeHTML(a.cwd) + '</button>' +
+                  branch;
+              })()}
             </td>
-            <td>\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="branch-cell">\${a.branch ? '<code style="color:var(--accent);">' + escapeHTML(a.branch) + '</code>' : '<span style="color:var(--text-muted)">—</span>'}</td>
             <td style="max-width:340px;">
-              <div class="action-text" data-agent-id="\${escapeHTML(a.id)}" title="Click to expand prompt">
-                \${a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : ''}
-                <span>\${escapeHTML(a.prompt || (a.status === 'working' ? 'Processing...' : 'Idle'))}</span>
-              </div>
+              \${(() => {
+                // Only a row with something to show is worth a tap: an idle row
+                // with no tool and no prompt opened an empty panel that said so,
+                // which is a dead end dressed as a control.
+                const detail = Boolean(a.tool || a.toolInput || a.prompt);
+                const label = a.prompt || (a.status === 'working' ? 'Processing...' : 'Idle');
+                const body = (a.tool ? '<code style="color:var(--accent); font-size:11px;">[' + escapeHTML(a.tool) + ']</code> ' : '') +
+                  '<span>' + escapeHTML(label) + '</span>';
+                return detail
+                  ? '<button type="button" class="action-text" data-agent-id="' + escapeHTML(a.id) + '" title="Expand the prompt">' + body + '</button>'
+                  : '<div class="action-text action-plain">' + body + '</div>';
+              })()}
             </td>
             <td style="color:var(--text-muted); font-size:12px; white-space:nowrap;">\${timeSince(a.updatedAt)}</td>
           </tr>
         \`;
       }).join('');
+
+      restoreRowFocus(focused);
     }
 
     function showModalById(id) {
@@ -670,6 +937,14 @@ export function renderDashboardHtml() {
     }
     checkUpdate();
     setInterval(checkUpdate, 600000);
+
+    // A browser over plain http on a non-loopback address refuses to register a
+    // worker, and that rejection is not an error the operator can act on: the
+    // page works either way, it just cannot be installed. Tailscale serves over
+    // https, which is the case this is for.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
   </script>
 </body>
 </html>`
@@ -744,6 +1019,21 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-cache',
     })
     return res.end(JSON.stringify(updateInfo))
+  }
+
+  const staticFile = STATIC_FILES.get(reqUrl.pathname)
+  if (staticFile) {
+    // A missing file is a deployment problem, not a 404 the operator can act
+    // on, so say which file and why the browser will refuse the install.
+    let body
+    try {
+      body = fs.readFileSync(path.join(PUBLIC_DIR, staticFile.file))
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'text/plain' })
+      return res.end(`the dashboard is missing ${staticFile.file}, so it cannot be installed as an app`)
+    }
+    res.writeHead(200, { 'Content-Type': staticFile.type, 'Cache-Control': 'no-cache' })
+    return res.end(body)
   }
 
   if (reqUrl.pathname === '/' || reqUrl.pathname === '/index.html') {
