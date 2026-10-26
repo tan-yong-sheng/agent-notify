@@ -112,10 +112,11 @@ export function workspaceLabel(displayName, { agent = '', branch = '', cwd = '' 
 }
 
 // A duration is shown only where it is measured, not inferred. Orca reports
-// when a run began; Herdr reports no wall clock at all, so its only available
-// duration would count from when this dashboard started looking, and an agent
-// four hours into a run showed "32m+" on a page started 32 minutes earlier.
-// Rather than qualify a number that wrong, Herdr rows carry no duration.
+// when a run began; Herdr reports no wall clock at all, so its duration comes
+// from the adapter, which records when it saw the status change. A Herdr row
+// with no recorded time carries no duration: counting from when this dashboard
+// started looking would date a four-hour run to 32 minutes, and qualifying
+// that number as a lower bound still answers a different question.
 export function showsDuration(agent) {
   return Boolean(agent?.stateSinceExact) && Number.isFinite(agent?.stateSince)
 }

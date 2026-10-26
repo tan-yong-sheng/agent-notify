@@ -81,6 +81,38 @@ export function canonicalAgentName(name) {
   return text ? (AGENT_ALIASES.get(text.toLowerCase()) || text) : text
 }
 
+// A pi session file is named after the moment the session started:
+// `2026-10-24T15-08-37-988Z_<uuid>.jsonl`. The time keeps the name safe on
+// every filesystem, so the colons are dashes. The stamp is the session's
+// start, a moment before the file itself appears.
+const PI_SESSION_STAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_/
+
+// The file name is the session's identity: the stamp says when the session
+// started, the uuid says which session it is. Two sessions can share a
+// millisecond, so the whole name is what tells two agents apart.
+function sessionFileName(value) {
+  const name = String(value || '').split(/[\\/]/).pop()
+  return name || null
+}
+
+// The moment the agent's session started, or null when the runtime reports no
+// session path or one this cannot read. It is the floor for any record about
+// that agent: no record of this agent can be older than its session, and a
+// pane reused by a new agent runs a new session, so a record from before this
+// moment belongs to the predecessor.
+function sessionStartFromPath(value) {
+  const name = sessionFileName(value)
+  const match = PI_SESSION_STAMP.exec(name)
+  if (!match) return null
+  const [, year, month, day, hour, minute, second, millis] = match
+  const at = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}.${millis}Z`)
+  if (!Number.isFinite(at)) return null
+  // The parser rolls impossible dates forward (February 30 becomes March 2),
+  // so the moment it returns must reproduce the stamp it was given.
+  const stamp = `${year}-${month}-${day}T${hour}:${minute}:${second}.${millis}`
+  return new Date(at).toISOString().startsWith(stamp) ? at : null
+}
+
 // `index` comes from the extractor and is only used when the runtime omits the
 // id: one shared fallback would key every such row alike, and the dashboard
 // resolves a row by id.
@@ -106,6 +138,11 @@ export function parseHerdrAgent(a = {}, index = 0) {
     // because the stamp was rewritten on each poll. `null` is the honest value;
     // collectLiveState() fills in the state's own observation time instead.
     stateStartedAt: null,
+    // The session the agent runs in. Herdr reports the session file: its name
+    // is the session's identity, and the stamp in that name is the moment the
+    // session started.
+    sessionIdentity: sessionFileName(asText(record.agent_session?.value)),
+    sessionStartedAt: sessionStartFromPath(asText(record.agent_session?.value)),
     updatedAt: null,
   }
 }
@@ -273,8 +310,8 @@ export function resetStateSince() {
   stateSince.clear()
 }
 
-// A row that has gone must not keep its history: both runtimes reuse pane ids,
-// and a stale entry would hand a new agent its predecessor's clock.
+// A row that has gone must not keep its clock: both runtimes reuse pane ids,
+// and a stale clock would hand a new agent its predecessor's history.
 //
 // A row is only known to have gone when its runtime answered. A failed query
 // returns an empty list, and treating that as "every row of this runtime
@@ -282,7 +319,7 @@ export function resetStateSince() {
 // hiccuped. `answered` names the runtimes that actually reported.
 function forgetDeparted(agents, answered) {
   const live = new Set(agents.map((agent) => agent.id))
-  for (const id of stateSince.keys()) {
+  for (const [id] of stateSince) {
     if (live.has(id)) continue
     // An id carries its runtime as a prefix; a source that did not answer says
     // nothing about its rows, so its history is kept.
@@ -297,22 +334,84 @@ function isActive(status) {
   return ACTIVE_STATUSES.has(status)
 }
 
-// Works out when the current status began, in one of four ways:
+// The floor is the latest instant that cannot belong to the current
+// occurrence: a record stamped at or before it describes an earlier one.
+//
+// The two bounds are not equally strict. A poll boundary is inclusive — the
+// poll at that instant saw a different status, so a record stamped there is
+// the one it saw, or a change in the same millisecond that cannot be told
+// apart from it. A session start is exclusive — the occurrence began when
+// the session began, so a record stamped exactly at the session start may be
+// that session's first transition — which makes the session bound the
+// millisecond before the start.
+//
+// The session start is also the bound that survives the dashboard missing the
+// moment a pane changed hands: a new agent runs a new session, so the
+// predecessor's record falls before it.
+//
+// A handover is bounded by the later of the new session's start and the poll
+// that saw the predecessor. The stamp alone is not enough: a resumed session
+// carries its original start, which can be older than the predecessor's own
+// session and says nothing about when the agent took over the pane. The poll
+// that saw the predecessor is the other bound — the predecessor's record was
+// written no later than it, unless the adapter lagged that event past it.
+function occurrenceFloor(agent, previous, changed, now) {
+  const sessionStart = agent.sessionStartedAt
+  const sessionFloor = sessionStart === null || sessionStart === undefined ? null : sessionStart - 1
+  if (!previous) return sessionFloor
+  // A new agent starts a new occurrence: its own session bounds it, or this
+  // poll when that session cannot be read.
+  const handedOver = sessionChanged(previous, agent)
+  const observed = handedOver
+    ? (sessionFloor === null ? now : Math.max(sessionFloor, previous.observedAt))
+    : (changed ? previous.observedAt : previous.floor)
+  if (sessionFloor === null) return observed
+  if (observed === null || observed === undefined) return sessionFloor
+  return Math.max(observed, sessionFloor)
+}
+
+// A pane handed to a new agent runs a new session. Herdr reports one session
+// per agent, and its file name is that session's identity, so a change in the
+// name is the proof that the pane holds someone else now.
+//
+// The identity can also arrive late: a runtime that reports no session at
+// first may report one later. That alone proves nothing, but a row whose
+// clock starts before the session that is here now cannot belong to it, so
+// the clock is proof enough.
+function sessionChanged(previous, agent) {
+  const after = agent.sessionIdentity
+  if (after === null || after === undefined) return false
+  const before = previous ? previous.session : null
+  if (before !== null && before !== undefined) return before !== after
+  const sessionStart = agent.sessionStartedAt
+  if (sessionStart === null || sessionStart === undefined) return false
+  return previous.at < sessionStart
+}
+
+// Works out when the current status began, in four ways:
 //   1. the runtime said so (Orca) — exact, and it survives a restart;
-//   2. the same status as last poll — the clock it was first given;
+//   2. the same agent, in the same status — the clock it was first given;
 //   3. a change this process watched happen — measured to within one poll;
-//   4. first sight — a lower bound, and the only case that knows nothing.
-// `witnessed` marks case 3, which is how a stale adapter record is told apart
-// from a fresh one below.
+//   4. a new agent in the pane, or a first sighting — a lower bound, and the
+//      only case that knows nothing.
 function resolveTiming(agent, previous, now) {
-  if (agent.stateStartedAt !== null) {
-    return { at: agent.stateStartedAt, exact: true, settledAt: agent.stateStartedAt, witnessed: false }
-  }
   const changed = previous ? previous.status !== agent.status : true
-  if (previous && !changed) {
-    return { at: previous.at, exact: previous.exact, settledAt: previous.settledAt, witnessed: previous.witnessed }
+  const floor = occurrenceFloor(agent, previous, changed, now)
+  if (agent.stateStartedAt !== null) {
+    // The runtime reports the start, but the floor still marks the last poll
+    // that saw a different status, so a record cannot date an earlier run of
+    // the current status.
+    return { at: agent.stateStartedAt, exact: true, settledAt: agent.stateStartedAt, floor }
   }
-  return { at: now, exact: false, settledAt: previous ? now : null, witnessed: Boolean(previous) }
+  // The same agent, in the same status: the clock it was first given.
+  if (previous && !changed && !sessionChanged(previous, agent)) {
+    return { at: previous.at, exact: previous.exact, settledAt: previous.settledAt, floor }
+  }
+  // A change, a first sighting, or a new agent in the pane. The row's clock
+  // starts again: the one the predecessor left behind belongs to another
+  // agent, and a settled row must not claim it settled at the predecessor's
+  // time.
+  return { at: now, exact: false, settledAt: previous ? now : null, floor }
 }
 
 // Exported for tests. The clock is a parameter so a suite can step time
@@ -325,7 +424,7 @@ export function trackStateSince(agents, now, answered = null) {
     const timing = resolveTiming(agent, previous, now)
     agent.stateSince = timing.at
     agent.stateSinceExact = timing.exact
-    agent.stateSinceWitnessed = timing.witnessed
+    agent.occurrenceFloor = timing.floor
     agent.settledSince = timing.settledAt
 
     stateSince.set(agent.id, {
@@ -333,7 +432,15 @@ export function trackStateSince(agents, now, answered = null) {
       at: timing.at,
       exact: timing.exact,
       settledAt: timing.settledAt,
-      witnessed: timing.witnessed,
+      floor: timing.floor,
+      // The agent's session, by its identity. A pane handed to a new agent
+      // runs a new session, and that is what tells the two apart when the
+      // status does not change. The identity carries the uuid as well as the
+      // start, so two agents can share a millisecond and still differ.
+      session: agent.sessionIdentity,
+      // The poll this row was seen in. It becomes the next poll's floor when
+      // the status changes, because the row showed the old status here.
+      observedAt: now,
     })
 
     // Last activity is a runtime fact, not an inference. Herdr reports none, so
@@ -390,13 +497,24 @@ function herdrPaneId(agent) {
 
 // The recorded time for this row, or null when there is none it may trust.
 //
-// Two separate reasons to refuse. The stored time describes the status it was
-// recorded for, so a missed or delayed event leaves the row on a newer status
-// and that clock belongs to the previous state. And a matching status is not
-// enough on its own: a pane that cycled working -> done -> working matches a
-// record from the earlier `working`. A transition this process watched happen is
-// at most one poll old, so a record older than it describes the earlier
-// occurrence and must not date the current one.
+// Two reasons to refuse. The stored time describes the status it was recorded
+// for, so a missed or delayed event leaves the row on a newer status and that
+// clock belongs to the previous state. And a matching status does not prove
+// the current occurrence: the adapter can miss an event, and then its record
+// still carries the status while its clock belongs to the earlier run of that
+// status. The floor settles it — the current occurrence began after the last
+// poll that saw a different status, and no earlier than the agent's session
+// started, so a record at or before the floor describes the earlier one.
+//
+// What a record that passes the floor guarantees is that the adapter saw this
+// status change after the dashboard last saw another one, and after the
+// current session began. It dates the occurrence as the adapter saw it, which
+// is at or after the change itself, so it never claims a longer run than the
+// adapter observed. It cannot prove the record belongs to this occurrence
+// rather than an earlier run of the same status inside the same session:
+// Herdr reports no identifier that ties a record to an occurrence, and a
+// missing event leaves the adapter and the dashboard with the same evidence —
+// a row that looks like it has been running since it was last seen.
 function recordedTimeFor(agent, store) {
   const paneId = herdrPaneId(agent)
   if (!paneId) return null
@@ -404,7 +522,8 @@ function recordedTimeFor(agent, store) {
   if (!sameState(entryStatus(entry), agent.status)) return null
   const recorded = entryStartedAt(entry)
   if (recorded === null) return null
-  if (agent.stateSinceWitnessed && recorded < agent.stateSince) return null
+  const floor = agent.occurrenceFloor
+  if (floor !== null && floor !== undefined && recorded <= floor) return null
   return recorded
 }
 
