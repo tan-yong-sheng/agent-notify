@@ -110,6 +110,16 @@ import {
 } from './shared/service.mjs'
 
 const results = { pass: 0, fail: 0, total: 0 }
+// The runtimes are faked on PATH so discovery, id assignment, and branch
+// filling are exercised end to end: execEnv keeps the inherited PATH, so a temp
+// directory in front of it is found. Herdr is a POSIX runtime, so its fake is
+// a POSIX shell stub, the same convention the rest of the suite's fakes use.
+function writeFakeRuntime(bin, name, payload) {
+  const file = path.join(bin, name)
+  fs.writeFileSync(file, `#!/bin/sh\necho '${payload}'\n`)
+  fs.chmodSync(file, 0o755)
+}
+
 const dashboardPath = fileURLToPath(new URL('./dashboard.mjs', import.meta.url))
 const catalogPath = fileURLToPath(new URL('./shared/catalog.mjs', import.meta.url))
 
@@ -1331,6 +1341,7 @@ async function runTimingTests() {
   trackStateSince(firstSight, t0)
   assert(firstSight[0].stateSince === t0, 'a first sighting starts the clock at observation')
   assert(firstSight[0].stateSinceExact === false, 'a first sighting is not an exact start')
+  assert(firstSight[0].occurrenceFloor === null, 'a first sighting has no floor to judge a record by')
 
   // The clock must survive a poll: this is the whole point of the map.
   const stillWorking = [herdrRow('working')]
@@ -1343,10 +1354,16 @@ async function runTimingTests() {
   trackStateSince(settled, t0 + 900_000)
   assert(settled[0].settledSince === t0 + 900_000, 'a transition records when it was observed')
   assert(settled[0].updatedAt === t0 + 900_000, 'a settled row is last active at its transition')
+  // The floor is the poll before the change: the row showed the old status
+  // then, so the current status began after it. It is what tells an adapter
+  // record for this occurrence apart from one left over from an earlier run of
+  // the same status.
+  assert(settled[0].occurrenceFloor === t0 + 600_000, 'a change takes the previous poll as its floor')
 
   const stillSettled = [herdrRow('done')]
   trackStateSince(stillSettled, t0 + 1_200_000)
   assert(stillSettled[0].settledSince === t0 + 900_000, 'the settled time is not rewritten on each poll')
+  assert(stillSettled[0].occurrenceFloor === t0 + 600_000, 'a poll with unchanged status keeps the floor')
 
   // A row first seen already settled has no observed transition behind it, so
   // the page shows a dash rather than claiming it settled at process start.
@@ -1362,6 +1379,14 @@ async function runTimingTests() {
   trackStateSince(orcaRows, t0)
   assert(orcaRows[0].stateSince === t0 - 300_000, 'an exact runtime start is preferred over observation')
   assert(orcaRows[0].stateSinceExact === true, 'an exact runtime start is marked exact')
+  // The floor is the last poll that saw a different status, whatever the
+  // source of the start: a row whose status changes takes the previous poll
+  // as its floor, so a recorded time cannot date the earlier run of the
+  // status it just left.
+  assert(orcaRows[0].occurrenceFloor === null, 'an exact first sighting has no floor')
+  const orcaChanged = [{ id: 'orca-k', status: 'done', stateStartedAt: t0 - 100_000, updatedAt: t0 }]
+  trackStateSince(orcaChanged, t0 + 60_000)
+  assert(orcaChanged[0].occurrenceFloor === t0, 'an exact start that changes status takes the previous poll as its floor')
 
   // A vanished row must not hand its clock to the next agent in that pane.
   resetStateSince()
@@ -1560,29 +1585,310 @@ async function runTimingTests() {
     'applyRecordedTransitions survives a null store'
   )
 
-  // A pane that cycled working -> done -> working keeps a record whose status
-  // matches again, but it belongs to the earlier occurrence. A transition this
-  // process watched is at most one poll old, so the older record loses.
-  const cycled = applyRecordedTransitions(
-    [{ id: 'herdr-w6:p1', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: true, stateSinceExact: false }],
-    { 'w6:p1': { status: 'working', at: 10_000 } }
+  // A witnessed transition means the dashboard observed a change. The adapter
+  // saw the event before the dashboard's poll could, so its record is older
+  // than the row's observed start and is the more accurate of the two. The
+  // floor is the last poll that saw a different status, and the record is
+  // newer than it, so it belongs to this occurrence.
+  const witnessed = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p1', source: 'herdr', status: 'working', stateSince: 20_000, occurrenceFloor: 19_000, stateSinceExact: false }],
+    { 'w6:p1': { status: 'working', at: 19_500 } }
   )
-  assert(cycled[0].stateSinceExact === false, 'a record older than a witnessed transition is not applied')
+  assert(witnessed[0].stateSince === 19_500, 'a witnessed transition takes the adapter record')
+  assert(witnessed[0].stateSinceExact === true, 'a witnessed transition is exact')
 
-  // A record newer than the witnessed transition is the real one.
-  const fresher = applyRecordedTransitions(
-    [{ id: 'herdr-w6:p2', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: true, stateSinceExact: false }],
-    { 'w6:p2': { status: 'working', at: 21_000 } }
+  // The adapter can miss an event. Its record then still carries the status,
+  // but its clock belongs to the earlier run of that status: the pane went
+  // working -> done -> working and the adapter never saw the middle state.
+  // The floor is the last poll that saw the different status, so a record at
+  // or before it is the earlier occurrence and must not date this one.
+  const staleOccurrence = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p2', source: 'herdr', status: 'working', stateSince: 20_000, occurrenceFloor: 19_000, stateSinceExact: false }],
+    { 'w6:p2': { status: 'working', at: 10_000 } }
   )
-  assert(fresher[0].stateSince === 21_000, 'a record newer than a witnessed transition is applied')
+  assert(staleOccurrence[0].stateSince === 20_000, 'a record older than the current occurrence is not applied')
+  assert(staleOccurrence[0].stateSinceExact === false, 'a record older than the current occurrence stays inexact')
 
-  // A row first seen already running has no witnessed transition to prefer, so
-  // the adapter's record is the best evidence available.
+  // The boundary is inclusive. The floor is the instant the row was last seen
+  // in a different status, so a record stamped exactly then was written before
+  // the current status began: it belongs to the earlier occurrence.
+  const atFloor = applyRecordedTransitions(
+    [{ id: 'herdr-w6:p4', source: 'herdr', status: 'working', stateSince: 20_000, occurrenceFloor: 19_000, stateSinceExact: false }],
+    { 'w6:p4': { status: 'working', at: 19_000 } }
+  )
+  assert(atFloor[0].stateSince === 20_000, 'a record stamped exactly at the floor is not applied')
+  assert(atFloor[0].stateSinceExact === false, 'a record stamped exactly at the floor stays inexact')
+
+  // A row first seen already running has no earlier poll to judge the record
+  // by, so the adapter's record is the best evidence available.
   const firstSightRow = applyRecordedTransitions(
-    [{ id: 'herdr-w6:p3', source: 'herdr', status: 'working', stateSince: 20_000, stateSinceWitnessed: false, stateSinceExact: false }],
+    [{ id: 'herdr-w6:p3', source: 'herdr', status: 'working', stateSince: 20_000, occurrenceFloor: null, stateSinceExact: false }],
     { 'w6:p3': { status: 'working', at: 10_000 } }
   )
   assert(firstSightRow[0].stateSince === 10_000, 'a first-sight row takes the adapter record')
+  assert(firstSightRow[0].stateSinceExact === true, 'a first-sight row with a record is exact')
+
+  // ── The whole path, in the order the dashboard runs it ─────────────────────
+  // The assertions above pin one step each. These run the steps together, the
+  // way a snapshot does: poll, record, poll, apply.
+  resetStateSince()
+  const settledRow = [parseHerdrAgent({ pane_id: 'p9', agent_status: 'done' })]
+  trackStateSince(settledRow, t0)
+  const workingRow = [parseHerdrAgent({ pane_id: 'p9', agent_status: 'working' })]
+  trackStateSince(workingRow, t0 + 3_000)
+  const applied = applyRecordedTransitions(workingRow, { p9: { status: 'working', at: t0 + 1_000 } })
+  assert(applied[0].stateSince === t0 + 1_000, 'a recorded start reaches the row through the real path')
+  assert(applied[0].stateSinceExact === true, 'a recorded start is exact through the real path')
+
+  // The same path with a record the adapter left behind from an earlier run:
+  // it is older than the floor, so the row keeps its observed start.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p9', agent_status: 'done' })], t0)
+  const staleRow = [parseHerdrAgent({ pane_id: 'p9', agent_status: 'working' })]
+  trackStateSince(staleRow, t0 + 3_000)
+  const staleApplied = applyRecordedTransitions(staleRow, { p9: { status: 'working', at: t0 - 10_000 } })
+  assert(staleApplied[0].stateSinceExact === false, 'a stale record does not reach the row through the real path')
+  assert(staleApplied[0].stateSince === t0 + 3_000, 'a stale record leaves the row with its observed start')
+
+  // A pane id that goes and comes back may hold a new agent, and the new
+  // agent runs a new session. The predecessor's record predates that session,
+  // so it is refused rather than handed to the new agent — even though the
+  // predecessor's event reached the adapter after the dashboard last saw the
+  // pane, which is what a departure floor could not catch.
+  resetStateSince()
+  const sessionFile = (at) => `/tmp/pi/agent/sessions/--tmp--/${new Date(at).toISOString().replace(/[:.]/g, '-')}_session.jsonl`
+  const predecessorSession = sessionFile(t0 - 60_000)
+  const newSession = sessionFile(t0 + 400_000)
+  const sessionStart = t0 + 400_000
+  trackStateSince([parseHerdrAgent({ pane_id: 'p9', agent_status: 'working', agent_session: { value: predecessorSession } })], t0)
+  trackStateSince([], t0 + 1_000)
+  const reusedRow = [parseHerdrAgent({ pane_id: 'p9', agent_status: 'working', agent_session: { value: newSession } })]
+  trackStateSince(reusedRow, t0 + 500_000)
+  assert(reusedRow[0].occurrenceFloor === sessionStart - 1, 'the millisecond before the session start is the floor for the agent in the pane')
+  const reusedApplied = applyRecordedTransitions(reusedRow, { p9: { status: 'working', at: t0 + 2_000 } })
+  assert(reusedApplied[0].stateSinceExact === false, 'a record from the predecessor agent is not applied to a reused pane')
+  assert(reusedApplied[0].stateSince === t0 + 500_000, 'a reused pane starts its own clock')
+
+  // The same pane, still the same agent: its own session bounds the record
+  // from below, and a record from after that session started is applied.
+  const ownRecordRow = [parseHerdrAgent({ pane_id: 'p9', agent_status: 'working', agent_session: { value: newSession } })]
+  trackStateSince(ownRecordRow, t0 + 600_000)
+  const ownApplied = applyRecordedTransitions(ownRecordRow, { p9: { status: 'working', at: sessionStart + 60_000 } })
+  assert(ownApplied[0].stateSinceExact === true, 'a record from the current session is applied')
+  assert(ownApplied[0].stateSince === sessionStart + 60_000, 'a record from the current session dates the row')
+
+  // The pane changes hands between two polls, so the dashboard never sees it
+  // go: the row keeps its status, and only the new session tells the two
+  // agents apart. The predecessor's record was written after the dashboard
+  // last saw the pane, so a departure floor would not catch it — the session
+  // does. The row's own clock belongs to the predecessor too, so it starts
+  // again with the new agent.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p12', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const handedOverRow = [parseHerdrAgent({ pane_id: 'p12', agent_status: 'working', agent_session: { value: sessionFile(t0 + 400_000) } })]
+  trackStateSince(handedOverRow, t0 + 500_000)
+  assert(handedOverRow[0].occurrenceFloor === t0 + 399_999, 'a new session moves the floor even when the status did not change')
+  assert(handedOverRow[0].stateSince === t0 + 500_000, 'a row that changed hands starts its own clock')
+  const handedOverApplied = applyRecordedTransitions(handedOverRow, { p12: { status: 'working', at: t0 + 2_000 } })
+  assert(handedOverApplied[0].stateSince === t0 + 500_000, 'a record from the predecessor is refused after a handover')
+  assert(handedOverApplied[0].stateSinceExact === false, 'a row that changed hands has no measured start')
+
+  // A settled row that changed hands must not claim it settled when the
+  // predecessor settled: the new agent's settle time is not the old one's.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p13', agent_status: 'done', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const settledHandoverRow = [parseHerdrAgent({ pane_id: 'p13', agent_status: 'done', agent_session: { value: sessionFile(t0 + 400_000) } })]
+  trackStateSince(settledHandoverRow, t0 + 500_000)
+  assert(settledHandoverRow[0].settledSince === t0 + 500_000, 'a settled row that changed hands settles again')
+
+  // A session path written with Windows separators carries the same stamp:
+  // the file name holds the session's start, not the separator that leads to
+  // it, so the pane is bounded either way.
+  resetStateSince()
+  const windowsSession = `C:\\Users\\dev\\.pi\\agent\\sessions\\--C--\\${new Date(t0 + 400_000).toISOString().replace(/[:.]/g, '-')}_session.jsonl`
+  trackStateSince([parseHerdrAgent({ pane_id: 'p14', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const windowsRow = [parseHerdrAgent({ pane_id: 'p14', agent_status: 'working', agent_session: { value: windowsSession } })]
+  trackStateSince(windowsRow, t0 + 500_000)
+  assert(windowsRow[0].occurrenceFloor === t0 + 399_999, 'a session path with Windows separators still bounds the row')
+  const windowsApplied = applyRecordedTransitions(windowsRow, { p14: { status: 'working', at: t0 + 2_000 } })
+  assert(windowsApplied[0].stateSinceExact === false, 'a record from the predecessor is refused after a handover with a Windows session path')
+  assert(windowsApplied[0].stateSince === t0 + 500_000, 'a row with a Windows session path keeps its own clock')
+
+  // Two sessions can start in the same millisecond. The stamp in the file
+  // name is then the same, and only the rest of the name tells the agents
+  // apart — the second agent must not inherit the first one's settle time.
+  resetStateSince()
+  const sameMillisecond = (uuid) => `/tmp/pi/agent/sessions/--tmp--/${new Date(t0 + 400_000).toISOString().replace(/[:.]/g, '-')}_${uuid}.jsonl`
+  trackStateSince([parseHerdrAgent({ pane_id: 'p15', agent_status: 'done', agent_session: { value: sameMillisecond('first') } })], t0)
+  const sameMillisecondRow = [parseHerdrAgent({ pane_id: 'p15', agent_status: 'done', agent_session: { value: sameMillisecond('second') } })]
+  trackStateSince(sameMillisecondRow, t0 + 500_000)
+  assert(sameMillisecondRow[0].settledSince === t0 + 500_000, 'two sessions that started in the same millisecond are different agents')
+
+  // A name carrying a date the calendar does not have gives no bound: the
+  // parser rolls February 30 into March, and a floor the calendar never had
+  // would refuse records that are perfectly good.
+  resetStateSince()
+  const impossibleSession = '/tmp/pi/agent/sessions/--tmp--/2026-02-30T10-00-00-000Z_session.jsonl'
+  const impossibleRow = [parseHerdrAgent({ pane_id: 'p16', agent_status: 'working', agent_session: { value: impossibleSession } })]
+  trackStateSince(impossibleRow, t0)
+  assert(impossibleRow[0].occurrenceFloor === null, 'an impossible date in the session name gives no floor')
+
+  // A runtime that starts reporting a session after the dashboard has been
+  // watching the pane: the identity arriving late proves nothing on its own,
+  // but a row whose clock starts before that session cannot belong to it.
+  resetStateSince()
+  const unidentifiedRow = [parseHerdrAgent({ pane_id: 'p17', agent_status: 'working' })]
+  trackStateSince(unidentifiedRow, t0)
+  const identifiedRow = [parseHerdrAgent({ pane_id: 'p17', agent_status: 'working', agent_session: { value: sessionFile(t0 + 400_000) } })]
+  trackStateSince(identifiedRow, t0 + 500_000)
+  assert(identifiedRow[0].stateSince === t0 + 500_000, 'a session that starts after the row belongs to a new agent')
+  assert(identifiedRow[0].occurrenceFloor === t0 + 399_999, 'the session that arrives late bounds the row')
+
+  // A new session whose start cannot be read gives no bound of its own, so
+  // this poll is the boundary: the predecessor's record must not follow the
+  // new agent into the row.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p18', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const unreadableRow = [parseHerdrAgent({ pane_id: 'p18', agent_status: 'working', agent_session: { value: '/tmp/pi/agent/sessions/--tmp--/session-without-a-stamp.jsonl' } })]
+  trackStateSince(unreadableRow, t0 + 500_000)
+  assert(unreadableRow[0].occurrenceFloor === t0 + 500_000, 'a new session with no readable start is bounded by this poll')
+  const unreadableApplied = applyRecordedTransitions(unreadableRow, { p18: { status: 'working', at: t0 + 100_000 } })
+  assert(unreadableApplied[0].stateSinceExact === false, 'the predecessor record does not follow a session that cannot be read')
+  assert(unreadableApplied[0].stateSince === t0 + 500_000, 'a row with an unreadable session keeps its own clock')
+
+  // The new agent's own record: the adapter writes it before the dashboard
+  // polls, so it is older than this poll and newer than the session that is
+  // here now. It belongs to the new agent, and it must reach the row.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p19', agent_status: 'idle', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const newAgentRow = [parseHerdrAgent({ pane_id: 'p19', agent_status: 'working', agent_session: { value: sessionFile(t0 + 400_000) } })]
+  trackStateSince(newAgentRow, t0 + 500_000)
+  const newAgentApplied = applyRecordedTransitions(newAgentRow, { p19: { status: 'working', at: t0 + 450_000 } })
+  assert(newAgentApplied[0].stateSinceExact === true, 'the new agent own record is applied')
+  assert(newAgentApplied[0].stateSince === t0 + 450_000, 'the new agent own record dates the row')
+
+  // The same agent, seen first without a session and then with one: the
+  // session still bounds the row, so a record from before the session began
+  // cannot belong to this agent.
+  resetStateSince()
+  const lateSameRow = [parseHerdrAgent({ pane_id: 'p20', agent_status: 'working' })]
+  trackStateSince(lateSameRow, t0)
+  const lateSameIdentified = [parseHerdrAgent({ pane_id: 'p20', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })]
+  trackStateSince(lateSameIdentified, t0 + 500_000)
+  assert(lateSameIdentified[0].stateSince === t0, 'a session that arrives late keeps the clock of the same agent')
+  assert(lateSameIdentified[0].occurrenceFloor === t0 - 60_001, 'a session that arrives late bounds the row')
+  const lateSameApplied = applyRecordedTransitions(lateSameIdentified, { p20: { status: 'working', at: t0 - 100_000 } })
+  assert(lateSameApplied[0].stateSinceExact === false, 'a record from before the session began is refused')
+
+  // A runtime that reports no session path gives no bound, and the record is
+  // taken as the best evidence available.
+  resetStateSince()
+  const noSessionRow = [parseHerdrAgent({ pane_id: 'p11', agent_status: 'working' })]
+  trackStateSince(noSessionRow, t0)
+  assert(noSessionRow[0].occurrenceFloor === null, 'a row without a session path has no session floor')
+  const noSessionApplied = applyRecordedTransitions(noSessionRow, { p11: { status: 'working', at: t0 - 10_000 } })
+  assert(noSessionApplied[0].stateSinceExact === true, 'a row without a session path takes the adapter record')
+}
+
+// A pane handed to an agent that resumed a session it had open earlier. The
+// file name of a resumed session still carries the moment that session began,
+// which here is before the predecessor's session began: it says when that
+// session started, not when this agent took over the pane. The stamp cannot
+// bound the handover, so the poll that saw the predecessor does, and the
+// predecessor's record does not follow the new agent into the row.
+async function runHandoverFloorTests() {
+  const t0 = 1_700_000_000_000
+  const sessionFile = (at) => `/tmp/pi/agent/sessions/--tmp--/${new Date(at).toISOString().replace(/[:.]/g, '-')}_session.jsonl`
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p21', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const resumedRow = [parseHerdrAgent({ pane_id: 'p21', agent_status: 'working', agent_session: { value: sessionFile(t0 - 600_000) } })]
+  trackStateSince(resumedRow, t0 + 500_000)
+  assert(resumedRow[0].occurrenceFloor === t0, 'a resumed session is bounded by the poll that saw the predecessor')
+  const resumedApplied = applyRecordedTransitions(resumedRow, { p21: { status: 'working', at: t0 - 100_000 } })
+  assert(resumedApplied[0].stateSinceExact === false, 'a resumed session does not date the row with the predecessor record')
+  assert(resumedApplied[0].stateSince === t0 + 500_000, 'a row with a resumed session keeps its own clock')
+
+  // The new agent's own record in the same shape: the adapter wrote it after
+  // the handover and before the poll that noticed it. It belongs to the new
+  // agent, and a bound that refused it would take the duration away.
+  resetStateSince()
+  trackStateSince([parseHerdrAgent({ pane_id: 'p22', agent_status: 'working', agent_session: { value: sessionFile(t0 - 60_000) } })], t0)
+  const resumedOwnRow = [parseHerdrAgent({ pane_id: 'p22', agent_status: 'working', agent_session: { value: sessionFile(t0 - 600_000) } })]
+  trackStateSince(resumedOwnRow, t0 + 500_000)
+  const resumedOwnApplied = applyRecordedTransitions(resumedOwnRow, { p22: { status: 'working', at: t0 + 450_000 } })
+  assert(resumedOwnApplied[0].stateSinceExact === true, 'the new agent own record survives a resumed session')
+  assert(resumedOwnApplied[0].stateSince === t0 + 450_000, 'the new agent own record dates the row after a resumed session')
+}
+
+// The session bound is exclusive: the occurrence began when the session
+// began, so the last instant that cannot belong to it is the millisecond
+// before the session start. A record stamped exactly at the session start may
+// be that session's first transition.
+async function runSessionStartBoundTests() {
+  const t0 = 1_700_000_000_000
+  const sessionFile = (at) => `/tmp/pi/agent/sessions/--tmp--/${new Date(at).toISOString().replace(/[:.]/g, '-')}_session.jsonl`
+  const sessionStart = t0 + 400_000
+
+  resetStateSince()
+  const exactRow = [parseHerdrAgent({ pane_id: 'p23', agent_status: 'working', agent_session: { value: sessionFile(sessionStart) } })]
+  trackStateSince(exactRow, t0 + 500_000)
+  assert(exactRow[0].occurrenceFloor === sessionStart - 1, 'the session start bounds the row to the millisecond before it')
+  const exactApplied = applyRecordedTransitions(exactRow, { p23: { status: 'working', at: sessionStart } })
+  assert(exactApplied[0].stateSinceExact === true, 'a record stamped exactly at the session start is applied')
+  assert(exactApplied[0].stateSince === sessionStart, 'a record stamped exactly at the session start dates the row')
+
+  // The millisecond before the session start still belongs to the
+  // predecessor: the session had not begun yet.
+  resetStateSince()
+  const beforeRow = [parseHerdrAgent({ pane_id: 'p24', agent_status: 'working', agent_session: { value: sessionFile(sessionStart) } })]
+  trackStateSince(beforeRow, t0 + 500_000)
+  const beforeApplied = applyRecordedTransitions(beforeRow, { p24: { status: 'working', at: sessionStart - 1 } })
+  assert(beforeApplied[0].stateSinceExact === false, 'a record stamped before the session start is refused')
+  assert(beforeApplied[0].stateSince === t0 + 500_000, 'a record stamped before the session start leaves the row with its observed start')
+}
+
+// The snapshot path is the one the dashboard runs: the row's timing comes
+// from a poll, and the recorded time is read from the plugin's own state file
+// afterwards. A regression in that wiring would leave every Herdr row without
+// a duration while the helper tests still pass, so the whole path runs here: a
+// fake runtime on PATH and a state file the dashboard reads for itself.
+async function runSnapshotTimingTests() {
+  const snapshotBin = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-snapshot-bin-'))
+  const snapshotConfig = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-snapshot-config-'))
+  const snapshotSessionStart = Date.now() - 600_000
+  const snapshotSession = `/tmp/pi/agent/sessions/--tmp--/${new Date(snapshotSessionStart).toISOString().replace(/[:.]/g, '-')}_session.jsonl`
+  const snapshotHerdr = JSON.stringify({
+    result: {
+      agents: [{ pane_id: 'p9', agent_status: 'working', agent_session: { value: snapshotSession } }],
+    },
+  })
+  writeFakeRuntime(snapshotBin, 'herdr', snapshotHerdr)
+  writeFakeRuntime(snapshotBin, 'orca', '{"result":{"worktrees":[]}}')
+  const snapshotRecordedAt = snapshotSessionStart + 60_000
+  fs.writeFileSync(
+    path.join(snapshotConfig, 'agent-notify-state.json'),
+    JSON.stringify({ p9: { status: 'working', at: snapshotRecordedAt } })
+  )
+  const snapshotProbe = path.join(snapshotBin, 'probe.mjs')
+  fs.writeFileSync(
+    snapshotProbe,
+    `import { collectLiveState } from ${JSON.stringify(catalogPath)}\nconsole.log(JSON.stringify(await collectLiveState()))\n`
+  )
+  const snapshotState = JSON.parse(
+    execFileSync(process.execPath, [snapshotProbe], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${snapshotBin}${path.delimiter}${process.env.PATH}`,
+        HERDR_PLUGIN_CONFIG_DIR: snapshotConfig,
+      },
+    })
+  )
+  const snapshotRow = snapshotState.agents.find((agent) => agent.source === 'herdr')
+  assert(snapshotRow && snapshotRow.stateSinceExact === true, 'the snapshot path gives a Herdr row an exact start')
+  assert(snapshotRow && snapshotRow.stateSince === snapshotRecordedAt, 'the snapshot path dates the row with the recorded time')
+  fs.rmSync(snapshotBin, { recursive: true, force: true })
+  fs.rmSync(snapshotConfig, { recursive: true, force: true })
 }
 
 async function runDashboardUnitTests() {
@@ -2149,18 +2455,14 @@ async function runDashboardUnitTests() {
   // filling are exercised end to end: execEnv keeps the inherited PATH, so a temp
   // directory in front of it is found.
   const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-notify-fake-bin-'))
-  const writeFakeRuntime = (name, payload) => {
-    const file = path.join(fakeBin, name)
-    fs.writeFileSync(file, `#!/bin/sh\necho '${payload}'\n`)
-    fs.chmodSync(file, 0o755)
-  }
   writeFakeRuntime(
+    fakeBin,
     'herdr',
     // The second row supplies the id the first row falls back to, so both resolve
     // to herdr-pane-0 before de-duplication.
     '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"idle","pane_id":"pane-0"},{"agent_status":"working","pane_id":"pane-7"}]}}'
   )
-  writeFakeRuntime('orca', '{"result":{"worktrees":[{"path":"/tmp","agents":[{},{}]}]}}')
+  writeFakeRuntime(fakeBin, 'orca', '{"result":{"worktrees":[{"path":"/tmp","agents":[{},{}]}]}}')
   const stateProbe = path.join(fakeBin, 'probe.mjs')
   fs.writeFileSync(
     stateProbe,
@@ -3167,6 +3469,9 @@ async function main() {
   runOrcaMainUnitTests()
   await runDashboardUnitTests()
   await runTimingTests()
+  await runHandoverFloorTests()
+  await runSessionStartBoundTests()
+  await runSnapshotTimingTests()
   runAllowedHostTests()
   runPwaTests()
   await runTailscaleTests()
